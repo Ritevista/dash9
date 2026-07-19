@@ -57,6 +57,22 @@ impl Duration {
         };
         Ok(Duration { magnitude, unit })
     }
+
+    /// This value expressed in milliseconds — used wherever a
+    /// `Duration` must become a concrete window or budget (e.g.
+    /// `dash9 test`'s latency check, a panel's `query_range` window).
+    /// Saturates rather than overflows for absurdly large magnitudes.
+    pub fn as_millis(&self) -> i64 {
+        let unit_ms: i64 = match self.unit {
+            DurationUnit::Seconds => 1_000,
+            DurationUnit::Minutes => 60_000,
+            DurationUnit::Hours => 3_600_000,
+            DurationUnit::Days => 86_400_000,
+        };
+        i64::try_from(self.magnitude)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(unit_ms)
+    }
 }
 
 impl fmt::Display for Duration {
@@ -135,6 +151,23 @@ mod tests {
         assert!(Duration::parse("s").is_err());
         assert!(Duration::parse("").is_err());
         assert!(Duration::parse("30x").is_err());
+    }
+
+    #[test]
+    fn as_millis_converts_every_unit() {
+        assert_eq!(Duration::parse("30s").unwrap().as_millis(), 30_000);
+        assert_eq!(Duration::parse("5m").unwrap().as_millis(), 300_000);
+        assert_eq!(Duration::parse("1h").unwrap().as_millis(), 3_600_000);
+        assert_eq!(Duration::parse("2d").unwrap().as_millis(), 172_800_000);
+    }
+
+    #[test]
+    fn as_millis_saturates_instead_of_overflowing() {
+        let huge = Duration {
+            magnitude: u64::MAX,
+            unit: DurationUnit::Days,
+        };
+        assert_eq!(huge.as_millis(), i64::MAX);
     }
 
     #[test]

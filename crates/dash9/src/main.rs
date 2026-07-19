@@ -1,6 +1,7 @@
 //! `dash9` binary: `open`, `test`, `demo` subcommands. See `SPEC.md`.
 
 mod demo;
+mod test_cmd;
 
 use std::path::PathBuf;
 
@@ -23,18 +24,20 @@ enum Commands {
     Demo,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        // `open` and `test` need the dash9-prom datasource adapter,
-        // which is not implemented yet; wiring them up is next.
+        // `open` needs the interactive TUI event loop wired to a live
+        // refresh schedule; `test` is the smaller headless slice and
+        // is implemented first.
         Commands::Open { path } => {
             println!("dash9 open {}: not yet implemented", path.display());
             Ok(())
         }
         Commands::Test { path } => {
-            println!("dash9 test {}: not yet implemented", path.display());
-            Ok(())
+            let code = test_cmd::run(&path).await?;
+            std::process::exit(code);
         }
         Commands::Demo => demo::run(),
     }
