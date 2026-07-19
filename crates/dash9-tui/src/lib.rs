@@ -8,4 +8,7 @@
 //! around.
 
 pub mod chart;
+pub mod draw;
 pub mod theme;
+
+pub use draw::draw_chart;

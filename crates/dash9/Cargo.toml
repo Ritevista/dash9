@@ -14,9 +14,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
 dash9-core = { workspace = true }
 dash9-prom = { workspace = true }
 dash9-tui = { workspace = true }
+ratatui = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
