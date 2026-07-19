@@ -1,0 +1,13 @@
+[package]
+name = "dash9-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crossterm = { workspace = true }
+dash9-core = { workspace = true }
+ratatui = { workspace = true }
