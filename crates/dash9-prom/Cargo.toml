@@ -16,4 +16,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "net", "io-util"] }
