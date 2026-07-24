@@ -11,9 +11,11 @@ mod datasource;
 mod duration;
 mod error;
 mod frame;
+mod path;
+mod session;
 
 pub use check::{check_panel, PanelCheckResult};
-pub use command::{parse, Command};
+pub use command::{parse, Command, VerbSpec, VERB_REFERENCE};
 pub use dashboard::{
     load_path, load_str, validate, DashboardFile, DashboardMeta, DatasourceSpec, DatasourceType,
     GridSpec, PanelSpec, PanelType, ThresholdOp, ThresholdSpec, ValidatedDashboard,
@@ -27,3 +29,5 @@ pub use frame::{
     ColumnKind, ColumnValues, Frame, FrameKind, FrameMeta, Labels, Point, Series, Table,
     TableColumn,
 };
+pub use path::validate_workspace_relative_path;
+pub use session::{CommandSource, SessionLogEntry};

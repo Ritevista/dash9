@@ -1,0 +1,30 @@
+name: Architecture proposal
+description: Propose a durable boundary or decision requiring an ADR.
+title: "architecture: "
+labels: [architecture]
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and forces
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options considered
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Dependency, data-model, and compatibility impact
+      description: Does this change what dash9-core, dash9-tui, or dash9-prom are allowed to depend on? scripts/check-architecture.sh may need a new check.
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Proposed decision and consequences
+    validations:
+      required: true

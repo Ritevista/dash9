@@ -32,6 +32,11 @@ pub enum ErrorCode {
     E105,
     /// Query execution failed (wraps the datasource adapter's error).
     E106,
+    /// `dash save` / `dash open` path resolves outside the workspace
+    /// root (absolute path, `..` traversal, or a symlink escape).
+    /// Added for `docs/specs/assist.md`; append-only per SPEC.md B.1/B.5
+    /// — does not change any existing code's meaning.
+    E107,
 }
 
 impl ErrorCode {
@@ -49,6 +54,7 @@ impl ErrorCode {
             ErrorCode::E104 => "E104",
             ErrorCode::E105 => "E105",
             ErrorCode::E106 => "E106",
+            ErrorCode::E107 => "E107",
         }
     }
 }

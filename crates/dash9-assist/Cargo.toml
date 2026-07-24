@@ -1,6 +1,6 @@
 [package]
-name = "dash9-prom"
-description = "Prometheus datasource adapter for dash9"
+name = "dash9-assist"
+description = "Optional AI assistant for dash9 (docs/specs/assist.md)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "net", "io-util"] }

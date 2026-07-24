@@ -38,4 +38,19 @@ pub trait Datasource: Sync {
         end_ms: i64,
         step_ms: i64,
     ) -> impl std::future::Future<Output = Result<Frame, Self::Error>> + Send;
+
+    /// Every metric name known to this datasource, alphabetically
+    /// sorted. Added for `docs/specs/assist.md` Section E's context
+    /// assembly (the composition root fetches and caches this; the
+    /// assistant itself never calls a `Datasource` method directly).
+    fn metric_names(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send;
+
+    /// Every label *name* (not value) known to this datasource,
+    /// alphabetically sorted. Same caller/caching model as
+    /// [`Datasource::metric_names`].
+    fn label_names(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send;
 }

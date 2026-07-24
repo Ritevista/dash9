@@ -1,0 +1,14 @@
+[
+  {
+    "request": "show cpu load over the last hour",
+    "reply": "I'll chart 1-minute load average over the last hour.\n```\nq node_load1\nrange 1h\n```"
+  },
+  {
+    "request": "save this as examples/load.toml",
+    "reply": "```\ndash save examples/load.toml\n```"
+  },
+  {
+    "request": "what's the weather today",
+    "reply": "I can only help with dash9 dashboard commands, not weather."
+  }
+]

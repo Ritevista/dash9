@@ -1,0 +1,29 @@
+name: Feature proposal
+description: Propose externally observable behaviour.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Describe the problem independently of a proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: scenarios
+    attributes:
+      label: Scenarios and acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: grammar
+    attributes:
+      label: Command grammar / dashboard schema impact
+      description: Does this need a new verb, subverb, or TOML field? SPEC.md Section B.1 requires additions, never changes to a shipped verb's arity or semantics.
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals

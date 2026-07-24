@@ -22,4 +22,19 @@ for forbidden in dash9-prom reqwest tokio; do
   fi
 done
 
+
+# dash9-assist has exactly one effector (emitting command-grammar
+# text) and no network access beyond its own LLM endpoint — it must
+# never depend on dash9-tui or dash9-prom (docs/specs/assist.md
+# Section B).
+assist_manifest="crates/dash9-assist/Cargo.toml"
+if [ -f "$assist_manifest" ]; then
+  for forbidden in dash9-tui dash9-prom ratatui crossterm; do
+    if grep -Eq "^${forbidden}[[:space:]]*=" "$assist_manifest"; then
+      echo "forbidden dash9-assist dependency: ${forbidden}" >&2
+      exit 1
+    fi
+  done
+fi
+
 echo "architecture checks passed"

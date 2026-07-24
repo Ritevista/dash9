@@ -3,6 +3,7 @@ members = [
     "crates/dash9-core",
     "crates/dash9-prom",
     "crates/dash9-tui",
+    "crates/dash9-assist",
     "crates/dash9",
 ]
 resolver = "2"
@@ -11,8 +12,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.97.1"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/Ritevista/dash9"
 
 [workspace.dependencies]
+dash9-assist = { path = "crates/dash9-assist" }
 dash9-core = { path = "crates/dash9-core" }
 dash9-prom = { path = "crates/dash9-prom" }
 dash9-tui = { path = "crates/dash9-tui" }

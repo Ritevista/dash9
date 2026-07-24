@@ -371,10 +371,149 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
     }
 }
 
+/// One entry per verb an automated caller (e.g. `dash9-assist`) may
+/// reference. Colocated with `parse()` so a verb addition and its
+/// reference-table entry land in the same review; the
+/// `verb_reference_matches_parser` test below fails if they ever
+/// diverge — see `docs/specs/assist.md` Section C.1.
+#[derive(Debug, Clone, Copy)]
+pub struct VerbSpec {
+    pub verb: &'static str,
+    pub args: &'static [&'static str],
+    pub example: &'static str,
+    pub description: &'static str,
+}
+
+/// Excludes `quit` deliberately (`docs/specs/assist.md` Section H):
+/// session-control verbs are never something an automated caller
+/// should propose, so they are not part of this vocabulary at all,
+/// not merely blocked at validation time.
+pub const VERB_REFERENCE: &[VerbSpec] = &[
+    VerbSpec {
+        verb: "ds add",
+        args: &["name", "type", "url"],
+        example: "ds add prom prometheus http://localhost:9090",
+        description: "Add a named Prometheus datasource instance.",
+    },
+    VerbSpec {
+        verb: "ds list",
+        args: &[],
+        example: "ds list",
+        description: "List configured datasources.",
+    },
+    VerbSpec {
+        verb: "q",
+        args: &["query"],
+        example: r#"q up{job="api"}"#,
+        description: "Run an instant query against the focused datasource.",
+    },
+    VerbSpec {
+        verb: "panel type",
+        args: &["type"],
+        example: "panel type gauge",
+        description: "Set the focused panel's visualization type (timeseries, gauge, table, stat).",
+    },
+    VerbSpec {
+        verb: "panel threshold",
+        args: &["name", "op", "value"],
+        example: "panel threshold crit gte 95",
+        description: "Set a named threshold (gt, gte, lt, lte) on the focused panel.",
+    },
+    VerbSpec {
+        verb: "panel title",
+        args: &["text"],
+        example: r#"panel title "CPU Usage""#,
+        description: "Set the focused panel's title.",
+    },
+    VerbSpec {
+        verb: "range",
+        args: &["duration"],
+        example: "range 1h",
+        description: "Set the current view's time range (e.g. 30s, 5m, 1h, 2d).",
+    },
+    VerbSpec {
+        verb: "refresh",
+        args: &["duration_or_off"],
+        example: "refresh 30s",
+        description: "Set the auto-refresh interval, or \"off\" to disable it.",
+    },
+    VerbSpec {
+        verb: "dash save",
+        args: &["path"],
+        example: "dash save examples/demo.toml",
+        description: "Save the current dashboard state to a workspace-relative TOML path.",
+    },
+    VerbSpec {
+        verb: "dash open",
+        args: &["path"],
+        example: "dash open examples/demo.toml",
+        description: "Open a dashboard TOML file from a workspace-relative path.",
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::duration::DurationUnit;
+
+    /// Exhaustive on purpose: adding a new `Command` variant is a
+    /// compile error here until this match is updated, which is what
+    /// forces a corresponding `VERB_REFERENCE` entry to be considered
+    /// in the same change (see `verb_reference_matches_parser`).
+    fn variant_tag(cmd: &Command) -> &'static str {
+        match cmd {
+            Command::DsAdd { .. } => "ds add",
+            Command::DsList => "ds list",
+            Command::Q { .. } => "q",
+            Command::PanelType { .. } => "panel type",
+            Command::PanelThreshold { .. } => "panel threshold",
+            Command::PanelTitle { .. } => "panel title",
+            Command::Range { .. } => "range",
+            Command::Refresh { .. } => "refresh",
+            Command::DashSave { .. } => "dash save",
+            Command::DashOpen { .. } => "dash open",
+            Command::Quit => "quit",
+        }
+    }
+
+    #[test]
+    fn verb_reference_matches_parser() {
+        for spec in VERB_REFERENCE {
+            let parsed = parse(spec.example).unwrap_or_else(|e| {
+                panic!(
+                    "VERB_REFERENCE example {:?} failed to parse: {e}",
+                    spec.example
+                )
+            });
+            assert_eq!(
+                variant_tag(&parsed),
+                spec.verb,
+                "VERB_REFERENCE entry {:?} parsed to a different verb",
+                spec.verb
+            );
+        }
+
+        let all_verbs = [
+            "ds add",
+            "ds list",
+            "q",
+            "panel type",
+            "panel threshold",
+            "panel title",
+            "range",
+            "refresh",
+            "dash save",
+            "dash open",
+            // "quit" deliberately excluded from VERB_REFERENCE.
+        ];
+        for verb in all_verbs {
+            assert!(
+                VERB_REFERENCE.iter().any(|spec| spec.verb == verb),
+                "verb {verb:?} exists in the parser but has no VERB_REFERENCE entry"
+            );
+        }
+        assert_eq!(VERB_REFERENCE.len(), all_verbs.len());
+    }
 
     // --- SPEC.md B.3 verb reference table: one test per row ---
 

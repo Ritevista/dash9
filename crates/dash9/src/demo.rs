@@ -4,6 +4,18 @@
 //! getting one from a datasource adapter — it exists to exercise the
 //! `ChartModel` projection and Ratatui draw pipeline end to end
 //! without a live Prometheus instance to point at.
+//!
+//! `--assist` (see `docs/specs/assist.md` Section K) layers a scripted
+//! assistant walkthrough on top of the same chart: every few seconds
+//! it "asks" the next canned demo fixture through a real
+//! `AssistSession<FixtureLlmClient>` — the real contract/validate
+//! path, zero network — and shows the result in a log panel. There is
+//! no live Prometheus datasource behind this demo's `q`/`range`
+//! commands, so "auto-run" here means "logged immediately, no
+//! confirmation gate," not "produced a new Frame from a real query" —
+//! the chart keeps animating from its own synthetic signal regardless
+//! of what the assistant proposes. Pretending otherwise would violate
+//! the "never fabricate a result" rule (Section J).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,20 +30,16 @@ use dash9_tui::draw_chart;
 const HISTORY_POINTS: i64 = 120;
 const TICK: Duration = Duration::from_millis(250);
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(assist: bool) -> anyhow::Result<()> {
+    if assist {
+        return run_assist_walkthrough();
+    }
+    run_plain()
+}
+
+fn run_plain() -> anyhow::Result<()> {
     let started_at = Instant::now();
-    let thresholds = vec![
-        ValidatedThreshold {
-            name: "warn".to_string(),
-            op: ThresholdOp::Gte,
-            value: 0.75,
-        },
-        ValidatedThreshold {
-            name: "crit".to_string(),
-            op: ThresholdOp::Gte,
-            value: 0.90,
-        },
-    ];
+    let thresholds = demo_thresholds();
 
     ratatui::run(|terminal| -> anyhow::Result<()> {
         loop {
@@ -57,6 +65,202 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
     })
+}
+
+#[cfg(not(feature = "assist"))]
+fn run_assist_walkthrough() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "dash9 was built without the `assist` feature; rebuild with `cargo build --features assist`"
+    )
+}
+
+#[cfg(feature = "assist")]
+fn run_assist_walkthrough() -> anyhow::Result<()> {
+    use dash9_assist::{
+        ActiveDatasourceMetadata, AssistConfig, AssistContext, AssistSession, DatasourceSummary,
+        FixtureLlmClient, TimeRangeSummary, DEMO_FIXTURES_JSON,
+    };
+
+    /// How often the walkthrough "types" the next canned request.
+    const CYCLE: Duration = Duration::from_secs(6);
+    const MAX_LOG_LINES: usize = 16;
+
+    let started_at = Instant::now();
+    let thresholds = demo_thresholds();
+
+    let client = FixtureLlmClient::from_json(DEMO_FIXTURES_JSON)
+        .map_err(|e| anyhow::anyhow!("invalid demo fixtures: {e}"))?;
+    let config =
+        AssistConfig::from_toml_str("base_url = \"local-fixture\"\nmodel = \"demo-fixture\"\n")
+            .map_err(|e| anyhow::anyhow!("invalid demo assist config: {e}"))?;
+    let workspace_root = std::env::current_dir().unwrap_or_default();
+    let mut session = AssistSession::new(client, &config, workspace_root);
+
+    let requests = [
+        "show cpu load over the last hour",
+        "save this as examples/load.toml",
+        "what's the weather today",
+    ];
+    let mut next_request_index = 0usize;
+    let mut next_request_at = Instant::now() + Duration::from_secs(2);
+    let mut log: Vec<String> =
+        vec!["press q to quit, a to toggle the assistant on/off".to_string()];
+
+    let context = AssistContext {
+        datasources: vec![DatasourceSummary {
+            name: "prom".to_string(),
+            datasource_type: "prometheus".to_string(),
+        }],
+        active_datasource_metadata: Some(ActiveDatasourceMetadata {
+            datasource_name: "prom".to_string(),
+            metric_names: vec!["node_load1".to_string(), "up".to_string()],
+            label_keys: vec!["instance".to_string(), "job".to_string()],
+        }),
+        dashboard_toml: None,
+        time_range: TimeRangeSummary {
+            start_ms: 0,
+            end_ms: 3_600_000,
+        },
+    };
+
+    let runtime_handle = tokio::runtime::Handle::current();
+
+    ratatui::run(|terminal| -> anyhow::Result<()> {
+        loop {
+            let width = terminal.size()?.width;
+            let frame = synthetic_frame(started_at);
+            let model = ChartModel::project(
+                "demo --assist: synthetic saturation signal",
+                &frame,
+                &thresholds,
+                &ChartViewState::default(),
+                usize::from(width),
+            )?;
+
+            terminal.draw(|f| {
+                let chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        ratatui::layout::Constraint::Percentage(65),
+                        ratatui::layout::Constraint::Percentage(35),
+                    ])
+                    .split(f.area());
+                draw_chart(f, chunks[0], &model);
+                draw_log_panel(f, chunks[1], &log, &session.status());
+            })?;
+
+            if Instant::now() >= next_request_at {
+                let request = requests[next_request_index % requests.len()];
+                next_request_index += 1;
+                next_request_at = Instant::now() + CYCLE;
+
+                log.push(format!("> {request}"));
+                // `main` is already `#[tokio::main]`, i.e. we are
+                // running on a tokio worker thread — a plain
+                // `Handle::block_on` here would panic ("cannot start
+                // a runtime from within a runtime"). `block_in_place`
+                // is the sanctioned escape hatch on the multi-threaded
+                // runtime: it hands this thread's other work to
+                // another worker for the duration of the nested
+                // `block_on`, which is fine here since `ask()` against
+                // `FixtureLlmClient` never actually awaits real I/O.
+                let outcome = tokio::task::block_in_place(|| {
+                    runtime_handle.block_on(session.ask(&context, request, true))
+                });
+                append_outcome(&mut log, outcome, epoch_ms_now());
+                if log.len() > MAX_LOG_LINES {
+                    let excess = log.len() - MAX_LOG_LINES;
+                    log.drain(0..excess);
+                }
+            }
+
+            if event::poll(TICK)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('a') => {
+                                session.set_enabled(!session.is_enabled());
+                                log.push(format!(
+                                    "assistant turned {}",
+                                    if session.is_enabled() { "on" } else { "off" }
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Turns one `ask()` outcome into log lines. Every command — whether
+/// auto-run or a proposal — becomes a `SessionLogEntry` marked
+/// `CommandSource::Assistant` before it's rendered (Section I: no
+/// invisible assistant action, and the same shape a human's command
+/// would use), even though this demo only ever displays it as text
+/// rather than keeping a persisted, replayable log — that's `dash9
+/// open`'s job once it exists.
+#[cfg(feature = "assist")]
+fn append_outcome(log: &mut Vec<String>, outcome: dash9_assist::AssistOutcome, timestamp_ms: i64) {
+    use dash9_assist::{AssistOutcome, ProposedCommand};
+    use dash9_core::{CommandSource, SessionLogEntry};
+
+    match outcome {
+        AssistOutcome::Turn(turn) => {
+            if let Some(sentence) = turn.intent_sentence {
+                log.push(sentence);
+            }
+            for command in turn.commands {
+                let (tag, command) = match command {
+                    ProposedCommand::AutoRun(cmd) => ("auto", cmd),
+                    ProposedCommand::Proposal(cmd) => ("proposal, press to apply", cmd),
+                };
+                let entry = SessionLogEntry {
+                    source: CommandSource::Assistant,
+                    command_text: format!("{command:?}"),
+                    timestamp_ms,
+                };
+                log.push(format!("  [{tag}] {}", entry.command_text));
+            }
+        }
+        AssistOutcome::Refusal(sentence) => log.push(format!("assistant: {sentence}")),
+        AssistOutcome::Failed(err) => log.push(format!("assistant error: {err}")),
+    }
+}
+
+#[cfg(feature = "assist")]
+fn draw_log_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    log: &[String],
+    status: &dash9_assist::AssistStatusModel,
+) {
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    let mut text = log.join("\n");
+    text.push('\n');
+    text.push_str(&status.render_text());
+
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("assist"));
+    frame.render_widget(paragraph, area);
+}
+
+fn demo_thresholds() -> Vec<ValidatedThreshold> {
+    vec![
+        ValidatedThreshold {
+            name: "warn".to_string(),
+            op: ThresholdOp::Gte,
+            value: 0.75,
+        },
+        ValidatedThreshold {
+            name: "crit".to_string(),
+            op: ThresholdOp::Gte,
+            value: 0.90,
+        },
+    ]
 }
 
 #[allow(clippy::cast_precision_loss)]

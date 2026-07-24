@@ -434,6 +434,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "crossterm",
+ "dash9-assist",
  "dash9-core",
  "dash9-prom",
  "dash9-tui",
@@ -446,12 +447,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash9-assist"
+version = "0.1.0"
+dependencies = [
+ "dash9-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "dash9-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "toml",
 ]

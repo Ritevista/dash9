@@ -111,6 +111,16 @@ impl Datasource for PrometheusDatasource {
             .await?;
         parse_response(&body, &self.name, query, executed_at_ms)
     }
+
+    async fn metric_names(&self) -> Result<Vec<String>, PrometheusError> {
+        let body = self.get("/api/v1/label/__name__/values", &[]).await?;
+        parse_label_list_response(&body)
+    }
+
+    async fn label_names(&self) -> Result<Vec<String>, PrometheusError> {
+        let body = self.get("/api/v1/labels", &[]).await?;
+        parse_label_list_response(&body)
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -233,6 +243,37 @@ fn parse_response(
             warnings: vec![],
         },
     })
+}
+
+/// Prometheus's `/api/v1/label/__name__/values` (metric names) and
+/// `/api/v1/labels` (label names) share this flat-array response
+/// shape, distinct from `query`/`query_range`'s nested vector/matrix
+/// shape. Results are sorted here so callers (Section E's context
+/// assembly in `docs/specs/assist.md`) get a deterministic order to
+/// truncate against, regardless of what order Prometheus returned
+/// them in.
+#[derive(Deserialize)]
+struct RawLabelListResponse {
+    status: String,
+    #[serde(default)]
+    data: Option<Vec<String>>,
+    #[serde(rename = "errorType", default)]
+    error_type: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn parse_label_list_response(body: &str) -> Result<Vec<String>, PrometheusError> {
+    let parsed: RawLabelListResponse = serde_json::from_str(body)?;
+    if parsed.status != "success" {
+        return Err(PrometheusError::Api {
+            error_type: parsed.error_type.unwrap_or_default(),
+            message: parsed.error.unwrap_or_default(),
+        });
+    }
+    let mut names = parsed.data.ok_or(PrometheusError::MissingData)?;
+    names.sort();
+    Ok(names)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -382,6 +423,29 @@ mod tests {
         assert_eq!(seconds_param(1_700_000_015_421), "1700000015.421");
         assert_eq!(seconds_param(0), "0.000");
     }
+
+    #[test]
+    fn label_list_response_is_sorted_regardless_of_wire_order() {
+        let body = r#"{"status":"success","data":["node_load1","cpu_usage","zzz_metric"]}"#;
+        let names = parse_label_list_response(body).unwrap();
+        assert_eq!(names, vec!["cpu_usage", "node_load1", "zzz_metric"]);
+    }
+
+    #[test]
+    fn empty_label_list_is_not_an_error() {
+        let body = r#"{"status":"success","data":[]}"#;
+        assert_eq!(
+            parse_label_list_response(body).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn label_list_error_status_is_reported() {
+        let body = r#"{"status":"error","errorType":"bad_data","error":"boom"}"#;
+        let err = parse_label_list_response(body).unwrap_err();
+        assert!(matches!(err, PrometheusError::Api { .. }));
+    }
 }
 
 #[cfg(test)]
@@ -447,5 +511,23 @@ mod live_tests {
         let ds = PrometheusDatasource::new("prom", base_url);
         let err = ds.query("up{", 0).await.unwrap_err();
         assert!(matches!(err, PrometheusError::Api { .. }));
+    }
+
+    #[tokio::test]
+    async fn metric_names_hits_the_http_api_and_sorts_the_response() {
+        let body = r#"{"status":"success","data":["up","cpu_usage"]}"#;
+        let base_url = respond_once(body).await;
+        let ds = PrometheusDatasource::new("prom", base_url);
+        let names = ds.metric_names().await.unwrap();
+        assert_eq!(names, vec!["cpu_usage", "up"]);
+    }
+
+    #[tokio::test]
+    async fn label_names_hits_the_http_api_and_sorts_the_response() {
+        let body = r#"{"status":"success","data":["job","instance"]}"#;
+        let base_url = respond_once(body).await;
+        let ds = PrometheusDatasource::new("prom", base_url);
+        let names = ds.label_names().await.unwrap();
+        assert_eq!(names, vec!["instance", "job"]);
     }
 }

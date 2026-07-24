@@ -21,7 +21,13 @@ enum Commands {
     /// Validate a dashboard TOML file headlessly (SPEC.md Section C.3).
     Test { path: PathBuf },
     /// Run a self-contained demo panel against synthetic data.
-    Demo,
+    Demo {
+        /// Also run a scripted assistant walkthrough against canned
+        /// fixtures — no network (docs/specs/assist.md Section K).
+        /// Requires the `assist` feature (on by default).
+        #[arg(long)]
+        assist: bool,
+    },
 }
 
 #[tokio::main]
@@ -39,6 +45,6 @@ async fn main() -> anyhow::Result<()> {
             let code = test_cmd::run(&path).await?;
             std::process::exit(code);
         }
-        Commands::Demo => demo::run(),
+        Commands::Demo { assist } => demo::run(assist),
     }
 }
