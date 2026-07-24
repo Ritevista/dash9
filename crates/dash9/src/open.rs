@@ -44,7 +44,6 @@ use crate::live_session::{execute_command, LivePanel, LiveSession, SessionUpdate
 const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
 const STATUS_BAR_HEIGHT: u16 = 1;
-const COMMAND_BAR_HEIGHT: u16 = 10;
 
 pub fn run(path: &Path, assist: bool) -> anyhow::Result<()> {
     if assist {
@@ -230,7 +229,7 @@ pub(crate) fn help_text() -> String {
     out.push_str("  model <name> — switch AI model, resets conversation history (--assist only)\n");
     out.push_str("  save <csv|md|png> [path] — export the focused panel's data\n");
     out.push_str(
-        "\nKeys: Tab/Shift+Tab focus panel · : command · y/n confirm proposal · a toggle AI · q quit\n",
+        "\nKeys: Tab/Shift+Tab focus panel · : command (Esc cancels) · y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
     );
     out
 }
@@ -242,14 +241,23 @@ fn draw_session(
     session: &LiveSession,
     status: &StatusBarModel,
 ) {
+    let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
+
+    // The grid gets exactly the height its panels need, not whatever
+    // space a `Min(0)`/stretch constraint would hand it — `grid_layout`
+    // positions panels by absolute grid units, so a grid area taller
+    // than its content just leaves a dead, unrendered gap below the
+    // last panel row otherwise. The command bar (log + input) gets
+    // everything left over instead, so it grows to use that space
+    // rather than staying pinned to a fixed height.
     let [status_area, grid_area, bar_area] = Layout::vertical([
         Constraint::Length(STATUS_BAR_HEIGHT),
+        Constraint::Length(dash9_tui::content_height(&grids)),
         Constraint::Min(0),
-        Constraint::Length(COMMAND_BAR_HEIGHT),
     ])
     .areas(area);
     draw_status_bar(frame, status_area, status);
-    draw_dashboard(frame, grid_area, session, state.focused_panel);
+    draw_dashboard(frame, grid_area, &grids, session, state.focused_panel);
     draw_command_bar(
         frame,
         bar_area,
@@ -276,9 +284,14 @@ fn command_bar_hint(state: &ShellState, status: &StatusBarModel) -> String {
     hints.join(" · ")
 }
 
-fn draw_dashboard(frame: &mut Frame, area: Rect, session: &LiveSession, focused_panel: usize) {
-    let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
-    let rects = grid_layout(area, &grids);
+fn draw_dashboard(
+    frame: &mut Frame,
+    area: Rect,
+    grids: &[dash9_core::GridSpec],
+    session: &LiveSession,
+    focused_panel: usize,
+) {
+    let rects = grid_layout(area, grids);
 
     for (index, panel) in session.panels.iter().enumerate() {
         let rect = rects[index];

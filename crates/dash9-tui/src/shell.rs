@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dash9_core::{Command, CommandSource, LogLine, SessionLogEntry};
 
 use crate::export::ExportFormat;
@@ -147,11 +147,18 @@ impl ShellState {
     /// Applies one keyboard event. Returns `true` only when the
     /// session should end — `Esc` never does, matching `LoreMesh`'s
     /// explicit invariant ("Escape never terminates... even when
-    /// pressed repeatedly"); only `q` outside input, or typing `quit`,
-    /// ends the session.
+    /// pressed repeatedly"); only `q` outside input, typing `quit`, or
+    /// `Ctrl+C` (checked first, unconditionally, regardless of input
+    /// state — raw mode intercepts it as a normal keypress rather than
+    /// sending a real `SIGINT`, so without this a `Ctrl+C` habit either
+    /// types a literal `c` while editing or does nothing at all, which
+    /// reads as "the program won't quit") ends the session.
     pub fn handle_key<H: CommandHandler>(&mut self, key: KeyEvent, handler: &mut H) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
         }
 
         if let Some(buffer) = self.input.as_mut() {
@@ -357,6 +364,31 @@ mod tests {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
         assert!(state.handle_key(char_key('q'), &mut handler));
+    }
+
+    #[test]
+    fn ctrl_c_always_quits_in_or_out_of_input() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert!(state.handle_key(ctrl_c, &mut handler), "outside input");
+
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+        assert!(state.handle_key(ctrl_c, &mut handler), "while typing");
+    }
+
+    #[test]
+    fn plain_c_without_control_is_a_literal_character_while_typing() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        let quit = state.handle_key(char_key('c'), &mut handler);
+        assert!(!quit);
+        assert_eq!(state.input.as_deref(), Some("c"));
     }
 
     #[test]

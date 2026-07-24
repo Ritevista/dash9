@@ -43,6 +43,27 @@ fn panel_rect(area: Rect, grid: &GridSpec, column_width: u16) -> Rect {
     raw.intersection(area)
 }
 
+/// How many terminal rows the panel grid actually needs (the tallest
+/// panel's `row + h`, in `ROW_UNIT_HEIGHT` units) — for a caller that
+/// wants the grid area sized to its content instead of stretched to
+/// fill whatever space it's given. Without this, a grid area sized via
+/// a `Min(0)` layout constraint on a terminal taller than the
+/// dashboard's content leaves a dead, unrendered gap below the last
+/// panel row (nothing draws there, since `grid_layout` positions
+/// panels by absolute grid units, not by however much area it's
+/// handed). `0` for an empty panel list.
+pub fn content_height(panels: &[GridSpec]) -> u16 {
+    panels
+        .iter()
+        .map(|grid| {
+            u16::try_from(grid.row.saturating_add(grid.h))
+                .unwrap_or(u16::MAX)
+                .saturating_mul(ROW_UNIT_HEIGHT)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +204,16 @@ mod tests {
             height: 40,
         };
         assert!(grid_layout(area, &[]).is_empty());
+    }
+
+    #[test]
+    fn content_height_is_the_tallest_panels_row_plus_h() {
+        assert_eq!(content_height(&node_overview_grids()), 48); // (row 4 + h 4) * 6
+    }
+
+    #[test]
+    fn content_height_of_no_panels_is_zero() {
+        assert_eq!(content_height(&[]), 0);
     }
 
     #[test]
