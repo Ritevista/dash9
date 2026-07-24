@@ -25,6 +25,7 @@ use dash9_core::{
     ValidatedThreshold,
 };
 use dash9_prom::PrometheusDatasource;
+use dash9_tui::{table_for_export, table_to_csv, table_to_markdown, ExportFormat};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -176,6 +177,46 @@ impl LiveSession {
         self.config_rx.borrow().range
     }
 
+    /// e.g. `"2 datasources (loki, prom)"` — for the status bar.
+    pub fn datasource_summary(&self) -> String {
+        if self.datasources.is_empty() {
+            return "no datasources".to_string();
+        }
+        let mut names: Vec<&String> = self.datasources.keys().collect();
+        names.sort();
+        format!(
+            "{} datasource{} ({})",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            names.into_iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+
+    /// Derived from whether any panel's last query result was an
+    /// error — not a separate live probe (see
+    /// `dash9_tui::DatasourceHealth`'s docs). `Unknown` until at least
+    /// one panel has reported a result.
+    pub fn datasource_health(&self) -> dash9_tui::DatasourceHealth {
+        use dash9_tui::DatasourceHealth;
+
+        let mut any_ok = false;
+        let mut any_err = false;
+        for panel in &self.panels {
+            match &panel.last_result {
+                Some(Ok(_)) => any_ok = true,
+                Some(Err(_)) => any_err = true,
+                None => {}
+            }
+        }
+        if any_err {
+            DatasourceHealth::Degraded
+        } else if any_ok {
+            DatasourceHealth::Healthy
+        } else {
+            DatasourceHealth::Unknown
+        }
+    }
+
     fn refresh(&self) -> RefreshInterval {
         self.config_rx.borrow().refresh
     }
@@ -225,6 +266,58 @@ impl LiveSession {
                 .await;
         });
         format!("q {query}: running…")
+    }
+
+    /// `:save <format> [path]`. Exports the focused panel's *current*
+    /// data — one code path for every panel type, via
+    /// `dash9_tui::table_for_export`'s existing fallback (native
+    /// `Table` if the frame has one, else the same `series_as_table`
+    /// synthesis the table-panel renderer already uses). PNG is
+    /// deliberately not implemented (see `ExportFormat::Png`'s docs)
+    /// — reported honestly, not faked.
+    pub fn export_panel(
+        &self,
+        focused_panel: usize,
+        format: ExportFormat,
+        path: Option<&str>,
+    ) -> String {
+        let Some(panel) = self.panels.get(focused_panel) else {
+            return no_panel_focused_error();
+        };
+        if format == ExportFormat::Png {
+            return "PNG export is not available (no local renderer configured)".to_string();
+        }
+        let Some(result) = panel.last_result.as_ref() else {
+            return format!("panel \"{}\" has no data yet", panel.title);
+        };
+        let frame = match result {
+            Err(err) => return format!("panel \"{}\" last query failed: {err}", panel.title),
+            Ok(frame) => frame,
+        };
+        let Some(table) = table_for_export(frame) else {
+            return format!("panel \"{}\" has no data to export", panel.title);
+        };
+        let content = match format {
+            ExportFormat::Csv => table_to_csv(&table),
+            ExportFormat::Markdown => table_to_markdown(&table),
+            ExportFormat::Png => unreachable!("returned above"),
+        };
+
+        let relative =
+            path.map_or_else(|| default_export_path(&panel.title, format), str::to_string);
+        let destination = match validate_workspace_relative_path(&self.workspace_root, &relative) {
+            Ok(p) => p,
+            Err(err) => return err.to_string(),
+        };
+        if let Some(parent) = destination.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                return format!("failed to create {}: {err}", parent.display());
+            }
+        }
+        match std::fs::write(&destination, content) {
+            Ok(()) => format!("saved to {}", destination.display()),
+            Err(err) => format!("failed to write {}: {err}", destination.display()),
+        }
     }
 
     fn save(&self, path: &str) -> String {
@@ -368,6 +461,24 @@ fn no_panel_focused_error() -> String {
         "{}: \"panel *\" issued with no panel focused",
         ErrorCode::E103
     )
+}
+
+/// `exports/<slugified-panel-title>-<unix-ms>.<ext>`, used when
+/// `:save <format>` is given no explicit path. Not collision-proof
+/// against two exports in the same millisecond, but good enough for
+/// an interactive, one-at-a-time command.
+fn default_export_path(panel_title: &str, format: ExportFormat) -> String {
+    let slug: String = panel_title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("exports/{slug}-{}.{}", epoch_ms_now(), format.extension())
 }
 
 fn format_ad_hoc_result(query: &str, frame: &Frame) -> String {
@@ -528,7 +639,8 @@ pub fn execute_command(session: &mut LiveSession, focused_panel: usize, cmd: Com
 mod tests {
     use super::*;
     use dash9_core::{
-        DurationUnit, FrameKind, FrameMeta, ThresholdOp, ValidatedDatasource, ValidatedPanel,
+        DurationUnit, FrameKind, FrameMeta, Point, Series, ThresholdOp, ValidatedDatasource,
+        ValidatedPanel,
     };
     use tempfile::TempDir;
 
@@ -887,5 +999,91 @@ grid = { row = 0, col = 1, w = 1, h = 1 }
             [LogLine::Result(text)] => assert!(text.contains("boom"), "{text}"),
             other => panic!("expected exactly one Result log line, got {other:?}"),
         }
+    }
+
+    fn non_empty_frame() -> Frame {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("job".to_string(), "node".to_string());
+        Frame {
+            kind: FrameKind::InstantVector,
+            series: vec![Series {
+                labels,
+                points: vec![Point {
+                    timestamp_ms: 0,
+                    value: 0.5,
+                }],
+            }],
+            table: None,
+            meta: FrameMeta {
+                query: "up".to_string(),
+                datasource: "prom".to_string(),
+                executed_at_ms: 0,
+                warnings: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn export_panel_on_empty_session_reports_e103() {
+        let (session, _workspace) = session_with(vec![]);
+        let outcome = session.export_panel(0, ExportFormat::Csv, None);
+        assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn export_panel_with_no_data_yet_says_so() {
+        let (session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = session.export_panel(0, ExportFormat::Csv, None);
+        assert!(outcome.contains("no data yet"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn export_panel_with_a_failed_query_reports_the_error() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        session.panels[0].last_result = Some(Err(CommandError::new(ErrorCode::E106, "boom", None)));
+        let outcome = session.export_panel(0, ExportFormat::Csv, None);
+        assert!(outcome.contains("boom"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn export_panel_png_is_never_implemented_regardless_of_data_state() {
+        let (session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = session.export_panel(0, ExportFormat::Png, None);
+        assert!(outcome.contains("not available"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn export_panel_csv_writes_a_file_with_a_default_path() {
+        let (mut session, workspace) = session_with(vec![sample_panel("CPU Usage")]);
+        session.panels[0].last_result = Some(Ok(non_empty_frame()));
+
+        let outcome = session.export_panel(0, ExportFormat::Csv, None);
+        assert!(outcome.starts_with("saved to"), "{outcome}");
+
+        let exports_dir = workspace.path().join("exports");
+        let entries: Vec<_> = std::fs::read_dir(&exports_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one exported file");
+        let written = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+        assert!(written.starts_with("job,value\n"));
+        assert!(written.contains("node,0.500"));
+    }
+
+    #[tokio::test]
+    async fn export_panel_markdown_with_explicit_path() {
+        let (mut session, workspace) = session_with(vec![sample_panel("CPU")]);
+        session.panels[0].last_result = Some(Ok(non_empty_frame()));
+
+        let outcome = session.export_panel(0, ExportFormat::Markdown, Some("scratch.md"));
+        assert!(outcome.starts_with("saved to"), "{outcome}");
+        let written = std::fs::read_to_string(workspace.path().join("scratch.md")).unwrap();
+        assert!(written.starts_with("| job | value |"));
+    }
+
+    #[tokio::test]
+    async fn export_panel_rejects_a_path_escaping_the_workspace() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        session.panels[0].last_result = Some(Ok(non_empty_frame()));
+        let outcome = session.export_panel(0, ExportFormat::Csv, Some("../escape.csv"));
+        assert!(outcome.contains("E107"), "{outcome}");
     }
 }

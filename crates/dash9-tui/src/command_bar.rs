@@ -19,14 +19,22 @@ const INPUT_HEIGHT: u16 = 3;
 
 /// Draws the scrollable log (above) and the command-bar input line
 /// (below) into `area`. `input` is `Some(buffer)` while the user is
-/// typing a command (`:` keybinding), `None` otherwise — the input
-/// line still renders, as a hint of how to open it.
-pub fn draw_command_bar(frame: &mut Frame, area: Rect, log: &[LogLine], input: Option<&str>) {
+/// typing a command (`:` keybinding), `None` otherwise — in which
+/// case `hint` is shown instead, letting the composition root surface
+/// state-dependent guidance (e.g. "y/n confirm proposal" only while
+/// one is pending) without this module knowing why.
+pub fn draw_command_bar(
+    frame: &mut Frame,
+    area: Rect,
+    log: &[LogLine],
+    input: Option<&str>,
+    hint: &str,
+) {
     let [log_area, input_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(INPUT_HEIGHT)]).areas(area);
 
     draw_log(frame, log_area, log);
-    draw_input(frame, input_area, input);
+    draw_input(frame, input_area, input, hint);
 }
 
 fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine]) {
@@ -62,13 +70,10 @@ fn format_log_line(line: &LogLine) -> String {
     }
 }
 
-fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>) {
+fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>, hint: &str) {
     let (text, style) = match input {
         Some(buffer) => (format!(": {buffer}"), Style::default().fg(theme::FOCUS)),
-        None => (
-            "press : to enter a command".to_string(),
-            Style::default().fg(theme::MUTED),
-        ),
+        None => (hint.to_string(), Style::default().fg(theme::MUTED)),
     };
     let block = Block::default().borders(Borders::ALL);
     frame.render_widget(Paragraph::new(text).style(style).block(block), area);
@@ -89,7 +94,7 @@ mod tests {
     fn empty_log_draws_without_panicking() {
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &[], None))
+            .draw(|f| draw_command_bar(f, f.area(), &[], None, "press : to enter a command"))
             .unwrap();
     }
 
@@ -100,7 +105,7 @@ mod tests {
             .collect();
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &log, None))
+            .draw(|f| draw_command_bar(f, f.area(), &log, None, "press : to enter a command"))
             .unwrap();
     }
 
@@ -121,7 +126,15 @@ mod tests {
         ];
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &log, Some("range 1")))
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &log,
+                    Some("range 1"),
+                    "press : to enter a command",
+                );
+            })
             .unwrap();
     }
 
@@ -130,7 +143,7 @@ mod tests {
         let mut terminal = backend(60, 10);
         terminal
             .draw(|f| {
-                draw_command_bar(f, Rect::new(0, 0, 0, 0), &[], None);
+                draw_command_bar(f, Rect::new(0, 0, 0, 0), &[], None, "hint");
             })
             .unwrap();
     }

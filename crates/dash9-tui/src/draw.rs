@@ -258,7 +258,7 @@ pub fn draw_table(frame: &mut Frame, area: Rect, table: &dash9_core::Table, titl
     frame.render_widget(widget, area);
 }
 
-fn column_cell(column: &dash9_core::TableColumn, row_index: usize) -> String {
+pub(crate) fn column_cell(column: &dash9_core::TableColumn, row_index: usize) -> String {
     match &column.values {
         dash9_core::ColumnValues::Time(values) => values
             .get(row_index)

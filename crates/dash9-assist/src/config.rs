@@ -33,6 +33,17 @@ pub struct AssistConfig {
     /// falling back to non-streaming.
     #[serde(default)]
     pub stream: bool,
+    /// Optional, purely a display/discoverability hint: model names
+    /// the user knows their `base_url` endpoint serves, so a caller
+    /// (e.g. `dash9 open --assist`'s `:model` command) can list real
+    /// choices without querying a `/v1/models`-style endpoint — v1
+    /// has no such client method, and that endpoint's shape wasn't
+    /// reliable enough across the gateways tried during development
+    /// to build on. Never read or written by anything in this crate
+    /// beyond carrying it through; empty by default, fully backward
+    /// compatible with configs written before this field existed.
+    #[serde(default)]
+    pub known_models: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +115,26 @@ model = "llama3"
         assert_eq!(config.max_tokens, 1024);
         assert!(!config.stream);
         assert!(config.api_key_env.is_none());
+        assert!(
+            config.known_models.is_empty(),
+            "a config written before this field existed must still load"
+        );
+    }
+
+    #[test]
+    fn known_models_round_trips_when_present() {
+        let config = AssistConfig::from_toml_str(
+            r#"
+base_url = "http://localhost:4000"
+model = "cerebras-gpt-oss"
+known_models = ["cerebras-gpt-oss", "gemini-flash"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.known_models,
+            vec!["cerebras-gpt-oss".to_string(), "gemini-flash".to_string()]
+        );
     }
 
     #[test]

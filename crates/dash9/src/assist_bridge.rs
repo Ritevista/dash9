@@ -5,12 +5,12 @@
 //! `main.rs` — never compiled, and never linked against
 //! `dash9-assist`, when that optional feature is off.
 //!
-//! `crate::live_session` stays entirely unaware this file exists —
-//! everything assist-specific lives here and in `open.rs`'s
-//! `run_with_assist`, so the non-assist path (`open::run_plain`,
-//! `live_session.rs`) carries zero risk from this integration.
+//! [`AssistHandler`] implements `dash9_tui::shell::CommandHandler` —
+//! the render loop (`open::shell_loop`) doesn't know or care that this
+//! handler talks to an LLM; it's just another implementation of the
+//! same trait `GrammarOnlyHandler` (`open.rs`) implements. `crate::
+//! live_session` itself stays entirely unaware this file exists.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,10 +20,15 @@ use dash9_assist::{
 };
 use dash9_core::{Command, CommandSource, Datasource, LogLine, SessionLogEntry};
 use dash9_prom::PrometheusDatasource;
+use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput};
+use dash9_tui::{AssistStatusLine, StatusBarModel};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::datasources::epoch_ms_now;
 use crate::live_session::{execute_command, LiveSession};
+use crate::open::{help_text, status_bar_for, HasSession};
+
+const CHANNEL_CAPACITY: usize = 64;
 
 /// `~/.config/dash9/assist.toml` (`docs/specs/assist.md` Section D).
 /// No `dirs`/`home` crate in this workspace — `HOME` is enough for
@@ -35,24 +40,26 @@ fn default_config_path() -> Option<PathBuf> {
 /// Loads the assist config and builds a session, or returns the
 /// reason it couldn't — never fatal to the caller (mirrors `dash
 /// open`'s failure handling: a broken/absent assist config must not
-/// kill the whole `dash9 open` session).
-pub fn load_assist_session(
-    workspace_root: PathBuf,
-) -> Result<Arc<Mutex<AssistSession<HttpLlmClient>>>, String> {
+/// kill the whole `dash9 open` session). Returns the loaded
+/// `AssistConfig` alongside the session handle because model
+/// switching needs to clone-and-override it later.
+type LoadedAssistSession = (Arc<Mutex<AssistSession<HttpLlmClient>>>, AssistConfig);
+
+fn load_assist_session(workspace_root: PathBuf) -> Result<LoadedAssistSession, String> {
     let Some(path) = default_config_path() else {
         return Err("$HOME is not set; cannot locate ~/.config/dash9/assist.toml".to_string());
     };
     let config = AssistConfig::load(&path).map_err(|err| err.to_string())?;
     let client = HttpLlmClient::new(config.clone());
     let session = AssistSession::new(client, &config, workspace_root);
-    Ok(Arc::new(Mutex::new(session)))
+    Ok((Arc::new(Mutex::new(session)), config))
 }
 
 /// The parts of `AssistContext` buildable synchronously with no
-/// network access. Computed in the render loop right before spawning
+/// network access. Computed in `execute()` right before spawning
 /// `spawn_ask`, not inside the spawned task, so that task never needs
 /// a `LiveSession` reference — it only ever receives owned data.
-pub fn static_context_parts(
+fn static_context_parts(
     session: &LiveSession,
     now_ms: i64,
 ) -> (Vec<DatasourceSummary>, Option<String>, TimeRangeSummary) {
@@ -84,7 +91,7 @@ pub fn static_context_parts(
 /// back. Never blocks the render loop — the `Mutex` is only ever
 /// locked from inside this task, never from the render loop's own
 /// thread.
-pub fn spawn_ask(
+fn spawn_ask(
     assist: Arc<Mutex<AssistSession<HttpLlmClient>>>,
     focused_datasource: Option<(String, Arc<PrometheusDatasource>)>,
     static_parts: (Vec<DatasourceSummary>, Option<String>, TimeRangeSummary),
@@ -124,30 +131,263 @@ pub fn spawn_ask(
     });
 }
 
+/// Everything specific to an available, loaded assist config —
+/// `AssistHandler::assist` is `None` when the config couldn't load,
+/// so every method that needs this never has to handle "loaded but
+/// broken," only "loaded" vs "not available."
+struct AssistCore {
+    handle: Arc<Mutex<AssistSession<HttpLlmClient>>>,
+    config: AssistConfig,
+    workspace_root: PathBuf,
+    update_tx: mpsc::Sender<AssistOutcome>,
+    update_rx: mpsc::Receiver<AssistOutcome>,
+    enabled: bool,
+    model: String,
+    /// Mirrors `AssistStatusModel`'s connectivity, tracked locally
+    /// rather than read through `handle`'s `Mutex` each render tick —
+    /// that would need an `.await`, which the render loop's plain
+    /// sync closure can't do. Set to `"waiting"` the instant a request
+    /// is submitted, updated when the outcome arrives.
+    connectivity: String,
+    tokens_sent: u32,
+    tokens_received: u32,
+}
+
+pub struct AssistHandler {
+    session: LiveSession,
+    update_rx: mpsc::Receiver<crate::live_session::SessionUpdate>,
+    assist: Option<AssistCore>,
+}
+
+impl AssistHandler {
+    /// Returns the handler plus an optional startup message (e.g. why
+    /// assist isn't available) for the caller to log before entering
+    /// the render loop.
+    pub fn new(
+        session: LiveSession,
+        update_rx: mpsc::Receiver<crate::live_session::SessionUpdate>,
+        workspace_root: PathBuf,
+    ) -> (Self, Option<String>) {
+        match load_assist_session(workspace_root.clone()) {
+            Ok((handle, config)) => {
+                let model = config.model.clone();
+                let (update_tx, assist_rx) = mpsc::channel(CHANNEL_CAPACITY);
+                let core = AssistCore {
+                    handle,
+                    config,
+                    workspace_root,
+                    update_tx,
+                    update_rx: assist_rx,
+                    enabled: true,
+                    model,
+                    connectivity: "idle".to_string(),
+                    tokens_sent: 0,
+                    tokens_received: 0,
+                };
+                (
+                    Self {
+                        session,
+                        update_rx,
+                        assist: Some(core),
+                    },
+                    None,
+                )
+            }
+            Err(reason) => (
+                Self {
+                    session,
+                    update_rx,
+                    assist: None,
+                },
+                Some(format!("assist unavailable: {reason}")),
+            ),
+        }
+    }
+}
+
+impl HasSession for AssistHandler {
+    fn session(&self) -> &LiveSession {
+        &self.session
+    }
+}
+
+impl CommandHandler for AssistHandler {
+    fn execute(&mut self, input: ShellInput, focused_panel: usize) -> CommandResponse {
+        match input {
+            ShellInput::Grammar(Command::Quit) => CommandResponse {
+                should_quit: true,
+                ..CommandResponse::default()
+            },
+            ShellInput::Grammar(cmd) => {
+                CommandResponse::result(execute_command(&mut self.session, focused_panel, cmd))
+            }
+            ShellInput::Help => CommandResponse::result(help_text()),
+            ShellInput::Export { format, path } => CommandResponse::result(
+                self.session
+                    .export_panel(focused_panel, format, path.as_deref()),
+            ),
+            ShellInput::ModelStatus => CommandResponse::result(self.model_status()),
+            ShellInput::ModelSwitch(name) => CommandResponse::result(self.switch_model(&name)),
+            ShellInput::ToggleAssist => CommandResponse::result(self.toggle_assist()),
+            ShellInput::NaturalLanguage { text, parse_error } => {
+                self.ask_or_fallback(focused_panel, text, &parse_error)
+            }
+        }
+    }
+
+    fn poll(&mut self, focused_panel: usize) -> Option<CommandResponse> {
+        if let Ok(update) = self.update_rx.try_recv() {
+            let mut log_entries = Vec::new();
+            self.session.apply_update(update, &mut log_entries);
+            return Some(CommandResponse {
+                log_entries,
+                ..CommandResponse::default()
+            });
+        }
+        let core = self.assist.as_mut()?;
+        let Ok(outcome) = core.update_rx.try_recv() else {
+            return None;
+        };
+        core.connectivity = match &outcome {
+            AssistOutcome::Failed(err) => format!("error: {err}"),
+            _ => "idle".to_string(),
+        };
+        if let AssistOutcome::Turn(turn) = &outcome {
+            if let Some(usage) = turn.usage {
+                core.tokens_sent += usage.prompt_tokens;
+                core.tokens_received += usage.completion_tokens;
+            }
+        }
+        Some(handle_assist_outcome(
+            &mut self.session,
+            focused_panel,
+            outcome,
+        ))
+    }
+
+    fn panel_count(&self) -> usize {
+        self.session.panels.len()
+    }
+
+    fn status_bar(&self) -> StatusBarModel {
+        let assist = self.assist.as_ref().map(|core| AssistStatusLine {
+            model: core.model.clone(),
+            enabled: core.enabled,
+            connectivity: core.connectivity.clone(),
+            tokens_sent: core.tokens_sent,
+            tokens_received: core.tokens_received,
+        });
+        status_bar_for(&self.session, assist)
+    }
+}
+
+impl AssistHandler {
+    fn model_status(&self) -> String {
+        let Some(core) = &self.assist else {
+            return "assist unavailable".to_string();
+        };
+        if core.config.known_models.is_empty() {
+            format!("current model: {}", core.model)
+        } else {
+            format!(
+                "current model: {}\nknown models: {}",
+                core.model,
+                core.config.known_models.join(", ")
+            )
+        }
+    }
+
+    /// Rebuilds the `AssistSession` with the new model — conversation
+    /// history intentionally resets (decided with the user: switching
+    /// models is "end this session, start a new one," not mutating a
+    /// live session's model in place, which `dash9-assist`'s v1
+    /// non-goal of "no runtime model switching" already rules out).
+    fn switch_model(&mut self, name: &str) -> String {
+        let Some(core) = &mut self.assist else {
+            return "assist unavailable".to_string();
+        };
+        let mut new_config = core.config.clone();
+        new_config.model = name.to_string();
+        let client = HttpLlmClient::new(new_config.clone());
+        let session = AssistSession::new(client, &new_config, core.workspace_root.clone());
+        core.handle = Arc::new(Mutex::new(session));
+        core.config = new_config;
+        core.model = name.to_string();
+        core.connectivity = "idle".to_string();
+        format!("switched to model \"{name}\" (conversation history reset)")
+    }
+
+    fn toggle_assist(&mut self) -> String {
+        let Some(core) = &mut self.assist else {
+            return "assist unavailable".to_string();
+        };
+        core.enabled = !core.enabled;
+        format!(
+            "assistant turned {}",
+            if core.enabled { "on" } else { "off" }
+        )
+    }
+
+    fn ask_or_fallback(
+        &mut self,
+        focused_panel: usize,
+        text: String,
+        parse_error: &dash9_core::CommandError,
+    ) -> CommandResponse {
+        let Some(core) = &mut self.assist else {
+            return CommandResponse::result(parse_error.to_string());
+        };
+        if !core.enabled {
+            return CommandResponse::result(parse_error.to_string());
+        }
+
+        let now_ms = epoch_ms_now();
+        let static_parts = static_context_parts(&self.session, now_ms);
+        let focused_datasource = self.session.panels.get(focused_panel).and_then(|p| {
+            self.session
+                .datasources
+                .get(&p.datasource)
+                .map(|ds| (p.datasource.clone(), Arc::clone(&ds.adapter)))
+        });
+        let focused_panel_bool = !self.session.panels.is_empty();
+
+        core.connectivity = "waiting".to_string();
+        spawn_ask(
+            Arc::clone(&core.handle),
+            focused_datasource,
+            static_parts,
+            focused_panel_bool,
+            text,
+            core.update_tx.clone(),
+        );
+        CommandResponse::result("asking assistant…".to_string())
+    }
+}
+
 /// The AI-integration analogue of `live_session::execute_command`:
 /// pure/sync dispatch of one delivered `AssistOutcome`. Every
 /// `AutoRun` command runs immediately through the exact same
 /// `execute_command` a human-typed command uses; every `Proposal` is
-/// queued, never executed, until the caller applies or dismisses it
-/// (`docs/specs/assist.md` Section H/I — no invisible assistant
-/// action, a proposal is staged, not silently run).
-pub fn handle_assist_outcome(
+/// queued (via `CommandResponse::new_proposals`), never executed,
+/// until the caller applies or dismisses it (`docs/specs/assist.md`
+/// Section H/I — no invisible assistant action, a proposal is staged,
+/// not silently run).
+fn handle_assist_outcome(
     session: &mut LiveSession,
-    log: &mut Vec<LogLine>,
-    pending: &mut VecDeque<Command>,
     focused_panel: usize,
     outcome: AssistOutcome,
-) {
+) -> CommandResponse {
+    let mut response = CommandResponse::default();
     match outcome {
         AssistOutcome::Turn(turn) => {
             if let Some(sentence) = turn.intent_sentence {
-                log.push(LogLine::Result(sentence));
+                response.log_entries.push(LogLine::Result(sentence));
             }
             for proposed in turn.commands {
                 let cmd = match &proposed {
                     ProposedCommand::AutoRun(cmd) | ProposedCommand::Proposal(cmd) => cmd.clone(),
                 };
-                log.push(LogLine::Command(SessionLogEntry {
+                response.log_entries.push(LogLine::Command(SessionLogEntry {
                     source: CommandSource::Assistant,
                     command_text: format!("{cmd:?}"),
                     timestamp_ms: epoch_ms_now(),
@@ -155,11 +395,11 @@ pub fn handle_assist_outcome(
                 match proposed {
                     ProposedCommand::AutoRun(cmd) => {
                         let result = execute_command(session, focused_panel, cmd);
-                        log.push(LogLine::Result(result));
+                        response.log_entries.push(LogLine::Result(result));
                     }
                     ProposedCommand::Proposal(cmd) => {
-                        pending.push_back(cmd);
-                        log.push(LogLine::Result(
+                        response.new_proposals.push(cmd);
+                        response.log_entries.push(LogLine::Result(
                             "proposal — press y to apply, n to dismiss".to_string(),
                         ));
                     }
@@ -167,10 +407,17 @@ pub fn handle_assist_outcome(
             }
         }
         AssistOutcome::Refusal(sentence) => {
-            log.push(LogLine::Result(format!("assistant: {sentence}")));
+            response
+                .log_entries
+                .push(LogLine::Result(format!("assistant: {sentence}")));
         }
-        AssistOutcome::Failed(err) => log.push(LogLine::Result(format!("assistant error: {err}"))),
+        AssistOutcome::Failed(err) => {
+            response
+                .log_entries
+                .push(LogLine::Result(format!("assistant error: {err}")));
+        }
     }
+    response
 }
 
 #[cfg(test)]
@@ -181,7 +428,6 @@ mod tests {
         DatasourceType, Duration, DurationUnit, GridSpec, PanelType, RefreshInterval,
         ValidatedDashboard, ValidatedDatasource, ValidatedPanel,
     };
-    use tokio::sync::mpsc;
 
     fn sample_session() -> (LiveSession, tempfile::TempDir) {
         let dashboard = ValidatedDashboard {
@@ -244,8 +490,6 @@ mod tests {
     #[tokio::test]
     async fn autorun_command_executes_immediately_and_logs_twice() {
         let (mut session, _workspace) = sample_session();
-        let mut log = Vec::new();
-        let mut pending = VecDeque::new();
 
         let outcome = AssistOutcome::Turn(AssistTurn {
             intent_sentence: Some("Sure.".to_string()),
@@ -255,19 +499,17 @@ mod tests {
             raw_reply: String::new(),
             usage: None,
         });
-        handle_assist_outcome(&mut session, &mut log, &mut pending, 0, outcome);
+        let response = handle_assist_outcome(&mut session, 0, outcome);
 
         assert_eq!(session.panels[0].title, "Renamed by AI");
-        assert!(pending.is_empty());
+        assert!(response.new_proposals.is_empty());
         // intent sentence + command + result = 3 lines
-        assert_eq!(log.len(), 3);
+        assert_eq!(response.log_entries.len(), 3);
     }
 
     #[tokio::test]
     async fn proposal_command_is_queued_not_executed() {
         let (mut session, _workspace) = sample_session();
-        let mut log = Vec::new();
-        let mut pending = VecDeque::new();
         let original_title = session.panels[0].title.clone();
 
         let outcome = AssistOutcome::Turn(AssistTurn {
@@ -278,35 +520,26 @@ mod tests {
             raw_reply: String::new(),
             usage: None,
         });
-        handle_assist_outcome(&mut session, &mut log, &mut pending, 0, outcome);
+        let response = handle_assist_outcome(&mut session, 0, outcome);
 
         assert_eq!(session.panels[0].title, original_title, "must not execute");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(log.len(), 2); // command + "press y/n" result
+        assert_eq!(response.new_proposals.len(), 1);
+        assert_eq!(response.log_entries.len(), 2); // command + "press y/n" result
     }
 
     #[tokio::test]
     async fn refusal_and_failure_each_log_one_line() {
         let (mut session, _workspace) = sample_session();
-        let mut log = Vec::new();
-        let mut pending = VecDeque::new();
 
-        handle_assist_outcome(
-            &mut session,
-            &mut log,
-            &mut pending,
-            0,
-            AssistOutcome::Refusal("no.".to_string()),
-        );
-        assert_eq!(log.len(), 1);
+        let response =
+            handle_assist_outcome(&mut session, 0, AssistOutcome::Refusal("no.".to_string()));
+        assert_eq!(response.log_entries.len(), 1);
 
-        handle_assist_outcome(
+        let response = handle_assist_outcome(
             &mut session,
-            &mut log,
-            &mut pending,
             0,
             AssistOutcome::Failed(dash9_assist::AssistError::Timeout),
         );
-        assert_eq!(log.len(), 2);
+        assert_eq!(response.log_entries.len(), 1);
     }
 }
