@@ -31,7 +31,7 @@ use dash9_tui::chart::{ChartModel, ChartViewState};
 use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput, ShellState};
 use dash9_tui::{
     draw_chart, draw_command_bar, draw_gauge, draw_stat, draw_status_bar, draw_table, grid_layout,
-    series_as_table, theme, StatusBarModel,
+    help_text, series_as_table, theme, StatusBarModel,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -131,11 +131,10 @@ fn shell_loop<H: CommandHandler + HasSession>(
     })
 }
 
-/// The `run_plain` handler: no `dash9-assist` awareness at all.
-/// `ModelStatus`/`ModelSwitch`/`ToggleAssist` all report the same
-/// "requires --assist" message; `NaturalLanguage` shows the original
-/// grammar parse error verbatim — the exact message this input would
-/// have produced before the command bar existed.
+/// The `run_plain` handler: no `dash9-assist` awareness at all. Every
+/// AI-only `ShellInput` variant reports the same "requires --assist"
+/// message; `NaturalLanguage` (any line with no leading `/`) reports
+/// that natural language itself needs `--assist`.
 struct GrammarOnlyHandler {
     session: LiveSession,
     update_rx: mpsc::Receiver<SessionUpdate>,
@@ -157,15 +156,21 @@ impl CommandHandler for GrammarOnlyHandler {
             ShellInput::Grammar(cmd) => {
                 CommandResponse::result(execute_command(&mut self.session, focused_panel, cmd))
             }
-            ShellInput::Help => CommandResponse::result(help_text()),
+            ShellInput::Help(topic) => CommandResponse::result(help_text(topic.as_deref())),
+            ShellInput::CommandError(err) => CommandResponse::result(err.to_string()),
             ShellInput::Export { format, path } => CommandResponse::result(
                 self.session
                     .export_panel(focused_panel, format, path.as_deref()),
             ),
-            ShellInput::NaturalLanguage { parse_error, .. } => {
-                CommandResponse::result(parse_error.to_string())
-            }
-            ShellInput::ModelStatus | ShellInput::ModelSwitch(_) | ShellInput::ToggleAssist => {
+            ShellInput::NaturalLanguage(_) => CommandResponse::result(
+                "natural language requires --assist (or prefix a command with /, see /help)"
+                    .to_string(),
+            ),
+            ShellInput::ModelStatus
+            | ShellInput::ModelSwitch(_)
+            | ShellInput::ToggleAssist
+            | ShellInput::AssistStatus
+            | ShellInput::SetAssist(_) => {
                 CommandResponse::result("AI features require --assist".to_string())
             }
         }
@@ -210,30 +215,6 @@ pub(crate) fn status_bar_for(
     }
 }
 
-/// The full command reference, generated from `dash9_core::VERB_
-/// REFERENCE` (the same source `dash9-assist`'s system prompt already
-/// uses — one source of truth, never hand-duplicated) plus the
-/// shell-level meta-commands and keybindings. Shared by both handlers.
-pub(crate) fn help_text() -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::from("Commands:\n");
-    for spec in dash9_core::VERB_REFERENCE {
-        let args = spec.args.join(" ");
-        let _ = writeln!(out, "  {} {} — {}", spec.verb, args, spec.description);
-    }
-    out.push_str("  quit — end the session\n");
-    out.push_str("\nShell:\n");
-    out.push_str("  help | ? — show this text\n");
-    out.push_str("  model — show the current AI model (--assist only)\n");
-    out.push_str("  model <name> — switch AI model, resets conversation history (--assist only)\n");
-    out.push_str("  save <csv|md|png> [path] — export the focused panel's data\n");
-    out.push_str(
-        "\nKeys: Tab/Shift+Tab focus panel · : command (Esc cancels) · y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
-    );
-    out
-}
-
 fn draw_session(
     frame: &mut Frame,
     area: Rect,
@@ -273,7 +254,7 @@ fn draw_session(
 /// toggle at all — never shown as options that would currently do
 /// nothing.
 fn command_bar_hint(state: &ShellState, status: &StatusBarModel) -> String {
-    let mut hints = vec![": command", "Tab focus"];
+    let mut hints = vec!["/command · text = AI", "Tab reaches this box", "/help"];
     if !state.pending_proposals.is_empty() {
         hints.push("y/n confirm proposal");
     }

@@ -9,18 +9,29 @@
 //! implementations with real I/O live in the `dash9` binary
 //! (`GrammarOnlyHandler`, `AssistHandler`).
 //!
-//! Adopts three things dash9's command bar was missing relative to
-//! `LoreMesh`'s: **Escape never quits** (only `q` outside input, or the
-//! `quit` grammar verb — an accidental `Esc` no longer kills the
-//! session), **command history** (`Up`/`Down` while typing cycles
+//! Adopts things dash9's command bar was missing relative to
+//! `LoreMesh`: **Escape never quits** (only `q` outside input, `/quit`,
+//! or `Ctrl+C`), **command history** (`Up`/`Down` while typing cycles
 //! previous submissions), and a pure/testable core instead of
 //! key-handling inlined into the render loop.
+//!
+//! Command routing is explicit-prefix, not fallback: a submitted line
+//! starting with `/` is always a structured command (a shell
+//! meta-verb, or SPEC.md grammar via `dash9_core::parse`) —
+//! unrecognized text after `/` is a hard error, never silently
+//! retried as natural language. A line with **no** leading `/` is
+//! always natural language, even if it happens to look like valid
+//! grammar (`dash9_core::parse` is never called on it). `Tab`/
+//! `Shift+Tab` cycle through every panel and then into the command
+//! box itself (a `panel_count() + 1`-stop ring), so the command box
+//! is reachable without needing to already know about `:`.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use dash9_core::{Command, CommandSource, LogLine, SessionLogEntry};
+use dash9_core::{Command, CommandError, CommandSource, LogLine, SessionLogEntry, VerbSpec};
 
 use crate::export::ExportFormat;
 use crate::status_bar::StatusBarModel;
@@ -32,45 +43,226 @@ const MAX_HISTORY: usize = 50;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShellInput {
     Grammar(Command),
-    Help,
+    /// `/help` or `/?` (`None`), or `/help <topic>` (`Some`).
+    Help(Option<String>),
     ModelStatus,
     ModelSwitch(String),
+    /// Bare `/ai`: combined enabled/disabled + model status.
+    AssistStatus,
+    /// `/ai on` / `/ai off` — explicit, idempotent (unlike the bare
+    /// `a` key, which toggles).
+    SetAssist(bool),
+    ToggleAssist,
     Export {
         format: ExportFormat,
         path: Option<String>,
     },
-    /// Carries the original parse error alongside the raw text: a
-    /// handler without natural-language support (`GrammarOnlyHandler`)
-    /// shows `parse_error` verbatim — the exact same message this
-    /// input would have produced before any of this existed — while
-    /// `AssistHandler` uses `text` to ask instead.
-    NaturalLanguage {
-        text: String,
-        parse_error: dash9_core::CommandError,
-    },
-    ToggleAssist,
+    /// A line with no leading `/` — always sent as-is, never
+    /// grammar-parsed first.
+    NaturalLanguage(String),
+    /// A line that started with `/` but didn't match any shell
+    /// meta-verb or `dash9_core` grammar verb.
+    CommandError(CommandError),
 }
 
-/// Parses one submitted line into a [`ShellInput`]. Recognizes the
-/// shell-level meta-commands (`help`, `model`, `model <name>`,
-/// `save <format> [path]`) before falling back to
-/// `dash9_core::parse` — these are shell/UI concerns, not part of
-/// SPEC.md's append-only command grammar, so they're intercepted
-/// here rather than added to `dash9_core::Command`.
+/// Shell-level meta-commands (`help`, `model`, `ai`, `save`, `quit`)
+/// in the same `VerbSpec` shape `dash9_core::VERB_REFERENCE` uses —
+/// these are deliberately *not* part of SPEC.md's append-only grammar
+/// (they're shell/UI concerns, not something an automated caller
+/// would ever propose), but sharing the shape lets `/help` group and
+/// render both sources identically.
+const SHELL_META_REFERENCE: &[VerbSpec] = &[
+    VerbSpec {
+        verb: "help",
+        args: &["topic?"],
+        example: "/help ds",
+        description: "List commands, or show detail for one topic.",
+    },
+    VerbSpec {
+        verb: "model",
+        args: &[],
+        example: "/model",
+        description: "Show the current AI model and any configured known models.",
+    },
+    VerbSpec {
+        verb: "model",
+        args: &["name"],
+        example: "/model gemini-flash",
+        description: "Switch the AI model (resets conversation history).",
+    },
+    VerbSpec {
+        verb: "ai",
+        args: &[],
+        example: "/ai",
+        description: "Show whether the assistant is on/off and the current model.",
+    },
+    VerbSpec {
+        verb: "ai on",
+        args: &[],
+        example: "/ai on",
+        description: "Turn the assistant on.",
+    },
+    VerbSpec {
+        verb: "ai off",
+        args: &[],
+        example: "/ai off",
+        description: "Turn the assistant off.",
+    },
+    VerbSpec {
+        verb: "ai model",
+        args: &["name"],
+        example: "/ai model gemini-flash",
+        description: "Switch the AI model (alias of \"/model <name>\").",
+    },
+    VerbSpec {
+        verb: "save",
+        args: &["format", "path?"],
+        example: "/save csv exports/out.csv",
+        description: "Export the focused panel's data (csv, md, or png).",
+    },
+    VerbSpec {
+        verb: "quit",
+        args: &[],
+        example: "/quit",
+        description: "End the session.",
+    },
+];
+
+/// One-line blurbs for `/help`'s top-level listing — written
+/// separately from `VERB_REFERENCE`/`SHELL_META_REFERENCE`'s
+/// per-verb descriptions since a group summary ("manage datasources")
+/// reads better at the top level than any single member verb's own
+/// description would.
+const GROUP_BLURBS: &[(&str, &str)] = &[
+    ("ds", "manage datasources (add, list)"),
+    ("q", "run an instant query against the focused datasource"),
+    (
+        "panel",
+        "configure the focused panel (type, threshold, title)",
+    ),
+    ("range", "set the view's time range"),
+    ("refresh", "set the auto-refresh interval"),
+    ("dash", "save or open a dashboard file"),
+    ("save", "export the focused panel's data (csv, md, png)"),
+    ("model", "show or switch the AI model"),
+    ("ai", "AI on/off/model (--assist only)"),
+    ("help", "show this list, or /help <name> for detail"),
+    ("quit", "end the session"),
+];
+
+fn all_specs() -> impl Iterator<Item = &'static VerbSpec> {
+    dash9_core::VERB_REFERENCE
+        .iter()
+        .chain(SHELL_META_REFERENCE.iter())
+}
+
+/// A verb's group is its first whitespace-separated token — `"ds
+/// add"` groups under `"ds"`, `"ai model"` groups under `"ai"`, a
+/// single-token verb like `"range"` is its own one-member group.
+fn group_of(verb: &str) -> &str {
+    verb.split_whitespace().next().unwrap_or(verb)
+}
+
+/// The full command reference: `/help` (bare) lists top-level groups,
+/// `/help <topic>` drills into one. Pure, no I/O — shared by every
+/// `CommandHandler` implementation instead of being duplicated per
+/// handler.
+pub fn help_text(topic: Option<&str>) -> String {
+    match topic {
+        None => help_overview(),
+        Some(t) => help_topic(t),
+    }
+}
+
+fn help_overview() -> String {
+    let mut out = String::from(
+        "Commands — prefix with / (e.g. /range 5m). Type \"/help <name>\" for detail:\n",
+    );
+    for (name, blurb) in GROUP_BLURBS {
+        let _ = writeln!(out, "  {name:<7} {blurb}");
+    }
+    out.push_str(
+        "\nNo leading / — the whole line goes to the AI as natural language \
+         (needs --assist and AI on).\n",
+    );
+    out.push_str(
+        "Keys: Tab/Shift+Tab cycle panels + command box · : jump to command box \
+         (Esc cancels) · y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
+    );
+    out
+}
+
+/// `topic` containing a space (e.g. `"ds add"`) is matched exactly
+/// against one verb; a single-word topic (e.g. `"ds"`, `"model"`)
+/// matches every verb in that group, which also naturally covers
+/// single-verb groups like `"range"` (a group of one).
+fn help_topic(topic: &str) -> String {
+    let topic = topic.trim();
+    let matches: Vec<&VerbSpec> = if topic.contains(' ') {
+        all_specs().filter(|spec| spec.verb == topic).collect()
+    } else {
+        all_specs()
+            .filter(|spec| group_of(spec.verb) == topic)
+            .collect()
+    };
+    if matches.is_empty() {
+        return format!("unknown help topic \"{topic}\" — try /help");
+    }
+    let mut out = String::new();
+    for spec in matches {
+        let args = spec.args.join(" ");
+        let _ = writeln!(out, "/{} {args}", spec.verb);
+        let _ = writeln!(out, "  {}", spec.description);
+        let _ = writeln!(out, "  e.g. {}\n", spec.example);
+    }
+    out.trim_end().to_string()
+}
+
+/// Parses one submitted line. A leading `/` is the only thing that
+/// makes a line a structured command — everything after it must
+/// match a shell meta-verb or `dash9_core::parse`, or the result is
+/// [`ShellInput::CommandError`]. No leading `/` is always
+/// [`ShellInput::NaturalLanguage`], unconditionally — the text is
+/// never handed to `dash9_core::parse` at all.
 pub fn parse_shell_input(text: &str) -> ShellInput {
     let trimmed = text.trim();
-    match trimmed {
-        "help" | "?" => return ShellInput::Help,
-        "model" => return ShellInput::ModelStatus,
-        _ => {}
+    let Some(body) = trimmed.strip_prefix('/') else {
+        return ShellInput::NaturalLanguage(trimmed.to_string());
+    };
+    let body = body.trim();
+
+    if body == "help" || body == "?" {
+        return ShellInput::Help(None);
     }
-    if let Some(rest) = trimmed.strip_prefix("model ") {
-        let name = rest.trim();
+    if let Some(topic) = body.strip_prefix("help ") {
+        let topic = topic.trim();
+        return ShellInput::Help((!topic.is_empty()).then(|| topic.to_string()));
+    }
+    if body == "model" {
+        return ShellInput::ModelStatus;
+    }
+    if let Some(name) = body.strip_prefix("model ") {
+        let name = name.trim();
         if !name.is_empty() {
             return ShellInput::ModelSwitch(name.to_string());
         }
     }
-    if let Some(rest) = trimmed.strip_prefix("save ") {
+    if body == "ai" {
+        return ShellInput::AssistStatus;
+    }
+    if body == "ai on" {
+        return ShellInput::SetAssist(true);
+    }
+    if body == "ai off" {
+        return ShellInput::SetAssist(false);
+    }
+    if let Some(name) = body.strip_prefix("ai model ") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return ShellInput::ModelSwitch(name.to_string());
+        }
+    }
+    if let Some(rest) = body.strip_prefix("save ") {
         let mut parts = rest.trim().splitn(2, char::is_whitespace);
         let format_str = parts.next().unwrap_or("");
         if let Some(format) = ExportFormat::parse(format_str) {
@@ -83,14 +275,12 @@ pub fn parse_shell_input(text: &str) -> ShellInput {
         }
         // Unrecognized format falls through to grammar parsing below,
         // which reports the same "unknown verb" shape any other
-        // unrecognized input gets — no bespoke error path needed.
+        // unrecognized `/`-command gets.
     }
-    match dash9_core::parse(trimmed) {
+
+    match dash9_core::parse(body) {
         Ok(cmd) => ShellInput::Grammar(cmd),
-        Err(parse_error) => ShellInput::NaturalLanguage {
-            text: trimmed.to_string(),
-            parse_error,
-        },
+        Err(err) => ShellInput::CommandError(err),
     }
 }
 
@@ -147,7 +337,7 @@ impl ShellState {
     /// Applies one keyboard event. Returns `true` only when the
     /// session should end — `Esc` never does, matching `LoreMesh`'s
     /// explicit invariant ("Escape never terminates... even when
-    /// pressed repeatedly"); only `q` outside input, typing `quit`, or
+    /// pressed repeatedly"); only `q` outside input, `/quit`, or
     /// `Ctrl+C` (checked first, unconditionally, regardless of input
     /// state — raw mode intercepts it as a normal keypress rather than
     /// sending a real `SIGINT`, so without this a `Ctrl+C` habit either
@@ -161,26 +351,33 @@ impl ShellState {
             return true;
         }
 
-        if let Some(buffer) = self.input.as_mut() {
+        if self.input.is_some() {
             match key.code {
                 KeyCode::Esc => {
                     self.input = None;
                     self.history_cursor = None;
                 }
                 KeyCode::Enter => {
-                    let text = buffer.clone();
-                    self.input = None;
+                    let text = self.input.take().unwrap_or_default();
                     self.history_cursor = None;
                     if !text.trim().is_empty() {
                         return self.submit(&text, handler);
                     }
                 }
                 KeyCode::Backspace => {
-                    buffer.pop();
+                    if let Some(buffer) = self.input.as_mut() {
+                        buffer.pop();
+                    }
                 }
                 KeyCode::Up => self.history_previous(),
                 KeyCode::Down => self.history_next(),
-                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Tab => self.advance_focus(handler, true),
+                KeyCode::BackTab => self.advance_focus(handler, false),
+                KeyCode::Char(c) => {
+                    if let Some(buffer) = self.input.as_mut() {
+                        buffer.push(c);
+                    }
+                }
                 _ => {}
             }
             return false;
@@ -205,16 +402,37 @@ impl ShellState {
             }
             KeyCode::Char('q') => return true,
             KeyCode::Char(':') => self.input = Some(String::new()),
-            KeyCode::Tab if handler.panel_count() > 0 => {
-                self.focused_panel = (self.focused_panel + 1) % handler.panel_count();
-            }
-            KeyCode::BackTab if handler.panel_count() > 0 => {
-                let len = handler.panel_count();
-                self.focused_panel = (self.focused_panel + len - 1) % len;
-            }
+            KeyCode::Tab => self.advance_focus(handler, true),
+            KeyCode::BackTab => self.advance_focus(handler, false),
             _ => {}
         }
         false
+    }
+
+    /// Moves focus one step around the `panel_count() + 1`-stop ring
+    /// (every panel, then the command box, wrapping). Entering the
+    /// command box always starts an empty buffer; leaving it discards
+    /// any uncommitted text, same as `Esc`.
+    fn advance_focus<H: CommandHandler>(&mut self, handler: &H, forward: bool) {
+        let panel_count = handler.panel_count();
+        let total = panel_count + 1;
+        let current = if self.input.is_some() {
+            panel_count
+        } else {
+            self.focused_panel.min(panel_count.saturating_sub(1))
+        };
+        let next = if forward {
+            (current + 1) % total
+        } else {
+            (current + total - 1) % total
+        };
+        if next == panel_count {
+            self.input = Some(String::new());
+        } else {
+            self.input = None;
+            self.focused_panel = next;
+        }
+        self.history_cursor = None;
     }
 
     /// Drains every background result currently ready, applying each
@@ -306,7 +524,7 @@ fn epoch_ms_now() -> i64 {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use dash9_core::{PanelType, RefreshInterval};
+    use dash9_core::{ErrorCode, PanelType, RefreshInterval};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -415,16 +633,55 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_backtab_cycle_panel_focus() {
+    fn tab_cycles_every_panel_then_reaches_the_command_box_then_wraps() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(3);
+
         state.handle_key(press(KeyCode::Tab), &mut handler);
         assert_eq!(state.focused_panel, 1);
+        assert!(state.input.is_none());
+
         state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.focused_panel, 2);
+
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert_eq!(state.focused_panel, 0, "wraps around");
+        assert!(
+            state.input.is_some(),
+            "the 4th Tab (past the last of 3 panels) reaches the command box"
+        );
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert!(state.input.is_none(), "Tab out of the command box wraps");
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn backtab_from_the_first_panel_reaches_the_command_box_backward() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(3);
+        assert_eq!(state.focused_panel, 0);
+
         state.handle_key(press(KeyCode::BackTab), &mut handler);
-        assert_eq!(state.focused_panel, 2, "wraps backward");
+        assert!(state.input.is_some());
+
+        state.handle_key(press(KeyCode::BackTab), &mut handler);
+        assert!(state.input.is_none());
+        assert_eq!(state.focused_panel, 2, "wraps backward to the last panel");
+    }
+
+    #[test]
+    fn tab_while_editing_discards_the_uncommitted_buffer() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+        assert_eq!(state.input.as_deref(), Some("x"));
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert!(
+            state.input.is_none(),
+            "left the command box, dropping \"x\""
+        );
     }
 
     #[test]
@@ -433,7 +690,7 @@ mod tests {
         let mut handler = MockHandler::new(1);
         handler.next_response = Some(CommandResponse::result("range set to 5m"));
 
-        let quit = type_and_submit(&mut state, &mut handler, "range 5m");
+        let quit = type_and_submit(&mut state, &mut handler, "/range 5m");
         assert!(!quit);
         assert_eq!(handler.calls.len(), 1);
         assert!(matches!(
@@ -444,26 +701,59 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_text_reaches_handler_as_natural_language_with_the_parse_error_attached() {
+    fn text_without_a_leading_slash_is_always_natural_language() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
         type_and_submit(&mut state, &mut handler, "please rename this");
+        assert_eq!(
+            handler.calls[0],
+            ShellInput::NaturalLanguage("please rename this".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_text_that_looks_like_grammar_is_still_natural_language() {
+        // The discriminator is the leading `/`, not parseability —
+        // "range 5m" is valid grammar, but with no `/` it must still
+        // be routed as natural language, never silently executed.
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        type_and_submit(&mut state, &mut handler, "range 5m");
+        assert_eq!(
+            handler.calls[0],
+            ShellInput::NaturalLanguage("range 5m".to_string())
+        );
+    }
+
+    #[test]
+    fn slash_prefixed_unknown_command_is_a_command_error() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        type_and_submit(&mut state, &mut handler, "/bogus");
         match &handler.calls[0] {
-            ShellInput::NaturalLanguage { text, parse_error } => {
-                assert_eq!(text, "please rename this");
-                assert_eq!(parse_error.code, dash9_core::ErrorCode::E002);
-            }
-            other => panic!("expected NaturalLanguage, got {other:?}"),
+            ShellInput::CommandError(err) => assert_eq!(err.code, ErrorCode::E002),
+            other => panic!("expected CommandError, got {other:?}"),
         }
     }
 
     #[test]
-    fn help_and_model_meta_commands_are_recognized_before_grammar_parsing() {
-        assert_eq!(parse_shell_input("help"), ShellInput::Help);
-        assert_eq!(parse_shell_input("?"), ShellInput::Help);
-        assert_eq!(parse_shell_input("model"), ShellInput::ModelStatus);
+    fn help_and_ai_meta_commands_are_recognized_before_grammar_parsing() {
+        assert_eq!(parse_shell_input("/help"), ShellInput::Help(None));
+        assert_eq!(parse_shell_input("/?"), ShellInput::Help(None));
         assert_eq!(
-            parse_shell_input("model gemini-flash"),
+            parse_shell_input("/help ds"),
+            ShellInput::Help(Some("ds".to_string()))
+        );
+        assert_eq!(parse_shell_input("/model"), ShellInput::ModelStatus);
+        assert_eq!(
+            parse_shell_input("/model gemini-flash"),
+            ShellInput::ModelSwitch("gemini-flash".to_string())
+        );
+        assert_eq!(parse_shell_input("/ai"), ShellInput::AssistStatus);
+        assert_eq!(parse_shell_input("/ai on"), ShellInput::SetAssist(true));
+        assert_eq!(parse_shell_input("/ai off"), ShellInput::SetAssist(false));
+        assert_eq!(
+            parse_shell_input("/ai model gemini-flash"),
             ShellInput::ModelSwitch("gemini-flash".to_string())
         );
     }
@@ -471,14 +761,14 @@ mod tests {
     #[test]
     fn save_meta_command_parses_format_and_optional_path() {
         assert_eq!(
-            parse_shell_input("save csv"),
+            parse_shell_input("/save csv"),
             ShellInput::Export {
                 format: ExportFormat::Csv,
                 path: None,
             }
         );
         assert_eq!(
-            parse_shell_input("save md exports/out.md"),
+            parse_shell_input("/save md exports/out.md"),
             ShellInput::Export {
                 format: ExportFormat::Markdown,
                 path: Some("exports/out.md".to_string()),
@@ -487,11 +777,39 @@ mod tests {
     }
 
     #[test]
-    fn save_with_unknown_format_falls_back_to_grammar_parse_error() {
-        match parse_shell_input("save pdf out.pdf") {
-            ShellInput::NaturalLanguage { .. } => {}
-            other => panic!("expected a fallback parse failure, got {other:?}"),
+    fn save_with_unknown_format_falls_through_to_a_command_error() {
+        match parse_shell_input("/save pdf out.pdf") {
+            ShellInput::CommandError(_) => {}
+            other => panic!("expected a CommandError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_overview_lists_every_top_level_group() {
+        let text = help_text(None);
+        for (name, _) in GROUP_BLURBS {
+            assert!(text.contains(name), "missing group {name:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn help_topic_group_lists_every_member_verb() {
+        let text = help_text(Some("ds"));
+        assert!(text.contains("/ds add"));
+        assert!(text.contains("/ds list"));
+    }
+
+    #[test]
+    fn help_topic_exact_multiword_verb_shows_one_entry() {
+        let text = help_text(Some("ds add"));
+        assert!(text.contains("/ds add"));
+        assert!(!text.contains("/ds list"));
+    }
+
+    #[test]
+    fn help_topic_unknown_reports_unknown() {
+        let text = help_text(Some("bogus"));
+        assert!(text.contains("unknown help topic"));
     }
 
     #[test]
@@ -534,22 +852,22 @@ mod tests {
     fn history_recall_cycles_most_recent_first_and_back_to_empty() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
-        type_and_submit(&mut state, &mut handler, "range 1h");
-        type_and_submit(&mut state, &mut handler, "range 2h");
+        type_and_submit(&mut state, &mut handler, "/range 1h");
+        type_and_submit(&mut state, &mut handler, "/range 2h");
 
         state.handle_key(char_key(':'), &mut handler);
         state.handle_key(press(KeyCode::Up), &mut handler);
         assert_eq!(
             state.input.as_deref(),
-            Some("range 2h"),
+            Some("/range 2h"),
             "most recent first"
         );
         state.handle_key(press(KeyCode::Up), &mut handler);
-        assert_eq!(state.input.as_deref(), Some("range 1h"));
+        assert_eq!(state.input.as_deref(), Some("/range 1h"));
         state.handle_key(press(KeyCode::Up), &mut handler);
-        assert_eq!(state.input.as_deref(), Some("range 1h"), "stops at oldest");
+        assert_eq!(state.input.as_deref(), Some("/range 1h"), "stops at oldest");
         state.handle_key(press(KeyCode::Down), &mut handler);
-        assert_eq!(state.input.as_deref(), Some("range 2h"));
+        assert_eq!(state.input.as_deref(), Some("/range 2h"));
         state.handle_key(press(KeyCode::Down), &mut handler);
         assert_eq!(
             state.input.as_deref(),

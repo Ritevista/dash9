@@ -20,5 +20,7 @@ pub use command_bar::draw_command_bar;
 pub use draw::{draw_chart, draw_gauge, draw_stat, draw_table, series_as_table};
 pub use export::{table_for_export, table_to_csv, table_to_markdown, ExportFormat};
 pub use layout::{content_height, grid_layout};
-pub use shell::{parse_shell_input, CommandHandler, CommandResponse, ShellInput, ShellState};
+pub use shell::{
+    help_text, parse_shell_input, CommandHandler, CommandResponse, ShellInput, ShellState,
+};
 pub use status_bar::{draw_status_bar, AssistStatusLine, DatasourceHealth, StatusBarModel};

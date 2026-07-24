@@ -21,12 +21,12 @@ use dash9_assist::{
 use dash9_core::{Command, CommandSource, Datasource, LogLine, SessionLogEntry};
 use dash9_prom::PrometheusDatasource;
 use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput};
-use dash9_tui::{AssistStatusLine, StatusBarModel};
+use dash9_tui::{help_text, AssistStatusLine, StatusBarModel};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::datasources::epoch_ms_now;
 use crate::live_session::{execute_command, LiveSession};
-use crate::open::{help_text, status_bar_for, HasSession};
+use crate::open::{status_bar_for, HasSession};
 
 const CHANNEL_CAPACITY: usize = 64;
 
@@ -221,17 +221,18 @@ impl CommandHandler for AssistHandler {
             ShellInput::Grammar(cmd) => {
                 CommandResponse::result(execute_command(&mut self.session, focused_panel, cmd))
             }
-            ShellInput::Help => CommandResponse::result(help_text()),
+            ShellInput::Help(topic) => CommandResponse::result(help_text(topic.as_deref())),
+            ShellInput::CommandError(err) => CommandResponse::result(err.to_string()),
             ShellInput::Export { format, path } => CommandResponse::result(
                 self.session
                     .export_panel(focused_panel, format, path.as_deref()),
             ),
             ShellInput::ModelStatus => CommandResponse::result(self.model_status()),
             ShellInput::ModelSwitch(name) => CommandResponse::result(self.switch_model(&name)),
+            ShellInput::AssistStatus => CommandResponse::result(self.assist_status()),
+            ShellInput::SetAssist(on) => CommandResponse::result(self.set_assist(on)),
             ShellInput::ToggleAssist => CommandResponse::result(self.toggle_assist()),
-            ShellInput::NaturalLanguage { text, parse_error } => {
-                self.ask_or_fallback(focused_panel, text, &parse_error)
-            }
+            ShellInput::NaturalLanguage(text) => self.ask_or_fallback(focused_panel, text),
         }
     }
 
@@ -328,17 +329,42 @@ impl AssistHandler {
         )
     }
 
-    fn ask_or_fallback(
-        &mut self,
-        focused_panel: usize,
-        text: String,
-        parse_error: &dash9_core::CommandError,
-    ) -> CommandResponse {
+    /// `/ai on` / `/ai off` — explicit and idempotent, unlike the
+    /// bare `a` key's toggle: setting the state it's already in
+    /// reports that rather than flipping it.
+    fn set_assist(&mut self, on: bool) -> String {
         let Some(core) = &mut self.assist else {
-            return CommandResponse::result(parse_error.to_string());
+            return "assist unavailable".to_string();
+        };
+        if core.enabled == on {
+            return format!("assistant already {}", if on { "on" } else { "off" });
+        }
+        core.enabled = on;
+        format!("assistant turned {}", if on { "on" } else { "off" })
+    }
+
+    /// Bare `/ai`: combined on/off + model status, for a single
+    /// glance at everything `/ai on|off` and `/model` each show a
+    /// slice of.
+    fn assist_status(&self) -> String {
+        let Some(core) = &self.assist else {
+            return "assist unavailable".to_string();
+        };
+        format!(
+            "assistant: {}\n{}",
+            if core.enabled { "on" } else { "off" },
+            self.model_status()
+        )
+    }
+
+    fn ask_or_fallback(&mut self, focused_panel: usize, text: String) -> CommandResponse {
+        let unavailable_message =
+            "no AI available — enable with /ai on, or use / for commands (see /help)";
+        let Some(core) = &mut self.assist else {
+            return CommandResponse::result(unavailable_message);
         };
         if !core.enabled {
-            return CommandResponse::result(parse_error.to_string());
+            return CommandResponse::result(unavailable_message);
         }
 
         let now_ms = epoch_ms_now();
