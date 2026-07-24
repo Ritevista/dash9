@@ -9,6 +9,8 @@
 
 pub mod chart;
 pub mod draw;
+pub mod layout;
 pub mod theme;
 
-pub use draw::draw_chart;
+pub use draw::{draw_chart, draw_gauge, draw_stat, draw_table, series_as_table};
+pub use layout::grid_layout;

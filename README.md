@@ -22,6 +22,28 @@ cargo run -p dash9 -- test path/to/dashboard.toml
 
 `dash9 test` loads and validates the file, runs each panel's query against its configured Prometheus datasource, checks that the result is non-empty (unless the panel allows it) and within its latency budget, and exits `0`/`1`/`2` depending on whether every panel passed, a panel failed, or the file itself was invalid (`SPEC.md` Section C.3).
 
+## Test against a live datasource
+
+`docker-compose.yml` runs a real Prometheus scraping itself and a
+`node_exporter`, so `dash9-prom` has live, changing metrics to query —
+no mocks. Requires Docker.
+
+```console
+just up      # or: docker compose up -d
+cargo run -p dash9 -- test examples/node-overview.toml
+cargo run -p dash9 -- dash open examples/node-overview.toml
+just down    # or: docker compose down
+```
+
+`node_exporter` reports on whatever the Docker daemon's kernel is —
+the host's on Linux, the Docker Desktop VM's on macOS/Windows — either
+way the metrics are real and change in real time, which is what
+exercising the datasource port needs.
+
+Prometheus is published on host port **9091**, not 9090 — some
+systems (e.g. Cockpit) already bind 9090, and Docker publishes fail
+silently rather than erroring in that case, so `examples/node-overview.toml` points at `9091`. If `9091` is also taken on your machine, change both the `ports:` mapping in `docker-compose.yml` and the datasource `url` in the example dashboard to a free port.
+
 ## Principles
 
 - One `Frame` type is the boundary every datasource adapter produces and every renderer consumes — nothing downstream of a `Frame` knows which datasource produced it (`SPEC.md` Section A).

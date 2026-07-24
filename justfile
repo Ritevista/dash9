@@ -13,3 +13,9 @@ ci: check test
 
 demo:
     cargo run -p dash9 -- demo
+
+up:
+    docker compose up -d
+
+down:
+    docker compose down

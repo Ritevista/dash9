@@ -7,21 +7,12 @@
 //! this module is only responsible for wiring real `Frame`s and real
 //! elapsed times into it and reporting the result.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use dash9_core::{
-    check_panel, load_path, validate, CommandError, Datasource, ErrorCode, Frame, PanelCheckResult,
-    PanelType, ValidatedDashboard, ValidatedPanel,
-};
-use dash9_prom::PrometheusDatasource;
+use dash9_core::{check_panel, load_path, validate, PanelCheckResult, ValidatedPanel};
 
-/// Target sample count when deriving a `query_range` step from a
-/// panel's effective time range — the same rough cadence
-/// `dash9 demo`'s synthetic chart uses.
-const TARGET_RANGE_SAMPLES: i64 = 120;
-const MIN_STEP_MS: i64 = 1_000;
+use crate::datasources::{build_datasources, epoch_ms_now, execute_panel_query};
 
 /// Runs `dash9 test <path>` and returns the process exit code per
 /// SPEC.md C.3: `0` all panels passed, `1` the file was valid but a
@@ -78,47 +69,6 @@ pub async fn run(path: &Path) -> anyhow::Result<i32> {
     Ok(i32::from(!all_passed))
 }
 
-fn build_datasources(dashboard: &ValidatedDashboard) -> HashMap<String, PrometheusDatasource> {
-    dashboard
-        .datasources
-        .iter()
-        .map(|ds| {
-            // `dash9-core::validate()` only accepts `type =
-            // "prometheus"` in v0.1 (SPEC.md C.1/D), so this is the
-            // only adapter constructed today; a second datasource
-            // type will need a match here.
-            let adapter = PrometheusDatasource::new(ds.name.clone(), ds.url.clone());
-            (ds.name.clone(), adapter)
-        })
-        .collect()
-}
-
-async fn execute_panel_query(
-    datasource: &PrometheusDatasource,
-    panel: &ValidatedPanel,
-    dashboard: &ValidatedDashboard,
-    now_ms: i64,
-) -> Result<Frame, CommandError> {
-    let to_command_error = |source: <PrometheusDatasource as Datasource>::Error| {
-        CommandError::new(ErrorCode::E106, source.to_string(), None)
-    };
-    match panel.panel_type {
-        PanelType::Timeseries => {
-            let range_ms = dashboard.default_range.as_millis();
-            let start_ms = now_ms - range_ms;
-            let step_ms = (range_ms / TARGET_RANGE_SAMPLES).max(MIN_STEP_MS);
-            datasource
-                .query_range(&panel.query, start_ms, now_ms, step_ms)
-                .await
-                .map_err(to_command_error)
-        }
-        PanelType::Gauge | PanelType::Stat | PanelType::Table => datasource
-            .query(&panel.query, now_ms)
-            .await
-            .map_err(to_command_error),
-    }
-}
-
 fn print_panel_result(panel: &ValidatedPanel, result: &PanelCheckResult) {
     match result {
         PanelCheckResult::Pass => println!("PASS  {}", panel.title),
@@ -135,11 +85,4 @@ fn print_panel_result(panel: &ValidatedPanel, result: &PanelCheckResult) {
             panel.title
         ),
     }
-}
-
-fn epoch_ms_now() -> i64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }

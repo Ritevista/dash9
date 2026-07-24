@@ -1,0 +1,55 @@
+# Points at the local Prometheus + node_exporter stack from
+# docker-compose.yml (`docker compose up -d`). Try it with:
+#
+#   cargo run -p dash9 -- test examples/node-overview.toml
+#   cargo run -p dash9 -- dash open examples/node-overview.toml
+
+[dashboard]
+title = "Node Overview"
+refresh = "5s"
+default_range = "15m"
+test_latency_budget = "5s"
+
+[[datasources]]
+name = "prom"
+type = "prometheus"
+url = "http://localhost:9091"
+
+[[panels]]
+title = "CPU Usage"
+type = "timeseries"
+datasource = "prom"
+query = "rate(node_cpu_seconds_total{mode=\"user\"}[5m])"
+grid = { row = 0, col = 0, w = 6, h = 4 }
+
+[[panels.thresholds]]
+name = "warn"
+op = "gte"
+value = 0.75
+
+[[panels.thresholds]]
+name = "crit"
+op = "gte"
+value = 0.90
+
+[[panels]]
+title = "Load Average (1m)"
+type = "stat"
+datasource = "prom"
+query = "node_load1"
+grid = { row = 0, col = 6, w = 3, h = 4 }
+
+[[panels]]
+title = "Disk Free %"
+type = "gauge"
+datasource = "prom"
+query = "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100"
+grid = { row = 0, col = 9, w = 3, h = 4 }
+
+[[panels]]
+title = "Top Processes by CPU"
+type = "table"
+datasource = "prom"
+query = "topk(5, rate(process_cpu_seconds_total[5m]))"
+allow_empty = true
+grid = { row = 4, col = 0, w = 12, h = 4 }
