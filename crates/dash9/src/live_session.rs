@@ -172,7 +172,7 @@ impl LiveSession {
         }
     }
 
-    fn range(&self) -> Duration {
+    pub fn range(&self) -> Duration {
         self.config_rx.borrow().range
     }
 
@@ -232,15 +232,24 @@ impl LiveSession {
             Ok(p) => p,
             Err(err) => return err.to_string(),
         };
-        let file = self.to_dashboard_file();
-        let toml_text = match toml::to_string(&file) {
-            Ok(t) => t,
-            Err(err) => return format!("failed to serialize dashboard: {err}"),
+        let Some(toml_text) = self.to_toml_string() else {
+            return "failed to serialize dashboard".to_string();
         };
         match std::fs::write(&destination, toml_text) {
             Ok(()) => format!("saved to {}", destination.display()),
             Err(err) => format!("failed to write {}: {err}", destination.display()),
         }
+    }
+
+    /// The current session state serialized as dashboard TOML text —
+    /// used both by `dash save` and (PR10) as `AssistContext`'s
+    /// `dashboard_toml` field, so the assistant sees the live session,
+    /// not just the file it was originally opened from. `None` only on
+    /// a serialization failure (`toml::to_string` erroring), which
+    /// `DashboardFile`'s shape makes essentially unreachable in
+    /// practice — never on empty/missing data.
+    pub fn to_toml_string(&self) -> Option<String> {
+        toml::to_string(&self.to_dashboard_file()).ok()
     }
 
     fn to_dashboard_file(&self) -> DashboardFile {
