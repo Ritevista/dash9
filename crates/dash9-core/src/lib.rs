@@ -30,4 +30,4 @@ pub use frame::{
     TableColumn,
 };
 pub use path::validate_workspace_relative_path;
-pub use session::{CommandSource, SessionLogEntry};
+pub use session::{CommandSource, LogLine, SessionLogEntry};

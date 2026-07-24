@@ -1,190 +1,189 @@
-//! `dash9 open` v1: a live, read-only multi-panel viewer. Loads a
-//! dashboard TOML, lays out its panels on the 12-column grid (SPEC.md
-//! C.1), polls each panel's datasource on `dashboard.refresh`'s
-//! cadence, and renders all four panel types with real data.
+//! `dash9 open`: the live, interactive multi-panel viewer with a
+//! command bar. Loads a dashboard TOML, lays out its panels on the
+//! 12-column grid (SPEC.md C.1), polls each panel's datasource live,
+//! renders all four panel types, and — as of this revision — runs the
+//! full command grammar (SPEC.md Section B) against a live, mutable
+//! session: `ds add`, `panel type`/`threshold`/`title`, `range`,
+//! `refresh`, `dash save`, `dash open`, ad-hoc `q`, `quit`.
 //!
-//! The command bar and runtime editing (`ds add`, `panel
-//! type`/`threshold`/`title`, `range`, `refresh`, `dash save`, ad-hoc
-//! `q` — SPEC.md Section B) are deliberately not part of this slice;
-//! `dash9_core::command::parse` is fully built and tested, but wiring
-//! it to a command-bar widget and mutating live session state is a
-//! separable follow-up. `focused_panel` below exists for that
-//! follow-up to consume — in v1 it is cosmetic (border color only).
+//! Session state and datasource polling live in `crate::live_session`
+//! (`LiveSession`, `execute_command`); this module is the composition
+//! root's UI layer — input handling, the session log, and draw-area
+//! layout — plus the panel-content drawing carried over from the
+//! read-only v1 (`draw_panel`/`draw_placeholder`/`recolor_border`).
+//!
+//! Natural-language input (routing unparseable text to
+//! `dash9-assist`'s `AssistSession` when enabled) is a deliberate
+//! follow-up, not part of this revision: seams left for it are typed
+//! input failing `dash9_core::parse` (currently always an immediate
+//! error) and `execute_command` (already the single place both a
+//! human command and an eventual AI-proposed command would run).
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::Duration as StdDuration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use dash9_core::{
-    load_path, validate, CommandError, Frame as CoreFrame, PanelType, RefreshInterval,
-    ValidatedDashboard, ValidatedPanel,
+    load_path, validate, Command, CommandSource, LogLine, PanelType, SessionLogEntry,
 };
-use dash9_prom::PrometheusDatasource;
 use dash9_tui::chart::{ChartModel, ChartViewState};
 use dash9_tui::{
-    draw_chart, draw_gauge, draw_stat, draw_table, grid_layout, series_as_table, theme,
+    draw_chart, draw_command_bar, draw_gauge, draw_stat, draw_table, grid_layout, series_as_table,
+    theme,
 };
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
-use crate::datasources::{build_datasources, epoch_ms_now, execute_panel_query};
+use crate::datasources::epoch_ms_now;
+use crate::live_session::{execute_command, LivePanel, LiveSession, SessionUpdate};
 
 const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
-
-/// One panel's latest fetch outcome, delivered from its polling task
-/// to the render loop. `elapsed_ms` is captured here (composition
-/// root owns timing, same as `dash9 test`) even though v1's draw code
-/// doesn't surface it yet.
-struct PanelUpdate {
-    panel_index: usize,
-    result: Result<CoreFrame, CommandError>,
-    #[allow(dead_code)]
-    elapsed_ms: i64,
-}
+const COMMAND_BAR_HEIGHT: u16 = 10;
+const MAX_LOG_LINES: usize = 500;
 
 pub fn run(path: &Path) -> anyhow::Result<()> {
     let dashboard = load_path(path)
         .and_then(|file| validate(&file))
         .map_err(|err| anyhow::anyhow!("dashboard invalid: {err}"))?;
-    let dashboard = Arc::new(dashboard);
+    let workspace_root = std::env::current_dir()?;
 
-    let datasources: HashMap<String, Arc<PrometheusDatasource>> = build_datasources(&dashboard)
-        .into_iter()
-        .map(|(name, ds)| (name, Arc::new(ds)))
-        .collect();
+    let (tx, mut rx) = mpsc::channel::<SessionUpdate>(CHANNEL_CAPACITY);
+    let mut session = LiveSession::new(&dashboard, workspace_root, tx);
 
-    let (tx, mut rx) = mpsc::channel::<PanelUpdate>(CHANNEL_CAPACITY);
-    for panel_index in 0..dashboard.panels.len() {
-        let panel = &dashboard.panels[panel_index];
-        let Some(datasource) = datasources.get(&panel.datasource) else {
-            // `validate()` already guarantees every panel's
-            // `datasource` matches a configured entry (same invariant
-            // `dash9 test` relies on).
-            anyhow::bail!(
-                "internal error: panel \"{}\" references unconfigured datasource \"{}\"",
-                panel.title,
-                panel.datasource
-            );
-        };
-        spawn_panel_poller(
-            panel_index,
-            Arc::clone(datasource),
-            Arc::clone(&dashboard),
-            tx.clone(),
-        );
-    }
-    drop(tx);
-
-    let mut panel_state: Vec<Option<Result<CoreFrame, CommandError>>> =
-        vec![None; dashboard.panels.len()];
     let mut focused_panel = 0usize;
+    let mut log: Vec<LogLine> = Vec::new();
+    let mut input: Option<String> = None;
 
     ratatui::run(|terminal| -> anyhow::Result<()> {
         loop {
             while let Ok(update) = rx.try_recv() {
-                panel_state[update.panel_index] = Some(update.result);
+                session.apply_update(update, &mut log);
+            }
+            if focused_panel >= session.panels.len() {
+                focused_panel = 0;
             }
 
             terminal.draw(|f| {
-                draw_dashboard(f, f.area(), &dashboard, &panel_state, focused_panel);
+                draw_session(f, f.area(), &session, focused_panel, &log, input.as_deref());
             })?;
 
-            if event::poll(TICK)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                            KeyCode::Tab if !dashboard.panels.is_empty() => {
-                                focused_panel = (focused_panel + 1) % dashboard.panels.len();
-                            }
-                            KeyCode::BackTab if !dashboard.panels.is_empty() => {
-                                let len = dashboard.panels.len();
-                                focused_panel = (focused_panel + len - 1) % len;
-                            }
-                            _ => {}
+            if !event::poll(TICK)? {
+                continue;
+            }
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if let Some(buffer) = input.as_mut() {
+                match key.code {
+                    KeyCode::Esc => input = None,
+                    KeyCode::Enter => {
+                        let text = buffer.clone();
+                        input = None;
+                        if submit_command(&mut session, &mut log, focused_panel, &text) {
+                            return Ok(());
                         }
                     }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) => buffer.push(c),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char(':') => input = Some(String::new()),
+                    KeyCode::Tab if !session.panels.is_empty() => {
+                        focused_panel = (focused_panel + 1) % session.panels.len();
+                    }
+                    KeyCode::BackTab if !session.panels.is_empty() => {
+                        let len = session.panels.len();
+                        focused_panel = (focused_panel + len - 1) % len;
+                    }
+                    _ => {}
                 }
             }
         }
     })
 }
 
-/// One polling task per panel: fetches on `dashboard.refresh`'s
-/// cadence and sends every outcome (success or failure) over `tx`.
-/// `RefreshInterval::Off` means fetch once and stop, matching the
-/// verb's SPEC.md B.3 semantics ("off" disables auto-refresh).
-fn spawn_panel_poller(
-    panel_index: usize,
-    datasource: Arc<PrometheusDatasource>,
-    dashboard: Arc<ValidatedDashboard>,
-    tx: mpsc::Sender<PanelUpdate>,
-) {
-    tokio::spawn(async move {
-        let panel = &dashboard.panels[panel_index];
-        let refresh_duration = match dashboard.refresh {
-            RefreshInterval::Duration(d) => Some(StdDuration::from_millis(
-                u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
-            )),
-            RefreshInterval::Off => None,
-        };
+/// Parses and runs one submitted command-bar line. Returns `true` if
+/// the session should end (`quit`). Every submission — parseable or
+/// not — is logged: a `SessionLogEntry` for what was typed, then a
+/// `Result` line for the outcome, so a failed attempt is as visible
+/// in the log as a successful one (matches `docs/specs/assist.md`
+/// Section I's "no invisible action" rule, which this log format was
+/// designed to satisfy even before an assistant is wired in).
+fn submit_command(
+    session: &mut LiveSession,
+    log: &mut Vec<LogLine>,
+    focused_panel: usize,
+    text: &str,
+) -> bool {
+    log.push(LogLine::Command(SessionLogEntry {
+        source: CommandSource::User,
+        command_text: text.to_string(),
+        timestamp_ms: epoch_ms_now(),
+    }));
 
-        loop {
-            let now_ms = epoch_ms_now();
-            let started = Instant::now();
-            let result = execute_panel_query(&datasource, panel, &dashboard, now_ms).await;
-            let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-
-            let update = PanelUpdate {
-                panel_index,
-                result,
-                elapsed_ms,
-            };
-            if tx.send(update).await.is_err() {
-                return; // Render loop exited; stop polling.
-            }
-
-            match refresh_duration {
-                Some(interval) => tokio::time::sleep(interval).await,
-                None => return,
-            }
+    let should_quit = match dash9_core::parse(text) {
+        Ok(Command::Quit) => true,
+        Ok(cmd) => {
+            let outcome = execute_command(session, focused_panel, cmd);
+            log.push(LogLine::Result(outcome));
+            false
         }
-    });
+        Err(err) => {
+            log.push(LogLine::Result(err.to_string()));
+            false
+        }
+    };
+
+    if log.len() > MAX_LOG_LINES {
+        let excess = log.len() - MAX_LOG_LINES;
+        log.drain(0..excess);
+    }
+    should_quit
 }
 
-fn draw_dashboard(
+fn draw_session(
     frame: &mut Frame,
     area: Rect,
-    dashboard: &ValidatedDashboard,
-    panel_state: &[Option<Result<CoreFrame, CommandError>>],
+    session: &LiveSession,
     focused_panel: usize,
+    log: &[LogLine],
+    input: Option<&str>,
 ) {
-    let grids: Vec<_> = dashboard.panels.iter().map(|p| p.grid).collect();
+    let [grid_area, bar_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(COMMAND_BAR_HEIGHT)]).areas(area);
+    draw_dashboard(frame, grid_area, session, focused_panel);
+    draw_command_bar(frame, bar_area, log, input);
+}
+
+fn draw_dashboard(frame: &mut Frame, area: Rect, session: &LiveSession, focused_panel: usize) {
+    let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
     let rects = grid_layout(area, &grids);
 
-    for (index, panel) in dashboard.panels.iter().enumerate() {
+    for (index, panel) in session.panels.iter().enumerate() {
         let rect = rects[index];
         if rect.width == 0 || rect.height == 0 {
             continue; // Positioned entirely off-screen (v1 has no scrolling).
         }
-        draw_panel(frame, rect, panel, panel_state[index].as_ref());
+        draw_panel(frame, rect, panel);
         recolor_border(frame, rect, index == focused_panel);
     }
 }
 
-fn draw_panel(
-    frame: &mut Frame,
-    area: Rect,
-    panel: &ValidatedPanel,
-    state: Option<&Result<CoreFrame, CommandError>>,
-) {
-    let Some(result) = state else {
+fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel) {
+    let Some(result) = panel.last_result.as_ref() else {
         draw_placeholder(frame, area, &panel.title, "(loading…)");
         return;
     };
@@ -249,7 +248,7 @@ fn draw_placeholder(frame: &mut Frame, area: Rect, title: &str, message: &str) {
 /// its own `Block`, so this restyles those cells directly via the
 /// buffer rather than adding a `focused: bool` parameter to four
 /// already-tested, already-used-by-`demo.rs` function signatures for
-/// a v1 feature that's cosmetic only (see module docs).
+/// a feature that's cosmetic only.
 fn recolor_border(frame: &mut Frame, area: Rect, focused: bool) {
     if area.width == 0 || area.height == 0 {
         return;

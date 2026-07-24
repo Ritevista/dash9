@@ -22,3 +22,15 @@ pub struct SessionLogEntry {
     pub command_text: String,
     pub timestamp_ms: i64,
 }
+
+/// One line in an interactive session's displayed log: either a
+/// command that was issued (human-typed or, later, assistant-proposed
+/// — see [`SessionLogEntry`]) or the text outcome of one (a query
+/// result, an error, a confirmation). Kept distinct from
+/// `SessionLogEntry` because an outcome isn't itself a command and
+/// has no `CommandSource`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogLine {
+    Command(SessionLogEntry),
+    Result(String),
+}

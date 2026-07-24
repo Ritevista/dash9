@@ -8,9 +8,11 @@
 //! around.
 
 pub mod chart;
+pub mod command_bar;
 pub mod draw;
 pub mod layout;
 pub mod theme;
 
+pub use command_bar::draw_command_bar;
 pub use draw::{draw_chart, draw_gauge, draw_stat, draw_table, series_as_table};
 pub use layout::grid_layout;

@@ -45,7 +45,14 @@ pub async fn run(path: &Path) -> anyhow::Result<i32> {
 
         let now_ms = epoch_ms_now();
         let started = Instant::now();
-        let query_result = execute_panel_query(datasource, panel, &dashboard, now_ms).await;
+        let query_result = execute_panel_query(
+            datasource,
+            panel.panel_type,
+            &panel.query,
+            dashboard.default_range,
+            now_ms,
+        )
+        .await;
         let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
         let result = check_panel(

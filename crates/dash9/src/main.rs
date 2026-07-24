@@ -2,6 +2,7 @@
 
 mod datasources;
 mod demo;
+mod live_session;
 mod open;
 mod test_cmd;
 

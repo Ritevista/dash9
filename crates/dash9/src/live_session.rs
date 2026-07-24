@@ -1,0 +1,882 @@
+//! Live, mutable dashboard session state for `dash9 open`'s command
+//! bar. Replaces PR8's immutable `Arc<ValidatedDashboard>` model —
+//! every SPEC.md Section B verb that mutates session state (`ds add`,
+//! `panel type`/`threshold`/`title`, `range`, `refresh`, `dash save`,
+//! `dash open`) needs somewhere real to apply to.
+//!
+//! `LiveSession` owns one polling task per panel (`tokio::spawn`, same
+//! shape PR8 introduced). `range`/`refresh`/a panel's `panel_type` are
+//! the only grammar-mutable fields that change what a poller
+//! *fetches* — `query`/`datasource`/`grid` never change at runtime —
+//! so those three live behind one `tokio::sync::watch` channel every
+//! poller reads fresh each loop iteration, instead of needing its task
+//! aborted and respawned on every edit. Only `dash open` (replaces the
+//! entire session) tears down and rebuilds every poller.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
+use dash9_core::{
+    load_path, validate, validate_workspace_relative_path, Command, CommandError, DashboardFile,
+    DashboardMeta, Datasource, DatasourceSpec, DatasourceType, Duration, ErrorCode, Frame,
+    GridSpec, LogLine, PanelSpec, PanelType, RefreshInterval, ThresholdSpec, ValidatedDashboard,
+    ValidatedThreshold,
+};
+use dash9_prom::PrometheusDatasource;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+use crate::datasources::{epoch_ms_now, execute_panel_query};
+
+/// One panel-poller result or one ad-hoc `q` result, delivered to the
+/// render loop over one shared channel.
+pub enum SessionUpdate {
+    Panel {
+        generation: u64,
+        panel_index: usize,
+        result: Result<Frame, CommandError>,
+    },
+    AdHoc {
+        query: String,
+        result: Result<Frame, CommandError>,
+    },
+}
+
+pub struct LiveDatasource {
+    pub datasource_type: DatasourceType,
+    pub url: String,
+    pub adapter: Arc<PrometheusDatasource>,
+}
+
+pub struct LivePanel {
+    pub title: String,
+    pub panel_type: PanelType,
+    pub datasource: String,
+    pub query: String,
+    pub allow_empty: bool,
+    pub latency_budget: Option<Duration>,
+    pub grid: GridSpec,
+    pub thresholds: Vec<ValidatedThreshold>,
+    pub last_result: Option<Result<Frame, CommandError>>,
+}
+
+impl From<&dash9_core::ValidatedPanel> for LivePanel {
+    fn from(p: &dash9_core::ValidatedPanel) -> Self {
+        LivePanel {
+            title: p.title.clone(),
+            panel_type: p.panel_type,
+            datasource: p.datasource.clone(),
+            query: p.query.clone(),
+            allow_empty: p.allow_empty,
+            latency_budget: p.latency_budget,
+            grid: p.grid,
+            thresholds: p.thresholds.clone(),
+            last_result: None,
+        }
+    }
+}
+
+/// The subset of session state a poller needs live, kept behind one
+/// `watch` channel so an edit takes effect without a task
+/// abort/respawn. See module docs.
+#[derive(Clone)]
+struct RuntimeConfig {
+    range: Duration,
+    refresh: RefreshInterval,
+    panel_types: Vec<PanelType>, // index-aligned with `LiveSession::panels`
+}
+
+pub struct LiveSession {
+    pub title: String,
+    pub datasources: HashMap<String, LiveDatasource>,
+    pub panels: Vec<LivePanel>,
+    test_latency_budget: Duration,
+    workspace_root: PathBuf,
+    generation: u64,
+    config_tx: watch::Sender<RuntimeConfig>,
+    config_rx: watch::Receiver<RuntimeConfig>,
+    poller_handles: Vec<JoinHandle<()>>,
+    update_tx: mpsc::Sender<SessionUpdate>,
+}
+
+impl LiveSession {
+    pub fn new(
+        dashboard: &ValidatedDashboard,
+        workspace_root: PathBuf,
+        update_tx: mpsc::Sender<SessionUpdate>,
+    ) -> Self {
+        let (config_tx, config_rx) = watch::channel(runtime_config_for(dashboard));
+        let mut session = LiveSession {
+            title: dashboard.title.clone(),
+            datasources: build_live_datasources(dashboard),
+            panels: dashboard.panels.iter().map(LivePanel::from).collect(),
+            test_latency_budget: dashboard.test_latency_budget,
+            workspace_root,
+            generation: 0,
+            config_tx,
+            config_rx,
+            poller_handles: Vec::new(),
+            update_tx,
+        };
+        session.spawn_all_pollers();
+        session
+    }
+
+    /// Applies one delivered `SessionUpdate`, pushing a `LogLine` for
+    /// an ad-hoc `q` result. A panel-poller update whose `generation`
+    /// doesn't match the current one is a stale result from a poller
+    /// that was aborted by a `dash open` since it started this fetch
+    /// — silently dropped, not applied.
+    pub fn apply_update(&mut self, update: SessionUpdate, log: &mut Vec<LogLine>) {
+        match update {
+            SessionUpdate::Panel {
+                generation,
+                panel_index,
+                result,
+            } => {
+                if generation == self.generation {
+                    if let Some(panel) = self.panels.get_mut(panel_index) {
+                        panel.last_result = Some(result);
+                    }
+                }
+            }
+            SessionUpdate::AdHoc { query, result } => {
+                let text = match result {
+                    Ok(frame) => format_ad_hoc_result(&query, &frame),
+                    Err(err) => format!("q {query}: {err}"),
+                };
+                log.push(LogLine::Result(text));
+            }
+        }
+    }
+
+    fn spawn_all_pollers(&mut self) {
+        for (index, panel) in self.panels.iter().enumerate() {
+            // `validate()` guarantees every panel's `datasource`
+            // matches a configured entry; still defensive here since
+            // a background-task spawner should never panic.
+            let Some(ds) = self.datasources.get(&panel.datasource) else {
+                continue;
+            };
+            let handle = spawn_poller(
+                index,
+                self.generation,
+                panel.query.clone(),
+                Arc::clone(&ds.adapter),
+                self.config_rx.clone(),
+                self.update_tx.clone(),
+            );
+            self.poller_handles.push(handle);
+        }
+    }
+
+    fn range(&self) -> Duration {
+        self.config_rx.borrow().range
+    }
+
+    fn refresh(&self) -> RefreshInterval {
+        self.config_rx.borrow().refresh
+    }
+
+    fn set_range(&mut self, duration: Duration) {
+        self.config_tx.send_modify(|cfg| cfg.range = duration);
+    }
+
+    fn set_refresh(&mut self, interval: RefreshInterval) {
+        self.config_tx.send_modify(|cfg| cfg.refresh = interval);
+    }
+
+    fn set_panel_type(&mut self, index: usize, panel_type: PanelType) {
+        self.config_tx
+            .send_modify(|cfg| cfg.panel_types[index] = panel_type);
+    }
+
+    /// "The focused datasource" (SPEC.md B.3's `q` description) is
+    /// read as the focused panel's configured datasource — SPEC.md
+    /// has no `ds focus` verb, so panel focus is the only grounded
+    /// notion of "current" datasource an interactive session has.
+    fn spawn_ad_hoc_query(&self, focused_panel: usize, query: &str) -> String {
+        let Some(panel) = self.panels.get(focused_panel) else {
+            return no_panel_focused_error();
+        };
+        let Some(datasource) = self.datasources.get(&panel.datasource) else {
+            return format!(
+                "{}: unknown datasource \"{}\"",
+                ErrorCode::E101,
+                panel.datasource
+            );
+        };
+        let adapter = Arc::clone(&datasource.adapter);
+        let update_tx = self.update_tx.clone();
+        let query_for_task = query.to_string();
+        tokio::spawn(async move {
+            let now_ms = epoch_ms_now();
+            let result = adapter
+                .query(&query_for_task, now_ms)
+                .await
+                .map_err(|err| CommandError::new(ErrorCode::E106, err.to_string(), None));
+            let _ = update_tx
+                .send(SessionUpdate::AdHoc {
+                    query: query_for_task,
+                    result,
+                })
+                .await;
+        });
+        format!("q {query}: running…")
+    }
+
+    fn save(&self, path: &str) -> String {
+        let destination = match validate_workspace_relative_path(&self.workspace_root, path) {
+            Ok(p) => p,
+            Err(err) => return err.to_string(),
+        };
+        let file = self.to_dashboard_file();
+        let toml_text = match toml::to_string(&file) {
+            Ok(t) => t,
+            Err(err) => return format!("failed to serialize dashboard: {err}"),
+        };
+        match std::fs::write(&destination, toml_text) {
+            Ok(()) => format!("saved to {}", destination.display()),
+            Err(err) => format!("failed to write {}: {err}", destination.display()),
+        }
+    }
+
+    fn to_dashboard_file(&self) -> DashboardFile {
+        let mut datasource_names: Vec<&String> = self.datasources.keys().collect();
+        datasource_names.sort();
+        let datasources = datasource_names
+            .into_iter()
+            .map(|name| {
+                let ds = &self.datasources[name];
+                DatasourceSpec {
+                    name: name.clone(),
+                    type_: ds.datasource_type.to_string(),
+                    url: ds.url.clone(),
+                }
+            })
+            .collect();
+
+        let panels = self
+            .panels
+            .iter()
+            .map(|p| PanelSpec {
+                title: p.title.clone(),
+                type_: p.panel_type.to_string(),
+                datasource: p.datasource.clone(),
+                query: p.query.clone(),
+                allow_empty: p.allow_empty,
+                latency_budget: p.latency_budget.map(|d| d.to_string()),
+                grid: p.grid,
+                thresholds: p
+                    .thresholds
+                    .iter()
+                    .map(|t| ThresholdSpec {
+                        name: t.name.clone(),
+                        op: t.op.to_string(),
+                        value: t.value,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        DashboardFile {
+            dashboard: DashboardMeta {
+                title: self.title.clone(),
+                refresh: self.refresh().to_string(),
+                default_range: self.range().to_string(),
+                test_latency_budget: self.test_latency_budget.to_string(),
+            },
+            datasources,
+            panels,
+        }
+    }
+
+    /// `dash open`: on success, replaces the entire session (aborts
+    /// every current poller and rebuilds from the newly loaded
+    /// dashboard) — the caller must re-clamp `focused_panel` against
+    /// the new `panels.len()` afterward, since the panel count may
+    /// have changed. On failure, the current session keeps running
+    /// unchanged — a bad `dash open` inside a live session must not
+    /// kill the TUI, unlike the fatal startup load in `open::run`.
+    fn open_dashboard(&mut self, path: &str) -> String {
+        let destination = match validate_workspace_relative_path(&self.workspace_root, path) {
+            Ok(p) => p,
+            Err(err) => return err.to_string(),
+        };
+        let dashboard = match load_path(&destination).and_then(|file| validate(&file)) {
+            Ok(d) => d,
+            Err(err) => return format!("dashboard invalid: {err}"),
+        };
+
+        for handle in self.poller_handles.drain(..) {
+            handle.abort();
+        }
+        self.generation += 1;
+        self.title.clone_from(&dashboard.title);
+        self.test_latency_budget = dashboard.test_latency_budget;
+        self.datasources = build_live_datasources(&dashboard);
+        self.panels = dashboard.panels.iter().map(LivePanel::from).collect();
+        self.config_tx
+            .send_modify(|cfg| *cfg = runtime_config_for(&dashboard));
+        self.spawn_all_pollers();
+
+        format!("opened {}", destination.display())
+    }
+}
+
+fn runtime_config_for(dashboard: &ValidatedDashboard) -> RuntimeConfig {
+    RuntimeConfig {
+        range: dashboard.default_range,
+        refresh: dashboard.refresh,
+        panel_types: dashboard.panels.iter().map(|p| p.panel_type).collect(),
+    }
+}
+
+fn build_live_datasources(dashboard: &ValidatedDashboard) -> HashMap<String, LiveDatasource> {
+    dashboard
+        .datasources
+        .iter()
+        .map(|ds| {
+            // `dash9-core::validate()` only accepts `type =
+            // "prometheus"` in v0.1 (SPEC.md C.1/D), so this is the
+            // only adapter constructed today; a second datasource
+            // type will need a match here.
+            let adapter = Arc::new(PrometheusDatasource::new(ds.name.clone(), ds.url.clone()));
+            let live = LiveDatasource {
+                datasource_type: ds.datasource_type,
+                url: ds.url.clone(),
+                adapter,
+            };
+            (ds.name.clone(), live)
+        })
+        .collect()
+}
+
+fn no_panel_focused_error() -> String {
+    format!(
+        "{}: \"panel *\" issued with no panel focused",
+        ErrorCode::E103
+    )
+}
+
+fn format_ad_hoc_result(query: &str, frame: &Frame) -> String {
+    if frame.is_empty() {
+        format!("q {query}: (no data)")
+    } else {
+        let series_count = frame.series.len();
+        let latest: Vec<String> = frame
+            .series
+            .iter()
+            .filter_map(|s| s.points.last())
+            .map(|p| format!("{:.3}", p.value))
+            .collect();
+        format!(
+            "q {query}: {series_count} series — latest: [{}]",
+            latest.join(", ")
+        )
+    }
+}
+
+/// One polling task per panel: reads `config_rx` fresh each iteration
+/// (rather than capturing `range`/`refresh`/`panel_type` at spawn
+/// time) so a live edit to any of the three takes effect on this
+/// task's very next iteration without needing to be aborted and
+/// respawned — see module docs. `RefreshInterval::Off` means fetch
+/// once and stop, matching PR8's behavior and the verb's SPEC.md B.3
+/// semantics.
+fn spawn_poller(
+    panel_index: usize,
+    generation: u64,
+    query: String,
+    datasource: Arc<PrometheusDatasource>,
+    mut config_rx: watch::Receiver<RuntimeConfig>,
+    update_tx: mpsc::Sender<SessionUpdate>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let cfg = config_rx.borrow_and_update().clone();
+            let panel_type = cfg.panel_types[panel_index];
+            let now_ms = epoch_ms_now();
+            let result =
+                execute_panel_query(&datasource, panel_type, &query, cfg.range, now_ms).await;
+
+            let update = SessionUpdate::Panel {
+                generation,
+                panel_index,
+                result,
+            };
+            if update_tx.send(update).await.is_err() {
+                return; // Render loop exited; stop polling.
+            }
+
+            let sleep_duration = match cfg.refresh {
+                RefreshInterval::Duration(d) => {
+                    StdDuration::from_millis(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                }
+                RefreshInterval::Off => return,
+            };
+            tokio::select! {
+                () = tokio::time::sleep(sleep_duration) => {}
+                _ = config_rx.changed() => {}
+            }
+        }
+    })
+}
+
+/// Executes one parsed `Command` against a live session, mutating it
+/// as needed, and returns a human-readable outcome for the log.
+/// `Command::Quit` is handled by the caller before this is invoked —
+/// it ends the session rather than mutating one.
+pub fn execute_command(session: &mut LiveSession, focused_panel: usize, cmd: Command) -> String {
+    match cmd {
+        Command::DsAdd {
+            name,
+            datasource_type,
+            url,
+        } => {
+            if session.datasources.contains_key(&name) {
+                return format!("{}: duplicate datasource name \"{name}\"", ErrorCode::E102);
+            }
+            let adapter = Arc::new(PrometheusDatasource::new(name.clone(), url.clone()));
+            session.datasources.insert(
+                name.clone(),
+                LiveDatasource {
+                    datasource_type,
+                    url,
+                    adapter,
+                },
+            );
+            format!("datasource \"{name}\" added")
+        }
+        Command::DsList => {
+            if session.datasources.is_empty() {
+                "no datasources configured".to_string()
+            } else {
+                let mut names: Vec<&String> = session.datasources.keys().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .map(|name| {
+                        let ds = &session.datasources[name];
+                        format!("{name}: {} {}", ds.datasource_type, ds.url)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        Command::Q { query } => session.spawn_ad_hoc_query(focused_panel, &query),
+        Command::PanelType { panel_type } => {
+            if session.panels.is_empty() {
+                return no_panel_focused_error();
+            }
+            session.panels[focused_panel].panel_type = panel_type;
+            session.set_panel_type(focused_panel, panel_type);
+            format!("panel type set to {panel_type}")
+        }
+        Command::PanelThreshold { name, op, value } => {
+            if session.panels.is_empty() {
+                return no_panel_focused_error();
+            }
+            let thresholds = &mut session.panels[focused_panel].thresholds;
+            if let Some(existing) = thresholds.iter_mut().find(|t| t.name == name) {
+                existing.op = op;
+                existing.value = value;
+            } else {
+                thresholds.push(ValidatedThreshold {
+                    name: name.clone(),
+                    op,
+                    value,
+                });
+            }
+            format!("threshold \"{name}\" set to {op} {value}")
+        }
+        Command::PanelTitle { text } => {
+            if session.panels.is_empty() {
+                return no_panel_focused_error();
+            }
+            session.panels[focused_panel].title.clone_from(&text);
+            format!("panel title set to \"{text}\"")
+        }
+        Command::Range { duration } => {
+            session.set_range(duration);
+            format!("range set to {duration}")
+        }
+        Command::Refresh { interval } => {
+            session.set_refresh(interval);
+            format!("refresh set to {interval}")
+        }
+        Command::DashSave { path } => session.save(&path),
+        Command::DashOpen { path } => session.open_dashboard(&path),
+        Command::Quit => {
+            unreachable!("Command::Quit is handled by the caller before execute_command runs")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dash9_core::{
+        DurationUnit, FrameKind, FrameMeta, ThresholdOp, ValidatedDatasource, ValidatedPanel,
+    };
+    use tempfile::TempDir;
+
+    fn sample_panel(title: &str) -> ValidatedPanel {
+        ValidatedPanel {
+            title: title.to_string(),
+            panel_type: PanelType::Timeseries,
+            datasource: "prom".to_string(),
+            query: "up".to_string(),
+            allow_empty: false,
+            latency_budget: None,
+            grid: GridSpec {
+                row: 0,
+                col: 0,
+                w: 1,
+                h: 1,
+            },
+            thresholds: vec![],
+        }
+    }
+
+    fn sample_dashboard(panels: Vec<ValidatedPanel>) -> ValidatedDashboard {
+        ValidatedDashboard {
+            title: "Test".to_string(),
+            refresh: RefreshInterval::Duration(Duration {
+                magnitude: 30,
+                unit: DurationUnit::Seconds,
+            }),
+            default_range: Duration {
+                magnitude: 1,
+                unit: DurationUnit::Hours,
+            },
+            test_latency_budget: Duration {
+                magnitude: 5,
+                unit: DurationUnit::Seconds,
+            },
+            // Unroutable on purpose: these tests exercise
+            // `execute_command`'s dispatch/mutation logic, never a
+            // poller's actual fetch, so this never needs to resolve.
+            datasources: vec![ValidatedDatasource {
+                name: "prom".to_string(),
+                datasource_type: DatasourceType::Prometheus,
+                url: "http://127.0.0.1:1".to_string(),
+            }],
+            panels,
+        }
+    }
+
+    /// Builds a session backed by a real temp workspace (so
+    /// `dash save`/`dash open` path validation has somewhere real to
+    /// resolve against) and a background `update_tx` receiver the
+    /// test just drops — panel pollers will fail against the
+    /// unroutable URL above and their results are simply never read.
+    fn session_with(panels: Vec<ValidatedPanel>) -> (LiveSession, TempDir) {
+        let dashboard = sample_dashboard(panels);
+        let workspace = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let session = LiveSession::new(&dashboard, workspace.path().to_path_buf(), tx);
+        (session, workspace)
+    }
+
+    fn minutes(magnitude: u64) -> Duration {
+        Duration {
+            magnitude,
+            unit: DurationUnit::Minutes,
+        }
+    }
+
+    #[tokio::test]
+    async fn range_and_refresh_update_live_config() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+
+        execute_command(
+            &mut session,
+            0,
+            Command::Range {
+                duration: minutes(5),
+            },
+        );
+        assert_eq!(session.range(), minutes(5));
+
+        execute_command(
+            &mut session,
+            0,
+            Command::Refresh {
+                interval: RefreshInterval::Off,
+            },
+        );
+        assert_eq!(session.refresh(), RefreshInterval::Off);
+    }
+
+    #[tokio::test]
+    async fn panel_type_updates_the_focused_panel_and_runtime_config() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        execute_command(
+            &mut session,
+            0,
+            Command::PanelType {
+                panel_type: PanelType::Gauge,
+            },
+        );
+        assert_eq!(session.panels[0].panel_type, PanelType::Gauge);
+        assert_eq!(session.config_rx.borrow().panel_types[0], PanelType::Gauge);
+    }
+
+    #[tokio::test]
+    async fn panel_threshold_adds_then_updates_by_name() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        execute_command(
+            &mut session,
+            0,
+            Command::PanelThreshold {
+                name: "warn".to_string(),
+                op: ThresholdOp::Gte,
+                value: 0.5,
+            },
+        );
+        assert_eq!(session.panels[0].thresholds.len(), 1);
+        assert!((session.panels[0].thresholds[0].value - 0.5).abs() < f64::EPSILON);
+
+        execute_command(
+            &mut session,
+            0,
+            Command::PanelThreshold {
+                name: "warn".to_string(),
+                op: ThresholdOp::Gte,
+                value: 0.9,
+            },
+        );
+        assert_eq!(
+            session.panels[0].thresholds.len(),
+            1,
+            "updated, not appended"
+        );
+        assert!((session.panels[0].thresholds[0].value - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn panel_verbs_on_a_panel_less_session_report_e103() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::PanelTitle {
+                text: "x".to_string(),
+            },
+        );
+        assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_add_duplicate_name_is_e102() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsAdd {
+                name: "prom".to_string(), // already present, see sample_dashboard
+                datasource_type: DatasourceType::Prometheus,
+                url: "http://example.invalid".to_string(),
+            },
+        );
+        assert!(outcome.contains("E102"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_add_new_name_is_listed() {
+        let (mut session, _workspace) = session_with(vec![]);
+        execute_command(
+            &mut session,
+            0,
+            Command::DsAdd {
+                name: "loki".to_string(),
+                datasource_type: DatasourceType::Prometheus,
+                url: "http://example.invalid".to_string(),
+            },
+        );
+        assert!(session.datasources.contains_key("loki"));
+        let listed = execute_command(&mut session, 0, Command::DsList);
+        assert!(
+            listed.contains("loki") && listed.contains("prom"),
+            "{listed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn q_with_no_panels_reports_e103() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::Q {
+                query: "up".to_string(),
+            },
+        );
+        assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn dash_save_then_reload_round_trips_current_state() {
+        let (mut session, workspace) = session_with(vec![sample_panel("CPU")]);
+        execute_command(
+            &mut session,
+            0,
+            Command::PanelTitle {
+                text: "CPU (renamed)".to_string(),
+            },
+        );
+        execute_command(
+            &mut session,
+            0,
+            Command::Range {
+                duration: minutes(10),
+            },
+        );
+
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DashSave {
+                path: "scratch.toml".to_string(),
+            },
+        );
+        assert!(outcome.starts_with("saved to"), "{outcome}");
+
+        let saved = load_path(&workspace.path().join("scratch.toml")).unwrap();
+        let reloaded = validate(&saved).unwrap();
+        assert_eq!(reloaded.panels[0].title, "CPU (renamed)");
+        assert_eq!(reloaded.default_range, minutes(10));
+    }
+
+    #[tokio::test]
+    async fn dash_save_rejects_a_path_escaping_the_workspace() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DashSave {
+                path: "../escape.toml".to_string(),
+            },
+        );
+        assert!(outcome.contains("E107"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn dash_open_missing_file_keeps_the_current_session() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DashOpen {
+                path: "does-not-exist.toml".to_string(),
+            },
+        );
+        assert!(outcome.contains("dashboard invalid"), "{outcome}");
+        assert_eq!(session.panels.len(), 1, "current session must be untouched");
+    }
+
+    const OTHER_DASHBOARD_TOML: &str = r#"
+[dashboard]
+title = "Other"
+refresh = "30s"
+default_range = "1h"
+
+[[datasources]]
+name = "prom"
+type = "prometheus"
+url = "http://127.0.0.1:1"
+
+[[panels]]
+title = "A"
+type = "stat"
+datasource = "prom"
+query = "up"
+grid = { row = 0, col = 0, w = 1, h = 1 }
+
+[[panels]]
+title = "B"
+type = "stat"
+datasource = "prom"
+query = "up"
+grid = { row = 0, col = 1, w = 1, h = 1 }
+"#;
+
+    #[tokio::test]
+    async fn dash_open_success_replaces_the_whole_session() {
+        let (mut session, workspace) = session_with(vec![sample_panel("CPU")]);
+        std::fs::write(workspace.path().join("other.toml"), OTHER_DASHBOARD_TOML).unwrap();
+
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DashOpen {
+                path: "other.toml".to_string(),
+            },
+        );
+        assert!(outcome.starts_with("opened"), "{outcome}");
+        assert_eq!(session.title, "Other");
+        assert_eq!(session.panels.len(), 2);
+        assert_eq!(session.panels[0].title, "A");
+        assert_eq!(session.panels[1].title, "B");
+    }
+
+    fn empty_frame(query: &str) -> Frame {
+        Frame {
+            kind: FrameKind::InstantVector,
+            series: vec![],
+            table: None,
+            meta: FrameMeta {
+                query: query.to_string(),
+                datasource: "prom".to_string(),
+                executed_at_ms: 0,
+                warnings: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_update_drops_stale_generation_panel_results() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let mut log = Vec::new();
+
+        session.apply_update(
+            SessionUpdate::Panel {
+                generation: 999, // stale: session.generation is 0
+                panel_index: 0,
+                result: Ok(empty_frame("up")),
+            },
+            &mut log,
+        );
+        assert!(session.panels[0].last_result.is_none());
+
+        session.apply_update(
+            SessionUpdate::Panel {
+                generation: 0,
+                panel_index: 0,
+                result: Ok(empty_frame("up")),
+            },
+            &mut log,
+        );
+        assert!(session.panels[0].last_result.is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_update_ad_hoc_pushes_a_result_log_line() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let mut log = Vec::new();
+        session.apply_update(
+            SessionUpdate::AdHoc {
+                query: "up".to_string(),
+                result: Err(CommandError::new(ErrorCode::E106, "boom", None)),
+            },
+            &mut log,
+        );
+        match log.as_slice() {
+            [LogLine::Result(text)] => assert!(text.contains("boom"), "{text}"),
+            other => panic!("expected exactly one Result log line, got {other:?}"),
+        }
+    }
+}

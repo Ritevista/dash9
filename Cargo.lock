@@ -442,6 +442,7 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

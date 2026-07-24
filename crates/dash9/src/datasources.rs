@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dash9_core::{
-    CommandError, Datasource, ErrorCode, Frame, PanelType, ValidatedDashboard, ValidatedPanel,
+    CommandError, Datasource, Duration, ErrorCode, Frame, PanelType, ValidatedDashboard,
 };
 use dash9_prom::PrometheusDatasource;
 
@@ -32,27 +32,36 @@ pub fn build_datasources(dashboard: &ValidatedDashboard) -> HashMap<String, Prom
         .collect()
 }
 
+/// Dispatches a panel's query the way its `panel_type` demands
+/// (`query_range` for `Timeseries`, an instant `query` otherwise).
+/// Takes only the three fields this decision actually depends on
+/// (`ValidatedPanel`'s other fields — title, datasource, grid,
+/// thresholds, ... — are irrelevant here), so a caller building this
+/// from a live, runtime-mutable panel (`dash9::live_session`) doesn't
+/// need to fabricate a full `ValidatedPanel`/`ValidatedDashboard` just
+/// to make this call.
 pub async fn execute_panel_query(
     datasource: &PrometheusDatasource,
-    panel: &ValidatedPanel,
-    dashboard: &ValidatedDashboard,
+    panel_type: PanelType,
+    query: &str,
+    default_range: Duration,
     now_ms: i64,
 ) -> Result<Frame, CommandError> {
     let to_command_error = |source: <PrometheusDatasource as Datasource>::Error| {
         CommandError::new(ErrorCode::E106, source.to_string(), None)
     };
-    match panel.panel_type {
+    match panel_type {
         PanelType::Timeseries => {
-            let range_ms = dashboard.default_range.as_millis();
+            let range_ms = default_range.as_millis();
             let start_ms = now_ms - range_ms;
             let step_ms = (range_ms / TARGET_RANGE_SAMPLES).max(MIN_STEP_MS);
             datasource
-                .query_range(&panel.query, start_ms, now_ms, step_ms)
+                .query_range(query, start_ms, now_ms, step_ms)
                 .await
                 .map_err(to_command_error)
         }
         PanelType::Gauge | PanelType::Stat | PanelType::Table => datasource
-            .query(&panel.query, now_ms)
+            .query(query, now_ms)
             .await
             .map_err(to_command_error),
     }
