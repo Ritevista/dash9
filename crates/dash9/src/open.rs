@@ -245,6 +245,7 @@ fn draw_session(
         &state.log,
         state.input.as_deref(),
         &command_bar_hint(state, status),
+        state.log_scroll,
     );
 }
 

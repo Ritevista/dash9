@@ -187,7 +187,8 @@ fn help_overview() -> String {
     );
     out.push_str(
         "Keys: Tab/Shift+Tab cycle panels + command box · : jump to command box \
-         (Esc cancels) · y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
+         (Esc cancels) · PageUp/PageDown scroll log · y/n confirm proposal · \
+         a toggle AI · q or Ctrl+C quit\n",
     );
     out
 }
@@ -320,6 +321,13 @@ pub trait CommandHandler {
     fn status_bar(&self) -> StatusBarModel;
 }
 
+/// Lines scrolled per `PageUp`/`PageDown` press. `ShellState` has no
+/// notion of terminal size (deliberately — it stays testable without
+/// a real terminal), so this is a fixed step rather than "one
+/// screen's worth"; `command_bar::draw_log`'s `visible_window` clamps
+/// the resulting offset against whatever area it's actually given.
+const LOG_SCROLL_STEP: usize = 8;
+
 /// Pure shell state: the command-bar buffer, the session log, pending
 /// AI proposals awaiting `y`/`n`, and which panel has focus. No
 /// terminal, filesystem, or network access anywhere in this type.
@@ -329,6 +337,12 @@ pub struct ShellState {
     pub log: Vec<LogLine>,
     pub pending_proposals: VecDeque<Command>,
     pub focused_panel: usize,
+    /// Lines scrolled up from the newest log line (0 = pinned to the
+    /// tail). Reset to 0 on every new submission — actively typing a
+    /// new command means "I want to see what happens," not "keep me
+    /// where I was"; background results (pollers, assistant replies)
+    /// never reset it, so reading old output isn't interrupted.
+    pub log_scroll: usize,
     history: VecDeque<String>,
     history_cursor: Option<usize>,
 }
@@ -349,6 +363,20 @@ impl ShellState {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
+        }
+        // Scrolling works the same whether or not the command box is
+        // being edited — reading old output while composing a new
+        // command is a normal thing to want to do.
+        match key.code {
+            KeyCode::PageUp => {
+                self.log_scroll = self.log_scroll.saturating_add(LOG_SCROLL_STEP);
+                return false;
+            }
+            KeyCode::PageDown => {
+                self.log_scroll = self.log_scroll.saturating_sub(LOG_SCROLL_STEP);
+                return false;
+            }
+            _ => {}
         }
 
         if self.input.is_some() {
@@ -449,6 +477,7 @@ impl ShellState {
     }
 
     fn submit<H: CommandHandler>(&mut self, text: &str, handler: &mut H) -> bool {
+        self.log_scroll = 0;
         self.push_history(text.to_string());
         self.push_log(LogLine::Command(SessionLogEntry {
             source: CommandSource::User,
@@ -682,6 +711,56 @@ mod tests {
             state.input.is_none(),
             "left the command box, dropping \"x\""
         );
+    }
+
+    #[test]
+    fn page_up_and_page_down_adjust_log_scroll_and_never_quit() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert_eq!(state.log_scroll, 0);
+
+        assert!(!state.handle_key(press(KeyCode::PageUp), &mut handler));
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP * 2);
+
+        assert!(!state.handle_key(press(KeyCode::PageDown), &mut handler));
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+    }
+
+    #[test]
+    fn page_down_past_zero_saturates_instead_of_underflowing() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::PageDown), &mut handler);
+        assert_eq!(state.log_scroll, 0);
+    }
+
+    #[test]
+    fn scrolling_works_while_editing_without_touching_the_buffer() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+        assert_eq!(
+            state.input.as_deref(),
+            Some("x"),
+            "scrolling must not disturb the in-progress buffer"
+        );
+    }
+
+    #[test]
+    fn submitting_a_command_resets_log_scroll_to_the_tail() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+
+        type_and_submit(&mut state, &mut handler, "hello");
+        assert_eq!(state.log_scroll, 0);
     }
 
     #[test]
