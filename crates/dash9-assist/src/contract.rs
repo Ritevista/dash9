@@ -193,12 +193,15 @@ pub fn process_reply(
 /// than inventing assist-specific ones — a datasource or focused-panel
 /// problem looks identical whether a human or the assistant caused it.
 ///
-/// Note on scope: today's command grammar has no verb that names a
-/// datasource by reference (only `ds add`, which *defines* one) — so
-/// there is currently nothing to check for "does a referenced
-/// datasource exist" (`E101`). If a future verb ever names one, it
-/// plugs into this same function; there is no special assist-only
-/// code path to remember to update.
+/// Note on scope: `ds metrics <name>` does name a *configured*
+/// datasource by reference, but this function still doesn't check it
+/// exists (`E101`) — that would mean threading the live datasource
+/// list through `process_reply`'s signature for one verb. Instead an
+/// unknown name reaches `live_session::LiveSession::spawn_ds_metrics_
+/// query` and fails there with the same `E101`, exactly like `q`'s
+/// (implicit, always-valid-by-construction) datasource lookup already
+/// does — a harmless `AutoRun` result, not a silent success, just one
+/// step later than a human typing the same wrong name would see.
 fn validate_for_assist(
     command: &Command,
     focused_panel: bool,
@@ -226,6 +229,7 @@ fn validate_for_assist(
         }
         Command::DsAdd { .. }
         | Command::DsList
+        | Command::DsMetrics { .. }
         | Command::Q { .. }
         | Command::Range { .. }
         | Command::Refresh { .. } => Ok(()),

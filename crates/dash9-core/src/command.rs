@@ -12,6 +12,14 @@ pub enum Command {
         url: String,
     },
     DsList,
+    /// Lists every metric name the given (or, when omitted, the
+    /// focused panel's) datasource reports. `name` is the only place
+    /// the grammar names a *configured* datasource by reference
+    /// (`ds add` only ever defines one) — see `dash9-assist`'s
+    /// `validate_for_assist` for why that distinction matters there.
+    DsMetrics {
+        name: Option<String>,
+    },
     /// Raw-tail: `query` is the remainder of the line verbatim, with
     /// no quote stripping (SPEC.md B.2).
     Q {
@@ -213,6 +221,20 @@ fn parse_ds(tokens: &[String]) -> Result<Command, CommandError> {
             }
             Ok(Command::DsList)
         }
+        "metrics" => {
+            let args = &tokens[2..];
+            match args.len() {
+                0 => Ok(Command::DsMetrics { name: None }),
+                1 => Ok(Command::DsMetrics {
+                    name: Some(args[0].clone()),
+                }),
+                got => Err(CommandError::new(
+                    ErrorCode::E005,
+                    format!("\"ds metrics\" expects 0 or 1 arguments (name?), got {got}"),
+                    None,
+                )),
+            }
+        }
         other => Err(unknown_subverb("ds", other)),
     }
 }
@@ -402,6 +424,12 @@ pub const VERB_REFERENCE: &[VerbSpec] = &[
         description: "List configured datasources.",
     },
     VerbSpec {
+        verb: "ds metrics",
+        args: &["name?"],
+        example: "ds metrics prom",
+        description: "List every metric name the given (or focused panel's) datasource reports.",
+    },
+    VerbSpec {
         verb: "q",
         args: &["query"],
         example: r#"q up{job="api"}"#,
@@ -464,6 +492,7 @@ mod tests {
         match cmd {
             Command::DsAdd { .. } => "ds add",
             Command::DsList => "ds list",
+            Command::DsMetrics { .. } => "ds metrics",
             Command::Q { .. } => "q",
             Command::PanelType { .. } => "panel type",
             Command::PanelThreshold { .. } => "panel threshold",
@@ -496,6 +525,7 @@ mod tests {
         let all_verbs = [
             "ds add",
             "ds list",
+            "ds metrics",
             "q",
             "panel type",
             "panel threshold",
@@ -533,6 +563,30 @@ mod tests {
     #[test]
     fn ds_list() {
         assert_eq!(parse("ds list").unwrap(), Command::DsList);
+    }
+
+    #[test]
+    fn ds_metrics_bare_has_no_name() {
+        assert_eq!(
+            parse("ds metrics").unwrap(),
+            Command::DsMetrics { name: None }
+        );
+    }
+
+    #[test]
+    fn ds_metrics_with_name() {
+        assert_eq!(
+            parse("ds metrics prom").unwrap(),
+            Command::DsMetrics {
+                name: Some("prom".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn ds_metrics_with_too_many_args_is_e005() {
+        let err = parse("ds metrics prom extra").unwrap_err();
+        assert_eq!(err.code, ErrorCode::E005);
     }
 
     #[test]

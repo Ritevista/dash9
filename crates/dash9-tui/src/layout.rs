@@ -21,23 +21,42 @@ const ROW_UNIT_HEIGHT: u16 = 6;
 /// drawing off-screen.
 pub fn grid_layout(area: Rect, panels: &[GridSpec]) -> Vec<Rect> {
     let columns = u16::try_from(GRID_COLUMNS).unwrap_or(12).max(1);
-    let column_width = area.width / columns;
     panels
         .iter()
-        .map(|grid| panel_rect(area, grid, column_width))
+        .map(|grid| panel_rect(area, grid, columns))
         .collect()
 }
 
-fn panel_rect(area: Rect, grid: &GridSpec, column_width: u16) -> Rect {
+/// A column boundary's absolute x, proportionally distributed across
+/// `area`'s width — not `col * (area.width / columns)`, which
+/// truncates on every multiplication and can leave several terminal
+/// columns on the right entirely unused by any panel (visible, on a
+/// terminal whose width doesn't divide evenly by `GRID_COLUMNS`, as a
+/// full-width panel's border falling a few columns short of the
+/// command bar's below it — reported live). Computing each boundary
+/// independently from the full width means a panel spanning every
+/// column always reaches exactly `area.x + area.width`, with any
+/// remainder distributed across interior boundaries instead of lost
+/// off the right edge.
+fn column_x(area: Rect, columns: u16, col: u16) -> u16 {
+    let col = col.min(columns);
+    let offset = (u32::from(area.width) * u32::from(col)) / u32::from(columns);
+    area.x
+        .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
+}
+
+fn panel_rect(area: Rect, grid: &GridSpec, columns: u16) -> Rect {
     let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+    let col_start = clamp(grid.col);
+    let col_end = col_start.saturating_add(clamp(grid.w));
+    let left = column_x(area, columns, col_start);
+    let right = column_x(area, columns, col_end);
     let raw = Rect {
-        x: area
-            .x
-            .saturating_add(clamp(grid.col).saturating_mul(column_width)),
+        x: left,
         y: area
             .y
             .saturating_add(clamp(grid.row).saturating_mul(ROW_UNIT_HEIGHT)),
-        width: clamp(grid.w).saturating_mul(column_width),
+        width: right.saturating_sub(left),
         height: clamp(grid.h).saturating_mul(ROW_UNIT_HEIGHT),
     };
     raw.intersection(area)
@@ -146,6 +165,29 @@ mod tests {
                 height: 16
             }
         );
+    }
+
+    #[test]
+    fn full_width_panel_reaches_the_right_edge_even_when_width_does_not_divide_evenly_by_12() {
+        // 160 / 12 truncates to 13, so the old `col * (width /
+        // columns)` math gave a full-width panel only 156 columns —
+        // 4 short of the area's actual 160, visible live as the
+        // panel's border falling short of the log/command bar below
+        // it (which spans the full area, not a grid column count).
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 40,
+        };
+        let grids = vec![GridSpec {
+            row: 0,
+            col: 0,
+            w: 12,
+            h: 4,
+        }];
+        let rects = grid_layout(area, &grids);
+        assert_eq!(rects[0].width, 160);
     }
 
     #[test]

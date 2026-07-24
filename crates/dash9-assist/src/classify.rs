@@ -23,6 +23,7 @@ pub enum ProposedCommand {
 pub fn classify(cmd: Command) -> ProposedCommand {
     match cmd {
         Command::DsList
+        | Command::DsMetrics { .. }
         | Command::Q { .. }
         | Command::Range { .. }
         | Command::PanelType { .. }

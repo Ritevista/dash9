@@ -43,6 +43,10 @@ pub enum SessionUpdate {
         query: String,
         result: Result<Frame, CommandError>,
     },
+    DsMetrics {
+        datasource: String,
+        result: Result<Vec<String>, CommandError>,
+    },
 }
 
 pub struct LiveDatasource {
@@ -149,6 +153,12 @@ impl LiveSession {
                     Err(err) => format!("q {query}: {err}"),
                 };
                 log.push(LogLine::Result(text));
+            }
+            SessionUpdate::DsMetrics { datasource, result } => {
+                log.push(LogLine::Result(format_ds_metrics_result(
+                    &datasource,
+                    result,
+                )));
             }
         }
     }
@@ -266,6 +276,43 @@ impl LiveSession {
                 .await;
         });
         format!("q {query}: running…")
+    }
+
+    /// `ds metrics [name]`. `name` is looked up directly in
+    /// `self.datasources`; omitted, it falls back to the focused
+    /// panel's datasource — the same "focused datasource" convention
+    /// `spawn_ad_hoc_query` uses, since SPEC.md has no `ds focus`
+    /// verb. An unresolvable name (typo, or the assistant proposing
+    /// one that was never added) is `E101`, exactly like an unknown
+    /// datasource reached any other way.
+    fn spawn_ds_metrics_query(&self, focused_panel: usize, name: Option<String>) -> String {
+        let target_name = if let Some(name) = name {
+            name
+        } else {
+            let Some(panel) = self.panels.get(focused_panel) else {
+                return no_panel_focused_error();
+            };
+            panel.datasource.clone()
+        };
+        let Some(datasource) = self.datasources.get(&target_name) else {
+            return format!("{}: unknown datasource \"{target_name}\"", ErrorCode::E101);
+        };
+        let ds_name = target_name;
+        let adapter = Arc::clone(&datasource.adapter);
+        let update_tx = self.update_tx.clone();
+        tokio::spawn(async move {
+            let result = adapter
+                .metric_names()
+                .await
+                .map_err(|err| CommandError::new(ErrorCode::E106, err.to_string(), None));
+            let _ = update_tx
+                .send(SessionUpdate::DsMetrics {
+                    datasource: ds_name,
+                    result,
+                })
+                .await;
+        });
+        "ds metrics: fetching…".to_string()
     }
 
     /// `:save <format> [path]`. Exports the focused panel's *current*
@@ -481,6 +528,18 @@ fn default_export_path(panel_title: &str, format: ExportFormat) -> String {
     format!("exports/{slug}-{}.{}", epoch_ms_now(), format.extension())
 }
 
+fn format_ds_metrics_result(datasource: &str, result: Result<Vec<String>, CommandError>) -> String {
+    match result {
+        Ok(names) if names.is_empty() => format!("ds metrics {datasource}: (no metrics)"),
+        Ok(names) => format!(
+            "ds metrics {datasource}: {} metrics\n{}",
+            names.len(),
+            names.join(", ")
+        ),
+        Err(err) => format!("ds metrics {datasource}: {err}"),
+    }
+}
+
 fn format_ad_hoc_result(query: &str, frame: &Frame) -> String {
     if frame.is_empty() {
         format!("q {query}: (no data)")
@@ -586,6 +645,7 @@ pub fn execute_command(session: &mut LiveSession, focused_panel: usize, cmd: Com
                     .join("\n")
             }
         }
+        Command::DsMetrics { name } => session.spawn_ds_metrics_query(focused_panel, name),
         Command::Q { query } => session.spawn_ad_hoc_query(focused_panel, &query),
         Command::PanelType { panel_type } => {
             if session.panels.is_empty() {
@@ -837,6 +897,86 @@ mod tests {
             },
         );
         assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metrics_named_unknown_datasource_is_e101() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetrics {
+                name: Some("bogus".to_string()),
+            },
+        );
+        assert!(outcome.contains("E101"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metrics_bare_with_no_panels_reports_e103() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(&mut session, 0, Command::DsMetrics { name: None });
+        assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metrics_bare_uses_the_focused_panels_datasource_and_starts_fetching() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = execute_command(&mut session, 0, Command::DsMetrics { name: None });
+        assert!(outcome.contains("fetching"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metrics_named_known_datasource_starts_fetching() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetrics {
+                name: Some("prom".to_string()),
+            },
+        );
+        assert!(outcome.contains("fetching"), "{outcome}");
+    }
+
+    #[test]
+    fn format_ds_metrics_result_lists_names_and_count() {
+        let text =
+            format_ds_metrics_result("prom", Ok(vec!["up".to_string(), "node_load1".to_string()]));
+        assert!(text.contains("2 metrics"), "{text}");
+        assert!(text.contains("up, node_load1"), "{text}");
+    }
+
+    #[test]
+    fn format_ds_metrics_result_with_no_metrics_says_so() {
+        let text = format_ds_metrics_result("prom", Ok(vec![]));
+        assert!(text.contains("(no metrics)"), "{text}");
+    }
+
+    #[test]
+    fn format_ds_metrics_result_with_an_error_reports_it() {
+        let text = format_ds_metrics_result(
+            "prom",
+            Err(CommandError::new(ErrorCode::E106, "boom", None)),
+        );
+        assert!(text.contains("boom"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn apply_update_ds_metrics_pushes_a_result_log_line() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let mut log = Vec::new();
+        session.apply_update(
+            SessionUpdate::DsMetrics {
+                datasource: "prom".to_string(),
+                result: Err(CommandError::new(ErrorCode::E106, "boom", None)),
+            },
+            &mut log,
+        );
+        match log.as_slice() {
+            [LogLine::Result(text)] => assert!(text.contains("boom"), "{text}"),
+            other => panic!("expected exactly one Result log line, got {other:?}"),
+        }
     }
 
     #[tokio::test]
