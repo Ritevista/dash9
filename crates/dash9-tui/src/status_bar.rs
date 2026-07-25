@@ -89,6 +89,37 @@ pub fn draw_status_bar(frame: &mut Frame, area: Rect, model: &StatusBarModel) {
     );
 }
 
+/// One line below the main status bar: the active zoom level plus that
+/// region's own key hint (`docs/specs/session-layout.md` Section D — "per
+/// bordered region" hints, so discoverability doesn't live solely in
+/// `/help`). Kept as its own small model/draw pair rather than folded into
+/// [`StatusBarModel`]/[`draw_status_bar`] — the zoom concept has nothing
+/// to do with datasource health or AI status, the two things that bar
+/// already tracks, and every future zoom-bar tweak (e.g. Grid's "panels
+/// X-Y of Z" paging indicator, computed by the composition root from real
+/// rect data) stays isolated from that already-busy line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoomBarModel {
+    /// e.g. `"Grid"`, `"Layout"`, `"Focus: chart"`, `"Focus: inspect"`.
+    pub zoom_label: String,
+    /// The active region's key hint (`shell::zoom_hint`), with the
+    /// composition root's own "panels X-Y of Z" suffix appended when Grid
+    /// is truncated — this module renders whatever text it's given, same
+    /// "pure rendering" split every other `dash9-tui` draw module keeps.
+    pub hint: String,
+}
+
+pub fn draw_zoom_bar(frame: &mut Frame, area: Rect, model: &ZoomBarModel) {
+    if area.height == 0 {
+        return;
+    }
+    let line = format!(" [{}] {} ", model.zoom_label, model.hint);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().fg(theme::MUTED)),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +181,30 @@ mod tests {
         let mut terminal = backend(120, 3);
         terminal
             .draw(|f| draw_status_bar(f, Rect::new(0, 0, 120, 0), &base_model()))
+            .unwrap();
+    }
+
+    #[test]
+    fn zoom_bar_draws_without_panicking() {
+        let model = ZoomBarModel {
+            zoom_label: "Grid".to_string(),
+            hint: "PageUp/PageDown page panels · +/- zoom · i detail".to_string(),
+        };
+        let mut terminal = backend(120, 1);
+        terminal
+            .draw(|f| draw_zoom_bar(f, f.area(), &model))
+            .unwrap();
+    }
+
+    #[test]
+    fn zoom_bar_zero_height_area_draws_without_panicking() {
+        let model = ZoomBarModel {
+            zoom_label: "Layout".to_string(),
+            hint: "+ back to grid".to_string(),
+        };
+        let mut terminal = backend(120, 1);
+        terminal
+            .draw(|f| draw_zoom_bar(f, Rect::new(0, 0, 120, 0), &model))
             .unwrap();
     }
 }
