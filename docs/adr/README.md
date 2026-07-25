@@ -12,3 +12,4 @@ ADRs are immutable decision history. Statuses are Proposed, Accepted, Superseded
 | 0006 | dash9 test: pure verdict logic separated from async I/O | Accepted |
 | 0007 | Apache-2.0 OR MIT dual license | Accepted |
 | 0008 | AI assistant: one effector, command-grammar text only | Proposed |
+| 0009 | Grafana dashboard JSON as a first-class, lossless format | Proposed |
