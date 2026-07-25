@@ -23,6 +23,7 @@
 //! implemented by both handlers alongside `CommandHandler`.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use crossterm::event::{self, Event};
@@ -40,6 +41,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc;
 
 use crate::live_session::{execute_command, LivePanel, LiveSession, SessionUpdate};
+use crate::log_recorder::LogRecorder;
 
 const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
@@ -59,12 +61,14 @@ fn run_plain(path: &Path) -> anyhow::Result<()> {
     let workspace_root = std::env::current_dir()?;
 
     let (tx, rx) = mpsc::channel::<SessionUpdate>(CHANNEL_CAPACITY);
-    let session = LiveSession::new(&dashboard, workspace_root, tx);
+    let session = LiveSession::new(&dashboard, workspace_root.clone(), tx);
+    let recorder = Arc::new(Mutex::new(LogRecorder::new(workspace_root)));
     let handler = GrammarOnlyHandler {
         session,
         update_rx: rx,
+        recorder: Arc::clone(&recorder),
     };
-    shell_loop(handler, ShellState::default())
+    shell_loop(handler, ShellState::default(), &recorder)
 }
 
 #[cfg(not(feature = "assist"))]
@@ -83,14 +87,19 @@ fn run_with_assist(path: &Path) -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<SessionUpdate>(CHANNEL_CAPACITY);
     let session = LiveSession::new(&dashboard, workspace_root.clone(), tx);
+    let recorder = Arc::new(Mutex::new(LogRecorder::new(workspace_root.clone())));
 
     let mut state = ShellState::default();
-    let (handler, startup_message) =
-        crate::assist_bridge::AssistHandler::new(session, rx, workspace_root);
+    let (handler, startup_message) = crate::assist_bridge::AssistHandler::new(
+        session,
+        rx,
+        workspace_root,
+        Arc::clone(&recorder),
+    );
     if let Some(message) = startup_message {
         state.log.push(dash9_core::LogLine::Result(message));
     }
-    shell_loop(handler, state)
+    shell_loop(handler, state, &recorder)
 }
 
 /// Exposes the `LiveSession` a `CommandHandler` implementation wraps,
@@ -104,14 +113,23 @@ pub(crate) trait HasSession {
 
 /// The shared render loop: identical for `run_plain` and
 /// `run_with_assist` now, generic over whichever `CommandHandler`
-/// implementation is driving it.
+/// implementation is driving it. `recorder` is the same handle the
+/// handler holds (see [`GrammarOnlyHandler`]/`AssistHandler`) — the
+/// handler owns turning `/record on|off` into an open/closed file,
+/// this loop owns noticing every new `state.log` line and offering it
+/// to the recorder, since that's the one place that sees every line
+/// (including ones `ShellState` itself adds, like the echoed command
+/// text, which never passes through a handler at all).
 fn shell_loop<H: CommandHandler + HasSession>(
     mut handler: H,
     mut state: ShellState,
+    recorder: &Arc<Mutex<LogRecorder>>,
 ) -> anyhow::Result<()> {
     ratatui::run(|terminal| -> anyhow::Result<()> {
         loop {
+            let before = state.log.len();
             state.apply_poll(&mut handler);
+            record_new_lines(&state, recorder, before);
 
             terminal.draw(|f| {
                 let status = handler.status_bar();
@@ -124,11 +142,41 @@ fn shell_loop<H: CommandHandler + HasSession>(
             let Event::Key(key) = event::read()? else {
                 continue;
             };
-            if state.handle_key(key, &mut handler) {
+            let before = state.log.len();
+            let should_quit = state.handle_key(key, &mut handler);
+            record_new_lines(&state, recorder, before);
+            if should_quit {
                 return Ok(());
             }
         }
     })
+}
+
+/// Offers every log line added since `before` to the recorder — a
+/// no-op on its end unless `/record on` is active. `before`/`after`
+/// bracket a single `apply_poll`/`handle_key` call, so this is immune
+/// to `ShellState`'s own `MAX_LOG_LINES` trimming shifting indices
+/// across ticks (nothing persists between calls); it would only miss
+/// lines if one single call added enough entries to itself trigger a
+/// trim, which needs hundreds of lines from one keypress or poll
+/// drain — never happens in practice.
+fn record_new_lines(state: &ShellState, recorder: &Arc<Mutex<LogRecorder>>, before: usize) {
+    let after = state.log.len();
+    if after <= before {
+        return;
+    }
+    lock_recorder(recorder).record(&state.log[before..after]);
+}
+
+/// A poisoned lock here would mean an earlier panic happened while
+/// holding it — recovering the guard anyway rather than propagating
+/// the poison keeps one bad recorder write from taking down the
+/// entire render loop over what's fundamentally a best-effort side
+/// channel, not session-critical state.
+fn lock_recorder(recorder: &Mutex<LogRecorder>) -> std::sync::MutexGuard<'_, LogRecorder> {
+    recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The `run_plain` handler: no `dash9-assist` awareness at all. Every
@@ -138,6 +186,7 @@ fn shell_loop<H: CommandHandler + HasSession>(
 struct GrammarOnlyHandler {
     session: LiveSession,
     update_rx: mpsc::Receiver<SessionUpdate>,
+    recorder: Arc<Mutex<LogRecorder>>,
 }
 
 impl HasSession for GrammarOnlyHandler {
@@ -162,6 +211,12 @@ impl CommandHandler for GrammarOnlyHandler {
                 self.session
                     .export_panel(focused_panel, format, path.as_deref()),
             ),
+            ShellInput::RecordingStatus => {
+                CommandResponse::result(lock_recorder(&self.recorder).status())
+            }
+            ShellInput::SetRecording { on, path } => {
+                CommandResponse::result(lock_recorder(&self.recorder).set(on, path))
+            }
             ShellInput::NaturalLanguage(_) => CommandResponse::result(
                 "natural language requires --assist (or prefix a command with /, see /help)"
                     .to_string(),

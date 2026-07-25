@@ -57,6 +57,16 @@ pub enum ShellInput {
         format: ExportFormat,
         path: Option<String>,
     },
+    /// Bare `/record`: whether continuous log recording is on, and
+    /// where.
+    RecordingStatus,
+    /// `/record on [path]` / `/record off` — continuous, append-as-
+    /// you-go recording of every log line to a file, distinct from
+    /// `Export`'s one-shot panel snapshot.
+    SetRecording {
+        on: bool,
+        path: Option<String>,
+    },
     /// A line with no leading `/` — always sent as-is, never
     /// grammar-parsed first.
     NaturalLanguage(String),
@@ -121,6 +131,25 @@ const SHELL_META_REFERENCE: &[VerbSpec] = &[
         description: "Export the focused panel's data (csv, md, or png).",
     },
     VerbSpec {
+        verb: "record",
+        args: &[],
+        example: "/record",
+        description: "Show whether continuous log recording is on, and where.",
+    },
+    VerbSpec {
+        verb: "record on",
+        args: &["path?"],
+        example: "/record on exports/session.jsonl",
+        description:
+            "Start recording every log line (JSONL, one record per line, appended) to a file.",
+    },
+    VerbSpec {
+        verb: "record off",
+        args: &[],
+        example: "/record off",
+        description: "Stop recording.",
+    },
+    VerbSpec {
         verb: "quit",
         args: &[],
         example: "/quit",
@@ -144,6 +173,7 @@ const GROUP_BLURBS: &[(&str, &str)] = &[
     ("refresh", "set the auto-refresh interval"),
     ("dash", "save or open a dashboard file"),
     ("save", "export the focused panel's data (csv, md, png)"),
+    ("record", "continuously record the log to a file (JSONL)"),
     ("model", "show or switch the AI model"),
     ("ai", "AI on/off/model (--assist only)"),
     ("help", "show this list, or /help <name> for detail"),
@@ -277,6 +307,28 @@ pub fn parse_shell_input(text: &str) -> ShellInput {
         // Unrecognized format falls through to grammar parsing below,
         // which reports the same "unknown verb" shape any other
         // unrecognized `/`-command gets.
+    }
+    if body == "record" {
+        return ShellInput::RecordingStatus;
+    }
+    if body == "record on" {
+        return ShellInput::SetRecording {
+            on: true,
+            path: None,
+        };
+    }
+    if let Some(path) = body.strip_prefix("record on ") {
+        let path = path.trim();
+        return ShellInput::SetRecording {
+            on: true,
+            path: (!path.is_empty()).then(|| path.to_string()),
+        };
+    }
+    if body == "record off" {
+        return ShellInput::SetRecording {
+            on: false,
+            path: None,
+        };
     }
 
     match dash9_core::parse(body) {
@@ -834,6 +886,32 @@ mod tests {
         assert_eq!(
             parse_shell_input("/ai model gemini-flash"),
             ShellInput::ModelSwitch("gemini-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn record_meta_commands_are_recognized_before_grammar_parsing() {
+        assert_eq!(parse_shell_input("/record"), ShellInput::RecordingStatus);
+        assert_eq!(
+            parse_shell_input("/record on"),
+            ShellInput::SetRecording {
+                on: true,
+                path: None
+            }
+        );
+        assert_eq!(
+            parse_shell_input("/record on exports/session.jsonl"),
+            ShellInput::SetRecording {
+                on: true,
+                path: Some("exports/session.jsonl".to_string())
+            }
+        );
+        assert_eq!(
+            parse_shell_input("/record off"),
+            ShellInput::SetRecording {
+                on: false,
+                path: None
+            }
         );
     }
 

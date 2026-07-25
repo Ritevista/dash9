@@ -440,6 +440,7 @@ dependencies = [
  "dash9-tui",
  "predicates",
  "ratatui",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

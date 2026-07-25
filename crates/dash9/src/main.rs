@@ -5,6 +5,7 @@ mod assist_bridge;
 mod datasources;
 mod demo;
 mod live_session;
+mod log_recorder;
 mod open;
 mod test_cmd;
 

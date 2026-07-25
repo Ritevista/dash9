@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::datasources::epoch_ms_now;
 use crate::live_session::{execute_command, LiveSession};
+use crate::log_recorder::LogRecorder;
 use crate::open::{status_bar_for, HasSession};
 
 const CHANNEL_CAPACITY: usize = 64;
@@ -157,16 +158,20 @@ pub struct AssistHandler {
     session: LiveSession,
     update_rx: mpsc::Receiver<crate::live_session::SessionUpdate>,
     assist: Option<AssistCore>,
+    recorder: Arc<std::sync::Mutex<LogRecorder>>,
 }
 
 impl AssistHandler {
     /// Returns the handler plus an optional startup message (e.g. why
     /// assist isn't available) for the caller to log before entering
-    /// the render loop.
+    /// the render loop. `recorder` is the same handle `open::shell_loop`
+    /// drains every tick — recording is handler-agnostic, not an
+    /// assist-only concern (see `log_recorder`'s module docs).
     pub fn new(
         session: LiveSession,
         update_rx: mpsc::Receiver<crate::live_session::SessionUpdate>,
         workspace_root: PathBuf,
+        recorder: Arc<std::sync::Mutex<LogRecorder>>,
     ) -> (Self, Option<String>) {
         match load_assist_session(workspace_root.clone()) {
             Ok((handle, config)) => {
@@ -189,6 +194,7 @@ impl AssistHandler {
                         session,
                         update_rx,
                         assist: Some(core),
+                        recorder,
                     },
                     None,
                 )
@@ -198,6 +204,7 @@ impl AssistHandler {
                     session,
                     update_rx,
                     assist: None,
+                    recorder,
                 },
                 Some(format!("assist unavailable: {reason}")),
             ),
@@ -226,6 +233,18 @@ impl CommandHandler for AssistHandler {
             ShellInput::Export { format, path } => CommandResponse::result(
                 self.session
                     .export_panel(focused_panel, format, path.as_deref()),
+            ),
+            ShellInput::RecordingStatus => CommandResponse::result(
+                self.recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .status(),
+            ),
+            ShellInput::SetRecording { on, path } => CommandResponse::result(
+                self.recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set(on, path),
             ),
             ShellInput::ModelStatus => CommandResponse::result(self.model_status()),
             ShellInput::ModelSwitch(name) => CommandResponse::result(self.switch_model(&name)),
