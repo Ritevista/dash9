@@ -450,11 +450,18 @@ datasources, focused panel, filesystem).
 | `E104` | `dash open` path does not exist or is not readable |
 | `E105` | `dash save` path is not writable |
 | `E106` | Query execution failed (wraps the datasource adapter's error) |
+| `E107` | `dash save`/`dash open` path resolves outside the workspace root (absolute path, `..` traversal, or a symlink escape) |
 
 `E106` is deliberately the only code that wraps an adapter-specific
 error rather than describing the grammar itself — a malformed PromQL
 expression inside a raw-tail `q` argument is invisible to the parser
 (B.2) and only surfaces when the adapter tries to execute it.
+
+`E107` was added after v0.1 shipped (`docs/specs/assist.md` Section
+C.2), append-only per B.1/B.5 — it does not change any existing code's
+meaning. The same workspace-relative-path check also guards the
+interactive session's `/save` and `/record` destinations
+(`docs/specs/open.md` Sections I, J).
 
 Worked examples:
 
@@ -480,9 +487,12 @@ E003: unknown subverb "frobnicate" for namespace "ds"
 ## C. The dashboard TOML schema
 
 A dashboard is one TOML file: metadata, a list of datasources, and a
-list of panels. `dash9 dash open <path>` loads one; `dash9 dash save
-<path>` writes the current in-session state back out; `dash9 test
-<path>` validates one headlessly (C.3).
+list of panels. The CLI's `dash9 open <path>` loads one into an
+interactive session (`docs/specs/open.md`); once inside that session,
+the grammar's `dash save <path>`/`dash open <path>` verbs (B.3) write
+the current in-session state back out or replace the session with a
+different file. `dash9 test <path>` validates a file headlessly (C.3)
+without opening a session at all.
 
 ### C.1 Schema reference
 

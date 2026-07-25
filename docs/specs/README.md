@@ -4,4 +4,5 @@ Specifications define observable behaviour and acceptance tests. Behaviour chang
 
 | Specification | Status |
 |---|---|
+| [The interactive `dash9 open` session](open.md) | Accepted |
 | [AI assistant (Phase 2)](assist.md) | Proposed |
