@@ -4,15 +4,16 @@
 panel grid, a scrollable session log, and a command bar, all driven by
 the one command grammar `SPEC.md` Section B defines. This document is
 the single source of truth for everything `open` adds on top of that
-grammar — the shell meta-commands, keybindings, the detail-view
-overlay, the status bar, and continuous log recording — none of which
-is part of SPEC.md's append-only grammar (Section B.1) because it is
-shell/UI behavior, not something a dashboard TOML file or a scripted
-`dash9 test` run ever needs to express.
+grammar — the shell meta-commands, keybindings, the zoom levels, the
+status bar, and continuous log recording — none of which is part of
+SPEC.md's append-only grammar (Section B.1) because it is shell/UI
+behavior, not something a dashboard TOML file or a scripted `dash9
+test` run ever needs to express.
 
 Status: **Accepted** — every behavior below is implemented and has
-unit or integration coverage (`crates/dash9-tui/src/shell.rs`,
-`crates/dash9-tui/src/{detail_view,status_bar,command_bar}.rs`,
+unit or integration coverage
+(`crates/dash9-tui/src/{shell,layout,pane,output}.rs`,
+`crates/dash9-tui/src/{detail_view,status_bar,command_bar,draw}.rs`,
 `crates/dash9/src/{open,live_session,log_recorder}.rs`). Prerequisites:
 `SPEC.md` (grammar, error codes, dashboard schema), `docs/architecture/rendering.md`.
 This spec does not cover the `--assist` flag's AI behavior (context
@@ -21,7 +22,10 @@ assembly, the contract loop, the LLM client) — that is
 interactive session every `dash9 open` invocation has regardless of
 `--assist` (Section H below is the one exception, since the `/ai`
 verbs and the assist status-bar segment only do anything when the
-session was built with assist wiring).
+session was built with assist wiring). Section E (keybindings) and
+Section G (zoom levels) reflect `docs/specs/session-layout.md`
+Sections A-D, which are implemented; that spec's Section E (`/save
+png`) is not — Section I below still accurately says so.
 
 ## Contents
 
@@ -30,8 +34,8 @@ session was built with assist wiring).
 - [C. Input routing](#c-input-routing)
 - [D. Shell meta-commands](#d-shell-meta-commands)
 - [E. Keybindings](#e-keybindings)
-- [F. The command log](#f-the-command-log)
-- [G. The detail view](#g-the-detail-view)
+- [F. The command log and the output pane](#f-the-command-log-and-the-output-pane)
+- [G. Zoom levels: Layout, Grid, Focus](#g-zoom-levels-layout-grid-focus)
 - [H. Status bar](#h-status-bar)
 - [I. Panel export (`/save`)](#i-panel-export-save)
 - [J. Continuous log recording (`/record`)](#j-continuous-log-recording-record)
@@ -71,8 +75,8 @@ metrics` run once against the focused panel's datasource and post
 their result to the log (Section F) rather than becoming a panel.
 
 Every panel result — pass or fail — is retained as the panel's `last_result`,
-which both the panel grid (small chart box) and the detail view
-(Section G, full data table) render from; there is exactly one source
+which both the panel grid (small chart box) and the detail pane
+(Section G.1, full data table) render from; there is exactly one source
 of truth for "what did this panel's query last return," not a
 separate copy for each view.
 
@@ -140,40 +144,96 @@ classification) is `docs/specs/assist.md`.
 | Key | Effect |
 |---|---|
 | `:` | Enter the command box (starts an empty buffer). |
-| `Esc` | While editing: cancel input, discard the buffer. Else, if the detail view is open: close it. Else: no-op. **Never quits**, regardless of how many times pressed. |
+| `Esc` | While editing: cancel input, discard the buffer. Else, layered: if the detail pane (Section G.1) is open, close it; only once it's closed does Esc fall through to zoom "home" — one hop to Grid from Layout or Focus (Section G); no-op once at Grid with detail closed. One press always does at most one thing. **Never quits**, regardless of how many times pressed. |
 | `Enter` | While editing: submit the buffer (no-op on an empty/whitespace-only line — nothing is logged and no handler call happens). |
-| `Tab` / `Shift+Tab` | Outside the command box: cycle focus forward/backward around every panel, then the command box itself, then wrap (`panel_count() + 1` stops total). **Inert while editing** — once inside the command box composing text, `Tab`/`Shift+Tab` do nothing, so a stray press never silently discards an in-progress command by navigating away; only `Esc` or `Enter` leave the box. |
+| `Tab` / `Shift+Tab` | Outside the command box: cycle focus forward/backward around every panel, then the command box itself, then wrap (`panel_count() + 1` stops total); in Grid zoom, also scrolls the viewport to keep the newly-focused panel visible. While editing: **never leaves the command box** — only `Esc` or `Enter` do that, so a stray press never silently discards an in-progress command by navigating away — but it still cycles which panel is focused (a plain `panel_count()`-stop ring, no command-box stop needed), so you can glance at another panel's chart mid-command without losing what you've typed. |
+| `1`-`9` | Outside the command box: jump focus straight to that panel (1-indexed), instead of stepping through `Tab`'s cycle one at a time. A digit past `panel_count()` (or on an empty dashboard) is a no-op. Works in every zoom level. While editing, a literal character. |
 | `↑` / `↓` | While editing: cycle command history, most recent first; `↓` past the newest clears back to an empty buffer. |
-| `PageUp` / `PageDown` | Scroll the log up/down by a fixed step, in or out of the command box, without touching the input buffer. Submitting a new command always resets scroll to the tail; background results (poller updates, assistant replies) never do, so reading old output is never interrupted out from under you. |
-| `i` | Outside the command box: toggle the focused panel's full-screen detail view (Section G). While editing, `i` is a literal character. |
+| `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C): scrolls the log while editing, in or out of the command box; pages the Grid viewport vertically when not editing and zoomed to Grid (Section G); a no-op in Layout or Focus. Submitting a new command always resets the log scroll to the tail; background results (poller updates, assistant replies) never do, so reading old output is never interrupted out from under you. |
+| `+` / `=` | Zoom in one level (Section G): Layout → Grid → Focus. No-op already at Focus. |
+| `-` / `_` | Zoom out one level: Focus → Grid → Layout. No-op already at Layout. |
+| `i` | Outside the command box: toggles the focused panel's detail pane (Section G.1) open/closed. Independent of zoom — works, and stays open, in Layout, Grid, or Focus alike, and never changes which zoom level is active. While editing, `i` is a literal character. |
 | `y` / `n` | Only while a proposal is pending (assist-only, `docs/specs/assist.md`): accept/execute or dismiss the oldest pending proposal. Inert with nothing pending. |
 | `a` | Toggle the assistant on/off (assist sessions only; unlike `/ai on`/`/ai off`, this always flips the current state rather than setting an explicit one). |
 | `q` | Outside the command box: quit. While editing, a literal character. |
 | `Ctrl+C` | Quit, unconditionally — in or out of the command box, checked before any other key handling. Needed because raw terminal mode delivers it as a normal keypress rather than a real `SIGINT`; without this override it would either type a literal `c` or do nothing. |
 
-## F. The command log
+## F. The command log and the output pane
 
-Every submitted command is appended to the log as one `Command` entry
-(who sent it — `user` or `assistant` — the verbatim text, and a
-millisecond timestamp), followed by one `Result` entry once a response
-arrives; background results (panel pollers are not logged individually,
-but ad-hoc `q`/`ds metrics` results and assistant replies are) are
-appended the same way whenever they complete. The log is kept bounded
-(oldest entries drop off past a fixed cap) and is what `/record`
-(Section J) mirrors to disk when recording is on.
+Every submitted command is appended to the session's log as one
+`Command` entry (who sent it — `user` or `assistant` — the verbatim
+text, and a millisecond timestamp), followed by one `Result` entry
+once a response arrives; background results (panel pollers are not
+logged individually, but ad-hoc `q`/`ds metrics` results and assistant
+replies are) are appended the same way whenever they complete. The log
+is kept bounded (oldest entries drop off past a fixed cap) and is what
+`/record` (Section J) mirrors to disk when recording is on —
+`Command`/`Result` entries interleaved, unchanged, since `/record`'s
+JSONL transcript is meant to be the complete session history.
 
-## G. The detail view
+That combined log is the data model; it is **not** rendered as one
+box. Mixing full result text (a `/help` listing, a query result, an
+error message) into the same compact strip as command echoes made both
+hard to read, so the two are rendered separately:
 
-The `i` key toggles a full-screen overlay for whichever panel is
-currently focused, replacing only the panel-grid area — the log and
-command bar stay visible and usable underneath, so a command that
-affects the focused panel (e.g. `/panel threshold crit gte 95`) shows
-its effect in the overlay immediately, since it redraws from live
-session state every frame like everything else. It has no separate
-"which panel" state: Tab-ing to a different panel while it's open
-just follows the newly focused one.
+- **The command log** (`dash9_tui::command_bar::draw_log`, bottom of
+  the screen, above the input line): `Command` entries only — a
+  compact, scrollable history of what was typed and when (`"> /range
+  5m"`, `"* panel type gauge"` for an assistant-issued one). `Result`
+  entries never appear here.
+- **The output pane** (`dash9_tui::output::draw_output`, between the
+  main area and the command log — see Section G/H): the most recent
+  `Result`'s full text, dynamically sized to its content (`output_height`,
+  clamped between `MIN_OUTPUT_HEIGHT` and `MAX_OUTPUT_HEIGHT` terminal
+  rows, never more than the space available) rather than a fixed size
+  that wastes room on a one-line result or crowds out the grid for a
+  long one. Shows `"(no output yet)"` before anything has run.
 
-The overlay has two parts:
+Nothing about the underlying `LogLine`/`ShellState.log` model changed
+to support this — it is a rendering-only split, two filtered views onto
+the same append-only log.
+
+## G. Zoom levels: Layout, Grid, Focus
+
+The main area has three zoom levels (full design in
+`docs/specs/session-layout.md` Sections A-D). `+`/`=` and `-`/`_`
+(Section E) step one level along the line Layout ↔ Grid ↔ Focus; `Esc`
+jumps straight to Grid ("home") from either end, once the detail pane
+(Section G.1) — a separate concern from zoom — is closed.
+
+1. **Layout** (`-` from Grid) — every panel, all at once, title-and-
+   border only (`dash9_tui::draw_panel_outline`), positioned by
+   `dash9_tui::layout::grid_layout_fit` which scales the row-unit
+   height down so nothing is ever clipped or paged — the point is
+   confirming the dashboard's *arrangement*, not reading data.
+2. **Grid** (the fixed "home" level, `open.md`'s original and still
+   default behavior) — real charts at readable size. When the
+   dashboard has more panel-rows than the terminal has height for, the
+   viewport pages vertically with `PageUp`/`PageDown` (Section E)
+   instead of clipping silently; the zoom bar (Section H) shows
+   `"panels X-Y of Z — PageDown/PageUp for more"` whenever there's
+   more to see.
+3. **Focus** (`+` from Grid) — the focused panel's ordinary
+   chart/gauge/stat/table rendering, just at full-pane size instead of
+   its small grid cell. Nothing more — no config/data overlay here;
+   that's the detail pane below, which Focus does not replace or imply.
+
+### G.1. The detail pane
+
+The `i` key toggles a panel's config+data detail pane open or
+closed — entirely independent of zoom (Section G): it works the same
+way, and stays open the same way, whichever of Layout/Grid/Focus is
+active, and pressing it never changes which zoom level is active. It
+is rendered in its own area **below** the main grid/layout/focus area
+(`dash9_tui::draw_panel_detail`, sized by `dash9_tui::detail_height`),
+never in place of it — the chart(s) above stay visible and usable the
+entire time a panel's detail is open. (An earlier iteration of this
+feature made the detail view a `Focus` sub-view that replaced the
+whole main area when open, with no visible way back to the charts
+short of `Esc`/`-`; this was reworked after exactly that "how do I get
+back to the chart" friction confirmed it was the wrong shape.)
+
+The pane has two parts:
 
 1. **Config** — title, panel type, datasource (name and connection),
    query text, grid position (`SPEC.md` C.1), `allow_empty` and
@@ -185,6 +245,66 @@ The overlay has two parts:
    `/save csv` produces are always the same data. Shows a placeholder
    for "no result yet," an error message for a failed query, or "no
    data" for an empty-but-successful result — never a blank pane.
+
+It has no separate "which panel" state: Tab-ing, or a `1`-`9` jump, to
+a different panel while it's open just follows the newly focused one,
+and a command that affects the focused panel (e.g. `/panel threshold
+crit gte 95`) shows its effect immediately, since it redraws from live
+session state every frame like everything else.
+
+### G.2. Pane chrome: name, status, hint, and focus color
+
+Every bordered pane (panel charts, Layout's outlines, the detail
+pane's config block) shares one border-embedded convention
+(`dash9_tui::pane::pane_block`) instead of a separate hint row per
+pane — the same density-reducing idea `loremesh-tui` uses (identity +
+focus-state live on the border itself, e.g. its `focus_block`), applied
+one step further: every corner of the border is meaningful, not just
+the title.
+
+- **Top-left: name.** Bold and `theme::FOCUS`-colored when the pane is
+  focused; plain `theme::TEXT` otherwise — color is emphasis on top of
+  an already-legible name, never the only signal (Mechanism 4).
+- **Top-right: status**, when the pane has one — shown uniformly across
+  every panel type on purpose, even where the body already conveys the
+  same thing (a stat panel's big centered value), rather than some
+  panel types having border status and others not: that inconsistency
+  read as broken chrome when panels of different types sat side by
+  side. Chart, stat, and gauge panels all show the latest value plus
+  severity marker/label via the same `status_for` helper, colored with
+  `theme::severity_color` (e.g. `0.070 ● ok`, green) — meaningful with
+  color stripped, same as everywhere else in this codebase. This is the
+  *only* place a gauge panel's severity marker/label appears at all —
+  its bar only carries severity as color, which alone isn't
+  monochrome-safe (Mechanism 4), so this border status closes a real
+  gap there, not just adds uniform styling. A table panel (including
+  the detail pane's data sub-block) shows its row count instead.
+  Nothing shown at all (not even a placeholder) when there's no data
+  yet — the panel body's own "(no data)"/"(loading…)" placeholder
+  already says so.
+- **Bottom-left: key hint**, shown only on the currently focused pane
+  — an unfocused pane's keys don't do anything right now, so it stays
+  quiet rather than advertising something inert. The one genuinely
+  panel-specific action is `i` (`"i detail"`, `dash9_tui::draw::PANEL_HINT`)
+  — broader navigation (`Tab`/`1`-`9`, `PageUp`/`PageDown`, `+`/`-`) is
+  region-level, not a property of any one panel, so it stays in the
+  zoom bar (Section H) instead of being repeated on every panel's
+  border; the zoom bar's own hint text deliberately excludes `i` for
+  the same reason, in reverse — showing it in both places would just
+  be the same text twice on screen at once.
+- **Bottom-right:** reserved, not yet used.
+- **Border color** itself is the same `theme::FOCUS`/`theme::MUTED`
+  split the border color already used before this section existed —
+  now applied natively via `Block::border_style` inside each
+  panel-type draw function instead of `open.rs` post-hoc recoloring
+  already-rendered buffer cells (the earlier approach could only ever
+  recolor a border, never add the status/hint content this section
+  adds — which needed real parameters on `draw_chart`/`draw_stat`/
+  `draw_gauge`/`draw_table`/`draw_panel_outline`, not a buffer patch).
+
+Phase 2 (deferred, Section K): a temporary per-pane pop-up showing a
+pane's *full* reference on demand, building on this section's hint
+text as its content once it exists.
 
 ## H. Status bar
 
@@ -198,6 +318,19 @@ short connectivity label (`idle` / `waiting` / `error: ...`), and
 cumulative tokens sent/received for the session. The AI segment is
 omitted entirely (not shown "off") when the session has no assist
 wiring at all — there is nothing configured to toggle.
+
+Directly below it, a second one-line zoom bar
+(`dash9_tui::status_bar::draw_zoom_bar`) shows the active zoom level
+(Section G) and that region's own key hint —
+`docs/specs/session-layout.md` Section D's "per bordered region" key
+discoverability, kept as its own small bar rather than folded into the
+status bar above since it tracks a different concern (zoom/keys, not
+dashboard/AI state). In Grid, it also appends the `"panels X-Y of Z —
+PageDown/PageUp for more"` paging indicator whenever the dashboard
+doesn't fully fit the viewport. The zoom label itself appends `" +
+detail"` (e.g. `"[Grid + detail]"`) whenever the detail pane
+(Section G.1) is open, since that's independent of which zoom level is
+active and worth surfacing alongside it.
 
 ## I. Panel export (`/save`)
 
@@ -257,7 +390,23 @@ callers never branch on "is recording on" first.
   process.
 - **No PNG export.** See Section I — reported unavailable, not planned
   for this phase.
+- **No scrolling within a single Focus panel or the detail pane.**
+  `PageUp`/`PageDown` are reserved but a no-op in Focus (Section E/G,
+  `docs/specs/session-layout.md` Section C); the detail pane's data
+  table (Section G.1) is likewise not scrollable — for a panel's own
+  long content to eventually scroll, not built now.
 - **No multi-session / multi-window support.** One `dash9 open`
   process is one session against one dashboard file at a time (`dash
   open` inside the grammar replaces the current session; it does not
   open a second one alongside it).
+- **No per-pane temporary help pop-up.** Section G.2's border-embedded
+  name/status/hint quadrants (Phase 1) are built; a follow-up
+  ("Phase 2") — a dismissable overlay showing one pane's *full*
+  reference on demand (not just its one-line footer hint) — is a
+  deliberately separate, deferred piece. Tracked here explicitly so it
+  isn't lost: it needs a genuinely new mechanism neither this codebase
+  nor `loremesh` has prior art for (a temporary/dismissable overlay
+  state — everything else in `dash9 open` is either permanent chrome
+  or driven straight by live session state, never a transient UI
+  layer), and makes the most sense to build once Phase 1's per-pane
+  hint text already exists to reuse/expand into the pop-up's content.

@@ -9,11 +9,12 @@ use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table as RatatuiTable,
+    Axis, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table as RatatuiTable,
 };
 use ratatui::Frame;
 
 use crate::chart::ChartModel;
+use crate::pane::pane_block;
 use crate::theme;
 
 /// Below this width the deterministic text fallback renders instead
@@ -21,19 +22,41 @@ use crate::theme;
 /// Mechanism 3 requires.
 const MIN_CHART_WIDTH: u16 = 40;
 
+/// The one genuinely panel-specific action (`docs/specs/open.md`
+/// Section G.2) — shown bottom-left, only on the focused panel, by
+/// every panel-type draw function below. Broader navigation (Tab/`1`-`9`
+/// selection, `PageUp`/`PageDown` paging, `+`/`-` zoom) is region-level,
+/// not a property of any one panel, so it stays in the zoom bar instead
+/// of being repeated on every panel's border.
+pub const PANEL_HINT: &str = "i detail";
+
 /// Draws one timeseries panel into `area`. Falls back to
 /// [`ChartModel::render_text`] when the terminal is too narrow for an
 /// axis/legend/braille chart to be legible, or when there are no
-/// points to plot at all.
-pub fn draw_chart(frame: &mut Frame, area: Rect, model: &ChartModel) {
+/// points to plot at all. `focused` drives the shared pane chrome
+/// (`pane::pane_block`)'s border/name color — it stays true (and the
+/// panel keeps looking targeted) even while the command box is
+/// capturing keystrokes, since `Tab`/`Shift+Tab` still move it then
+/// (`shell.rs::cycle_focused_panel`). `show_hint` is the separate,
+/// stricter "would `i` actually do something right now" bit — `false`
+/// while editing, even on the focused panel, since `i` is a literal
+/// character in the command box, not the detail toggle, and a hint
+/// promising otherwise would be actively misleading.
+pub fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    model: &ChartModel,
+    focused: bool,
+    show_hint: bool,
+) {
     let has_points = model.series.iter().any(|s| !s.points.is_empty());
     if area.width < MIN_CHART_WIDTH || !has_points {
-        draw_text_fallback(frame, area, model);
+        draw_text_fallback(frame, area, model, focused, show_hint);
         return;
     }
 
     let Some((x_min_ms, x_max_ms)) = x_bounds_ms(model) else {
-        draw_text_fallback(frame, area, model);
+        draw_text_fallback(frame, area, model, focused, show_hint);
         return;
     };
     #[allow(clippy::cast_precision_loss)]
@@ -103,10 +126,12 @@ pub fn draw_chart(frame: &mut Frame, area: Rect, model: &ChartModel) {
             format!("{y_max:.2}"),
         ]);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(model.title.clone())
-        .title_bottom(current_status_line(model));
+    let block = pane_block(
+        &model.title,
+        focused,
+        status_for(model),
+        show_hint.then_some(PANEL_HINT),
+    );
 
     let chart = Chart::new(datasets)
         .block(block)
@@ -116,9 +141,52 @@ pub fn draw_chart(frame: &mut Frame, area: Rect, model: &ChartModel) {
     frame.render_widget(chart, area);
 }
 
-fn draw_text_fallback(frame: &mut Frame, area: Rect, model: &ChartModel) {
-    let paragraph =
-        Paragraph::new(model.render_text()).block(Block::default().borders(Borders::ALL));
+/// Layout zoom level's per-panel rendering (`docs/specs/session-layout.md`
+/// Section A.1): title and border only, deliberately no chart/data at
+/// all — Layout exists to confirm the dashboard's *arrangement*, and its
+/// panels are routinely scaled down (`layout::grid_layout_fit`) well
+/// below the size any chart/text-fallback rendering would be legible at,
+/// so there is no "big enough" threshold to check here the way
+/// `draw_chart`'s `MIN_CHART_WIDTH` has — every panel gets the same
+/// outline treatment regardless of size. `i`/detail works in Layout same
+/// as everywhere else (`ShellState::detail_open` is zoom-independent —
+/// `docs/specs/session-layout.md` Section A.3's revision), so the
+/// focused panel gets `PANEL_HINT` here too, same as the other
+/// panel-type draw functions.
+pub fn draw_panel_outline(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = pane_block(title, focused, None, show_hint.then_some(PANEL_HINT));
+    frame.render_widget(block, area);
+}
+
+fn draw_text_fallback(
+    frame: &mut Frame,
+    area: Rect,
+    model: &ChartModel,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = pane_block(
+        &model.title,
+        focused,
+        status_for(model),
+        show_hint.then_some(PANEL_HINT),
+    );
+    // `render_text()`'s first line is the title, which the border above
+    // already shows — trimmed here only, since `render_text()` itself is
+    // shared with `dash9 test`'s CLI output and a bare title line there
+    // is exactly right.
+    let body = model.render_text();
+    let body = body
+        .strip_prefix(&model.title)
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .unwrap_or(&body);
+    let paragraph = Paragraph::new(body.to_string()).block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -126,11 +194,25 @@ fn draw_text_fallback(frame: &mut Frame, area: Rect, model: &ChartModel) {
 /// centered number, with `model.current_severity`'s marker/label so
 /// the state survives a monochrome terminal (Mechanism 4) — color is
 /// a supplement, applied via `theme::severity_color`, never the only
-/// carrier of meaning.
-pub fn draw_stat(frame: &mut Frame, area: Rect, model: &ChartModel) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(model.title.clone());
+/// carrier of meaning. The border status corner (top-right, same
+/// `status_for` every panel type uses) does duplicate the body here —
+/// deliberately: every panel type's chrome stays uniform (`docs/specs/open.md`
+/// Section G.2) rather than some panels having one and others not, which
+/// read as inconsistent/broken at a glance across a row of mixed panel
+/// types.
+pub fn draw_stat(
+    frame: &mut Frame,
+    area: Rect,
+    model: &ChartModel,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = pane_block(
+        &model.title,
+        focused,
+        status_for(model),
+        show_hint.then_some(PANEL_HINT),
+    );
     let (text, style) = match (model.current_value, &model.current_severity) {
         (Some(value), Some(severity)) => (
             format!("{value:.3}\n{} {}", severity.marker(), severity.label()),
@@ -151,11 +233,25 @@ pub fn draw_stat(frame: &mut Frame, area: Rect, model: &ChartModel) {
 /// (`SPEC.md` C.2, "Disk Free %") is one. A documented v1
 /// simplification, not a silent assumption; a future schema field
 /// (e.g. `panels.gauge.max`) could relax this without breaking the
-/// append-only grammar (SPEC.md B.1).
-pub fn draw_gauge(frame: &mut Frame, area: Rect, model: &ChartModel) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(model.title.clone());
+/// append-only grammar (SPEC.md B.1). The border status corner (see
+/// `draw_stat`'s docs on why it's shown despite the bar being uniform
+/// chrome) is the *only* place a gauge shows its severity marker/label
+/// at all — the bar itself only carries severity as color, which isn't
+/// monochrome-safe on its own (Mechanism 4); the border status fixes
+/// that gap rather than just adding uniform styling.
+pub fn draw_gauge(
+    frame: &mut Frame,
+    area: Rect,
+    model: &ChartModel,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = pane_block(
+        &model.title,
+        focused,
+        status_for(model),
+        show_hint.then_some(PANEL_HINT),
+    );
     let Some(value) = model.current_value else {
         frame.render_widget(Paragraph::new("(no data)").block(block), area);
         return;
@@ -238,10 +334,26 @@ pub fn series_as_table(frame: &dash9_core::Frame) -> Option<dash9_core::Table> {
 /// a `Table` frame with `ChartError::UnsupportedFrameKind`; SPEC.md
 /// A.2 defines `Table` as structurally different, column-oriented
 /// data).
-pub fn draw_table(frame: &mut Frame, area: Rect, table: &dash9_core::Table, title: &str) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title.to_string());
+/// `focused` drives the shared pane chrome's border/name color, `show_hint`
+/// whether the border also claims `i` will do something right now (`false`
+/// while the command box is editing — see `draw_chart`'s docs for why the
+/// two are separate). Pass `false, false` for the non-focus-ring uses
+/// (e.g. `detail_view.rs`'s inner "data" sub-pane, which is never itself a
+/// `Tab`-focusable target — it's already part of the focused panel's own
+/// detail pane).
+pub fn draw_table(
+    frame: &mut Frame,
+    area: Rect,
+    table: &dash9_core::Table,
+    title: &str,
+    focused: bool,
+    show_hint: bool,
+) {
+    let status = (table.row_count > 0).then(|| {
+        let plural = if table.row_count == 1 { "" } else { "s" };
+        (format!("{} row{plural}", table.row_count), theme::TEXT)
+    });
+    let block = pane_block(title, focused, status, show_hint.then_some(PANEL_HINT));
     if table.row_count == 0 {
         frame.render_widget(Paragraph::new("(no rows)").block(block), area);
         return;
@@ -311,16 +423,21 @@ fn relative_label(ms: i64, reference_ms: i64) -> String {
     }
 }
 
-fn current_status_line(model: &ChartModel) -> String {
+/// The pane border's top-right status corner (`pane::pane_block`) for a
+/// chart/stat/gauge panel: the latest value plus severity marker/label
+/// (Mechanism 4 — meaningful with color stripped, color is
+/// `theme::severity_color` on top), or just the value with no threshold
+/// breach to report, or nothing at all when there's no data yet (the
+/// panel body already shows its own "(no data)"/"(loading…)" placeholder
+/// — no need to repeat that in the border too).
+fn status_for(model: &ChartModel) -> Option<(String, ratatui::style::Color)> {
     match (model.current_value, &model.current_severity) {
-        (Some(value), Some(severity)) => {
-            format!(
-                "current: {value:.3} [{} {}]",
-                severity.marker(),
-                severity.label()
-            )
-        }
-        _ => "current: (no data)".to_string(),
+        (Some(value), Some(severity)) => Some((
+            format!("{value:.3} {} {}", severity.marker(), severity.label()),
+            theme::severity_color(severity),
+        )),
+        (Some(value), None) => Some((format!("{value:.3}"), theme::TEXT)),
+        (None, _) => None,
     }
 }
 
@@ -363,13 +480,36 @@ mod tests {
     }
 
     #[test]
+    fn panel_outline_draws_without_panicking_focused_and_not() {
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", true, true))
+            .unwrap();
+        terminal
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", false, false))
+            .unwrap();
+    }
+
+    #[test]
+    fn panel_outline_at_a_degenerate_tiny_size_draws_without_panicking() {
+        let backend = TestBackend::new(3, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU", false, false))
+            .unwrap();
+    }
+
+    #[test]
     fn wide_area_with_data_draws_without_panicking() {
         let frame = frame_with(vec![(0, 1.0), (1000, 2.0), (2000, 1.5)]);
         let model =
             ChartModel::project("CPU", &frame, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chart(f, f.area(), &model)).unwrap();
+        terminal
+            .draw(|f| draw_chart(f, f.area(), &model, true, true))
+            .unwrap();
     }
 
     #[test]
@@ -379,7 +519,9 @@ mod tests {
             ChartModel::project("CPU", &frame, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chart(f, f.area(), &model)).unwrap();
+        terminal
+            .draw(|f| draw_chart(f, f.area(), &model, false, false))
+            .unwrap();
     }
 
     #[test]
@@ -389,7 +531,9 @@ mod tests {
             ChartModel::project("CPU", &frame, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chart(f, f.area(), &model)).unwrap();
+        terminal
+            .draw(|f| draw_chart(f, f.area(), &model, false, false))
+            .unwrap();
     }
 
     #[test]
@@ -405,13 +549,15 @@ mod tests {
             ChartModel::project("Load", &with_data, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_stat(f, f.area(), &model)).unwrap();
+        terminal
+            .draw(|f| draw_stat(f, f.area(), &model, true, true))
+            .unwrap();
 
         let empty = frame_with(vec![]);
         let empty_model =
             ChartModel::project("Load", &empty, &[], &ChartViewState::default(), 80).unwrap();
         terminal
-            .draw(|f| draw_stat(f, f.area(), &empty_model))
+            .draw(|f| draw_stat(f, f.area(), &empty_model, false, false))
             .unwrap();
     }
 
@@ -422,14 +568,74 @@ mod tests {
             ChartModel::project("Disk", &with_data, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(30, 5);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_gauge(f, f.area(), &model)).unwrap();
+        terminal
+            .draw(|f| draw_gauge(f, f.area(), &model, true, true))
+            .unwrap();
 
         let empty = frame_with(vec![]);
         let empty_model =
             ChartModel::project("Disk", &empty, &[], &ChartViewState::default(), 80).unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &empty_model))
+            .draw(|f| draw_gauge(f, f.area(), &empty_model, false, false))
             .unwrap();
+    }
+
+    /// Regression test: `draw_stat`/`draw_gauge` used to pass `None` for
+    /// the border status corner, on the theory that the body already
+    /// shows severity — but `draw_gauge`'s body never showed a
+    /// marker/label at all (only bar color, not monochrome-safe), and
+    /// having some panel types show border status and others not read as
+    /// inconsistent chrome across a row of mixed panel types
+    /// (`docs/specs/open.md` Section G.2). Both must now show it.
+    #[test]
+    fn stat_and_gauge_show_the_severity_marker_in_the_border_status_corner() {
+        use dash9_core::{ThresholdOp, ValidatedThreshold};
+
+        let thresholds = [ValidatedThreshold {
+            name: "warn".to_string(),
+            op: ThresholdOp::Gte,
+            value: 0.0, // breached by any non-negative value below
+        }];
+
+        let frame = frame_with(vec![(0, 42.0)]);
+        let stat_model =
+            ChartModel::project("Load", &frame, &thresholds, &ChartViewState::default(), 80)
+                .unwrap();
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_stat(f, f.area(), &stat_model, true, true))
+            .unwrap();
+        let stat_content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            stat_content.contains("warn"),
+            "stat panel border must show the breached threshold's label: {stat_content}"
+        );
+
+        let gauge_model =
+            ChartModel::project("Disk", &frame, &thresholds, &ChartViewState::default(), 80)
+                .unwrap();
+        terminal
+            .draw(|f| draw_gauge(f, f.area(), &gauge_model, true, true))
+            .unwrap();
+        let gauge_content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            gauge_content.contains("warn"),
+            "gauge panel border must show the breached threshold's label \
+             — otherwise severity is color-only, not monochrome-safe: {gauge_content}"
+        );
     }
 
     #[test]
@@ -518,7 +724,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_table(f, f.area(), &table, "Top Processes"))
+            .draw(|f| draw_table(f, f.area(), &table, "Top Processes", true, true))
             .unwrap();
 
         let empty_table = Table {
@@ -526,7 +732,7 @@ mod tests {
             row_count: 0,
         };
         terminal
-            .draw(|f| draw_table(f, f.area(), &empty_table, "Top Processes"))
+            .draw(|f| draw_table(f, f.area(), &empty_table, "Top Processes", false, false))
             .unwrap();
     }
 }

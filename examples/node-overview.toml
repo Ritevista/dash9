@@ -45,11 +45,3 @@ type = "gauge"
 datasource = "prom"
 query = "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100"
 grid = { row = 0, col = 9, w = 3, h = 4 }
-
-[[panels]]
-title = "Top Processes by CPU"
-type = "table"
-datasource = "prom"
-query = "topk(5, rate(process_cpu_seconds_total[5m]))"
-allow_empty = true
-grid = { row = 4, col = 0, w = 12, h = 4 }

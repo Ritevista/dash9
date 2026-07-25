@@ -24,10 +24,12 @@
 //! grammar (`dash9_core::parse` is never called on it). `Tab`/
 //! `Shift+Tab` cycle through every panel and then into the command
 //! box itself (a `panel_count() + 1`-stop ring), so the command box
-//! is reachable without needing to already know about `:` — but once
-//! inside and actively composing text, `Tab`/`Shift+Tab` are inert;
-//! they must never silently discard what's typed by navigating away,
-//! so only `Esc` (cancel) or `Enter` (submit) leave the box.
+//! is reachable without needing to already know about `:` — once
+//! inside and actively composing text, `Tab`/`Shift+Tab` no longer
+//! leave the box (only `Esc`/cancel or `Enter`/submit do), but they
+//! still cycle which panel is focused underneath without touching the
+//! buffer, so you can glance at another panel mid-command without
+//! losing what you've typed.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -219,9 +221,12 @@ fn help_overview() -> String {
          (needs --assist and AI on).\n",
     );
     out.push_str(
-        "Keys: Tab/Shift+Tab cycle panels + command box · : jump to command box \
-         (Esc cancels) · i toggle focused panel's detail view (Esc closes) · \
-         PageUp/PageDown scroll log · y/n confirm proposal · \
+        "Keys: Tab/Shift+Tab cycle panels + command box · 1-9 jump straight \
+         to a panel · : jump to command box (Esc cancels) · +/- zoom \
+         Layout/Grid/Focus (an enlarged single chart) · i toggle the \
+         focused panel's detail pane below the main area · Esc closes \
+         detail, then goes home to Grid · PageUp/PageDown page panels \
+         (Grid) or scroll the log (editing) · y/n confirm proposal · \
          a toggle AI · q or Ctrl+C quit\n",
     );
     out
@@ -251,6 +256,26 @@ fn help_topic(topic: &str) -> String {
         let _ = writeln!(out, "  e.g. {}\n", spec.example);
     }
     out.trim_end().to_string()
+}
+
+/// The active zoom level's own one-line key hint
+/// (`docs/specs/session-layout.md` Section D — "per-pane shortcut hints,"
+/// the complement to `/help`'s full reference, not a replacement for it).
+/// Pure text, no I/O, same category as [`help_text`]. Doesn't include the
+/// Grid "panels X-Y of Z" paging indicator — that needs real viewport/rect
+/// data the render layer has and this module doesn't.
+/// Region-level navigation only — `i` (open/close the focused panel's
+/// detail pane) is deliberately not repeated here: every panel already
+/// shows it on its own border when focused
+/// (`dash9_tui::draw::PANEL_HINT`, `docs/specs/open.md` Section G.2),
+/// and it means the same thing regardless of zoom, so restating it in
+/// every arm here would just be the same text twice on screen at once.
+pub fn zoom_hint(zoom: Zoom) -> &'static str {
+    match zoom {
+        Zoom::Grid => "PageUp/PageDown page panels · 1-9 select · +/- zoom",
+        Zoom::Layout => "1-9 select · + back to grid",
+        Zoom::Focus => "1-9 select · Esc/- back to grid",
+    }
 }
 
 /// Parses one submitted line. A leading `/` is the only thing that
@@ -384,6 +409,60 @@ pub trait CommandHandler {
 /// the resulting offset against whatever area it's actually given.
 const LOG_SCROLL_STEP: usize = 8;
 
+/// Same step size for paging the Grid viewport (`docs/specs/session-layout.md`
+/// Section A.2/C) — in the same content row-units `layout.rs` already uses
+/// for `ROW_UNIT_HEIGHT`-scaled panel positions. `layout.rs`'s scroll-clamp
+/// helpers self-clamp the resulting offset against whatever viewport height
+/// the render layer actually has, same relationship `LOG_SCROLL_STEP` has
+/// with `visible_window`.
+const GRID_SCROLL_STEP: u16 = 6;
+
+/// The three zoom levels (`docs/specs/session-layout.md` Section A): one
+/// line, Layout ↔ Grid ↔ Focus. `Grid` is the fixed "home" level — today's
+/// only level, kept as the default so a fresh session behaves exactly as
+/// it did before this type existed. `Focus` is a single panel's chart,
+/// enlarged, full-pane — nothing more; the config+data detail overlay is
+/// a separate concern (`ShellState::detail_open`, below), not a zoom
+/// level, since replacing the whole main area to show it made it
+/// impossible to see any chart while inspecting one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Zoom {
+    Layout,
+    #[default]
+    Grid,
+    Focus,
+}
+
+impl Zoom {
+    /// `+`/`=`: one step toward Focus. No-op at Focus (already innermost).
+    fn zoom_in(self) -> Self {
+        match self {
+            Self::Layout => Self::Grid,
+            Self::Grid => Self::Focus,
+            Self::Focus => self,
+        }
+    }
+
+    /// `-`/`_`: one step toward Layout. No-op at Layout (already outermost).
+    fn zoom_out(self) -> Self {
+        match self {
+            Self::Focus => Self::Grid,
+            Self::Grid => Self::Layout,
+            Self::Layout => self,
+        }
+    }
+
+    /// `Esc` (not editing, and only once nothing else has claimed it —
+    /// see `handle_key`): "go home" — one hop straight to Grid from
+    /// anywhere, unlike `zoom_out`'s one-step walk. No-op at Grid.
+    fn zoom_home(self) -> Self {
+        match self {
+            Self::Focus | Self::Layout => Self::Grid,
+            Self::Grid => self,
+        }
+    }
+}
+
 /// Pure shell state: the command-bar buffer, the session log, pending
 /// AI proposals awaiting `y`/`n`, and which panel has focus. No
 /// terminal, filesystem, or network access anywhere in this type.
@@ -399,11 +478,28 @@ pub struct ShellState {
     /// where I was"; background results (pollers, assistant replies)
     /// never reset it, so reading old output isn't interrupted.
     pub log_scroll: usize,
-    /// `i`-toggled full-screen detail overlay for whichever panel is
-    /// currently focused. Always renders `focused_panel`'s live
-    /// state, so Tab-ing to a different panel while it's open just
-    /// follows — no separate "which panel" tracking needed.
-    pub detail_view: bool,
+    /// Which of the three zoom levels (`docs/specs/session-layout.md`
+    /// Section A) the main area is currently showing. Always renders
+    /// `focused_panel`'s live state in `Focus`, so Tab-ing to a different
+    /// panel while zoomed in just follows — no separate "which panel"
+    /// tracking needed.
+    pub zoom: Zoom,
+    /// `i`-toggled config+data overlay (`PanelDetail`/`draw_panel_detail`)
+    /// for whichever panel is currently focused — rendered in its own pane
+    /// **below** the main area (grid/layout/focus), never in place of it,
+    /// so the chart(s) stay visible the whole time you're inspecting one.
+    /// Independent of `zoom`: open in any of the three levels. Always
+    /// renders `focused_panel`'s live state, so Tab-ing or a `1`-`9` jump
+    /// while it's open just follows the newly focused panel.
+    pub detail_open: bool,
+    /// Grid viewport scroll, in the same content row-units `layout.rs`
+    /// positions panels with (0 = top). Only ever changed by `PageUp`/
+    /// `PageDown` while `zoom == Zoom::Grid` and not editing (Section C) —
+    /// `ShellState` has no notion of terminal size, so this is the user's
+    /// last explicit paging request, not a final render offset; the render
+    /// layer additionally nudges it to keep the focused panel visible on
+    /// `Tab` (Section B) without writing that nudge back here.
+    pub grid_scroll: u16,
     history: VecDeque<String>,
     history_cursor: Option<usize>,
 }
@@ -425,18 +521,26 @@ impl ShellState {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
-        // Scrolling works the same whether or not the command box is
-        // being edited — reading old output while composing a new
-        // command is a normal thing to want to do.
+        // `PageUp`/`PageDown` are contextual to whichever region is active
+        // (`docs/specs/session-layout.md` Section C), checked before the
+        // editing/non-editing split below since "editing" is itself one of
+        // the regions in that table (it always scrolls the log, unchanged
+        // from before zoom levels existed — reading old output while
+        // composing a new command is a normal thing to want to do).
         match key.code {
-            KeyCode::PageUp => {
-                self.log_scroll = self.log_scroll.saturating_add(LOG_SCROLL_STEP);
+            KeyCode::PageUp | KeyCode::PageDown if self.input.is_some() => {
+                self.scroll_log(key.code);
                 return false;
             }
-            KeyCode::PageDown => {
-                self.log_scroll = self.log_scroll.saturating_sub(LOG_SCROLL_STEP);
+            KeyCode::PageUp | KeyCode::PageDown if self.zoom == Zoom::Grid => {
+                self.scroll_grid(key.code);
                 return false;
             }
+            // Layout: nothing to page, every panel is already visible.
+            // Focus: reserved for v1 (scrolling one panel's own long
+            // content) — not built now, deliberately a no-op rather than
+            // falling back to scrolling the log out from under Focus.
+            KeyCode::PageUp | KeyCode::PageDown => return false,
             _ => {}
         }
 
@@ -460,12 +564,18 @@ impl ShellState {
                 }
                 KeyCode::Up => self.history_previous(),
                 KeyCode::Down => self.history_next(),
-                // Deliberately not `advance_focus` here — Tab reaches
-                // the command box from *outside* it (see the
-                // non-editing branch below), but once you're actively
-                // composing text, Tab must not navigate away and
-                // discard it out from under you. Only Esc (cancel) or
-                // Enter (submit) leave the box while editing.
+                // Cycles which panel is focused without leaving the
+                // command box or touching the buffer — you can look at a
+                // different panel's chart mid-command (e.g. to check a
+                // value before finishing `/panel threshold ...`) without
+                // losing what you've typed. Deliberately *not*
+                // `advance_focus` (the non-editing version below): that
+                // one also reaches the command box itself as a ring stop,
+                // which makes no sense when we're already in it — this is
+                // a plain `panel_count()`-stop ring over panels only, and
+                // never touches `self.input`, so it can never discard it.
+                KeyCode::Tab => self.cycle_focused_panel(handler, true),
+                KeyCode::BackTab => self.cycle_focused_panel(handler, false),
                 KeyCode::Char(c) => {
                     if let Some(buffer) = self.input.as_mut() {
                         buffer.push(c);
@@ -495,21 +605,48 @@ impl ShellState {
             }
             KeyCode::Char('q') => return true,
             KeyCode::Char(':') => self.input = Some(String::new()),
-            KeyCode::Char('i') => self.detail_view = !self.detail_view,
-            KeyCode::Esc if self.detail_view => self.detail_view = false,
+            KeyCode::Char('i') => self.detail_open = !self.detail_open,
+            KeyCode::Char('+' | '=') => self.zoom = self.zoom.zoom_in(),
+            KeyCode::Char('-' | '_') => self.zoom = self.zoom.zoom_out(),
+            // Layered, same shape `Esc` already had before zoom levels
+            // existed (cancel input, *then* close detail): close the
+            // detail pane first if it's open; only once it's closed (or
+            // was never open) does Esc fall through to "go home" for
+            // zoom. One press always does at most one thing.
+            KeyCode::Esc if self.detail_open => self.detail_open = false,
+            KeyCode::Esc => self.zoom = self.zoom.zoom_home(),
             KeyCode::Tab => self.advance_focus(handler, true),
             KeyCode::BackTab => self.advance_focus(handler, false),
+            KeyCode::Char(c @ '1'..='9') => self.focus_panel_by_number(c, handler),
             _ => {}
         }
         false
     }
 
+    /// `1`-`9`: jump focus straight to that panel (1-indexed, matching how
+    /// panels are announced/counted elsewhere — e.g. the zoom bar's
+    /// "panels X-Y of Z"), instead of stepping through `Tab`'s cycle one
+    /// panel at a time. A digit past `panel_count()` (including on an
+    /// empty dashboard) is a no-op rather than clamping to the last panel
+    /// — silently landing on the wrong panel would be more surprising
+    /// than nothing happening. Works in every zoom level, same as `Tab`
+    /// (`advance_focus` itself is never zoom-gated).
+    fn focus_panel_by_number<H: CommandHandler>(&mut self, digit: char, handler: &H) {
+        let index = digit
+            .to_digit(10)
+            .expect("checked by the '1'..='9' pattern") as usize
+            - 1;
+        if index < handler.panel_count() {
+            self.focused_panel = index;
+        }
+    }
+
     /// Moves focus one step around the `panel_count() + 1`-stop ring
-    /// (every panel, then the command box, wrapping). Only reachable
-    /// while *not* editing (see `handle_key` — Tab/BackTab are a
-    /// no-op while `input.is_some()`), so entering the command box
-    /// here always starts a fresh empty buffer; there's never an
-    /// in-progress one to discard.
+    /// (every panel, then the command box, wrapping). Only called from
+    /// the non-editing branch of `handle_key` — while editing,
+    /// `cycle_focused_panel` (below) is the one Tab/BackTab reach
+    /// instead — so entering the command box here always starts a fresh
+    /// empty buffer; there's never an in-progress one to discard.
     fn advance_focus<H: CommandHandler>(&mut self, handler: &H, forward: bool) {
         let panel_count = handler.panel_count();
         let total = panel_count + 1;
@@ -528,6 +665,23 @@ impl ShellState {
         self.history_cursor = None;
     }
 
+    /// The editing-time counterpart to `advance_focus`: a plain
+    /// `panel_count()`-stop ring over panels only (no command-box stop —
+    /// we're already there), and never touches `self.input`/
+    /// `self.history_cursor`. No-op on an empty dashboard.
+    fn cycle_focused_panel<H: CommandHandler>(&mut self, handler: &H, forward: bool) {
+        let panel_count = handler.panel_count();
+        if panel_count == 0 {
+            return;
+        }
+        let current = self.focused_panel.min(panel_count - 1);
+        self.focused_panel = if forward {
+            (current + 1) % panel_count
+        } else {
+            (current + panel_count - 1) % panel_count
+        };
+    }
+
     /// Drains every background result currently ready, applying each
     /// one, then re-clamps `focused_panel` in case a `dash open`
     /// changed the panel count. Call once per render tick.
@@ -538,6 +692,37 @@ impl ShellState {
         }
         if self.focused_panel >= handler.panel_count() {
             self.focused_panel = 0;
+        }
+    }
+
+    fn scroll_log(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::PageUp => self.log_scroll = self.log_scroll.saturating_add(LOG_SCROLL_STEP),
+            KeyCode::PageDown => {
+                self.log_scroll = self.log_scroll.saturating_sub(LOG_SCROLL_STEP);
+            }
+            _ => unreachable!("only called for PageUp/PageDown"),
+        }
+    }
+
+    /// `PageDown` moves further into the content (later panel rows,
+    /// growing `grid_scroll`) matching the "`PageDown` for more" affordance
+    /// `docs/specs/session-layout.md` Section A.2 describes; `PageUp` walks
+    /// back toward the top. This is the opposite direction from the log's
+    /// own convention (`scroll_log`, where `PageUp` grows the offset) —
+    /// the log is tail-anchored (0 = newest, at the bottom), the grid is
+    /// top-anchored (0 = first panels, at the top), so "`PageDown` reveals
+    /// more" means growing the offset in the log's case and the grid's
+    /// case alike, which is a shrink for one and a grow for the other.
+    fn scroll_grid(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::PageDown => {
+                self.grid_scroll = self.grid_scroll.saturating_add(GRID_SCROLL_STEP);
+            }
+            KeyCode::PageUp => {
+                self.grid_scroll = self.grid_scroll.saturating_sub(GRID_SCROLL_STEP);
+            }
+            _ => unreachable!("only called for PageUp/PageDown"),
         }
     }
 
@@ -744,10 +929,74 @@ mod tests {
             "the 4th Tab (past the last of 3 panels) reaches the command box"
         );
 
-        // Further Tabs, now that editing has started, must not
-        // navigate away — only Esc/Enter leave the box once inside.
+        // Further Tabs, now that editing has started, must not leave
+        // the command box — only Esc/Enter do that. They still cycle
+        // which panel is focused underneath, though (see
+        // `tab_and_backtab_while_editing_cycle_panel_focus_without_losing_the_buffer`).
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert!(state.input.is_some(), "Tab stays put while editing");
+        assert!(state.input.is_some(), "Tab does not leave the command box");
+    }
+
+    #[test]
+    fn number_keys_jump_focus_straight_to_that_panel() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(5);
+
+        state.handle_key(char_key('3'), &mut handler);
+        assert_eq!(
+            state.focused_panel, 2,
+            "'3' jumps to the 3rd (index 2) panel"
+        );
+
+        state.handle_key(char_key('1'), &mut handler);
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn number_key_past_panel_count_is_a_no_op() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(3);
+        state.focused_panel = 1;
+
+        state.handle_key(char_key('9'), &mut handler);
+        assert_eq!(state.focused_panel, 1, "no 9th panel — focus stays put");
+    }
+
+    #[test]
+    fn number_key_on_an_empty_dashboard_is_a_no_op() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(0);
+        state.handle_key(char_key('1'), &mut handler);
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn number_keys_work_in_every_zoom_level() {
+        for zoom in [Zoom::Layout, Zoom::Grid, Zoom::Focus] {
+            let mut state = ShellState {
+                zoom,
+                ..ShellState::default()
+            };
+            let mut handler = MockHandler::new(4);
+            state.handle_key(char_key('4'), &mut handler);
+            assert_eq!(
+                state.focused_panel, 3,
+                "{zoom:?} should still honor 1-9 selection"
+            );
+        }
+    }
+
+    #[test]
+    fn number_key_while_editing_is_a_literal_character_not_a_jump() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(5);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('3'), &mut handler);
+        assert_eq!(
+            state.focused_panel, 0,
+            "digits while editing must not move focus"
+        );
+        assert_eq!(state.input.as_deref(), Some("3"));
     }
 
     #[test]
@@ -761,28 +1010,49 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_backtab_while_editing_are_a_no_op_and_never_lose_the_buffer() {
+    fn tab_and_backtab_while_editing_cycle_panel_focus_without_losing_the_buffer() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(3);
         state.handle_key(char_key(':'), &mut handler);
         state.handle_key(char_key('x'), &mut handler);
         assert_eq!(state.input.as_deref(), Some("x"));
+        assert_eq!(state.focused_panel, 0);
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
         assert_eq!(
             state.input.as_deref(),
             Some("x"),
-            "Tab must not navigate away and drop what was typed"
+            "Tab must not discard what was typed"
+        );
+        assert_eq!(state.focused_panel, 1, "but it does move panel focus");
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.focused_panel, 2);
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(
+            state.focused_panel, 0,
+            "wraps — no command-box stop while already in it"
         );
 
         state.handle_key(press(KeyCode::BackTab), &mut handler);
+        assert_eq!(state.focused_panel, 2, "BackTab wraps the other way");
         assert_eq!(state.input.as_deref(), Some("x"));
     }
 
     #[test]
-    fn page_up_and_page_down_adjust_log_scroll_and_never_quit() {
+    fn tab_while_editing_on_an_empty_dashboard_is_a_no_op() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(0);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn page_up_and_page_down_while_editing_adjust_log_scroll_and_never_quit() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
         assert_eq!(state.log_scroll, 0);
 
         assert!(!state.handle_key(press(KeyCode::PageUp), &mut handler));
@@ -795,60 +1065,45 @@ mod tests {
     }
 
     #[test]
-    fn i_toggles_the_detail_view_outside_input_but_types_a_literal_i_while_editing() {
+    fn page_up_and_page_down_in_grid_and_not_editing_adjust_grid_scroll_instead_of_log() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
-        assert!(!state.detail_view);
+        assert_eq!(state.zoom, Zoom::Grid, "default zoom is Grid");
 
-        state.handle_key(char_key('i'), &mut handler);
-        assert!(state.detail_view);
-        state.handle_key(char_key('i'), &mut handler);
-        assert!(!state.detail_view);
-
-        state.handle_key(char_key(':'), &mut handler);
-        state.handle_key(char_key('i'), &mut handler);
-        assert!(
-            !state.detail_view,
-            "typing 'i' in the buffer must not toggle it"
+        assert!(!state.handle_key(press(KeyCode::PageDown), &mut handler));
+        assert_eq!(state.grid_scroll, GRID_SCROLL_STEP);
+        assert_eq!(
+            state.log_scroll, 0,
+            "log is untouched outside the command box"
         );
-        assert_eq!(state.input.as_deref(), Some("i"));
+
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.grid_scroll, 0);
     }
 
     #[test]
-    fn esc_closes_the_detail_view_when_open_and_not_editing() {
+    fn grid_scroll_saturates_instead_of_underflowing() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
-        state.detail_view = true;
-
-        assert!(!state.handle_key(press(KeyCode::Esc), &mut handler));
-        assert!(
-            !state.detail_view,
-            "Esc closes the detail view, doesn't quit"
-        );
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.grid_scroll, 0);
     }
 
     #[test]
-    fn esc_while_editing_cancels_input_first_even_if_detail_view_is_open() {
-        let mut state = ShellState::default();
-        let mut handler = MockHandler::new(1);
-        state.detail_view = true;
-        state.handle_key(char_key(':'), &mut handler);
-        state.handle_key(char_key('x'), &mut handler);
-
-        state.handle_key(press(KeyCode::Esc), &mut handler);
-        assert!(state.input.is_none(), "input cancelled first");
-        assert!(
-            state.detail_view,
-            "detail view stays open — a second Esc closes it"
-        );
-    }
-
-    #[test]
-    fn page_down_past_zero_saturates_instead_of_underflowing() {
-        let mut state = ShellState::default();
-        let mut handler = MockHandler::new(1);
-        state.handle_key(press(KeyCode::PageDown), &mut handler);
-        assert_eq!(state.log_scroll, 0);
+    fn page_up_and_page_down_are_a_no_op_in_layout_and_focus() {
+        for zoom in [Zoom::Layout, Zoom::Focus] {
+            let mut state = ShellState {
+                zoom,
+                ..ShellState::default()
+            };
+            let mut handler = MockHandler::new(1);
+            state.handle_key(press(KeyCode::PageDown), &mut handler);
+            assert_eq!(state.grid_scroll, 0, "{zoom:?} must not page the grid");
+            assert_eq!(
+                state.log_scroll, 0,
+                "{zoom:?} must not scroll the log either"
+            );
+        }
     }
 
     #[test]
@@ -869,13 +1124,148 @@ mod tests {
 
     #[test]
     fn submitting_a_command_resets_log_scroll_to_the_tail() {
-        let mut state = ShellState::default();
+        let mut state = ShellState {
+            log_scroll: LOG_SCROLL_STEP,
+            ..ShellState::default()
+        };
         let mut handler = MockHandler::new(1);
-        state.handle_key(press(KeyCode::PageUp), &mut handler);
-        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
 
         type_and_submit(&mut state, &mut handler, "hello");
         assert_eq!(state.log_scroll, 0);
+    }
+
+    #[test]
+    fn i_toggles_detail_open_and_types_a_literal_i_while_editing() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert!(!state.detail_open);
+        assert_eq!(
+            state.zoom,
+            Zoom::Grid,
+            "opening detail must not change zoom — it renders below the main area, not in place of it"
+        );
+
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(state.detail_open);
+        assert_eq!(state.zoom, Zoom::Grid, "zoom is untouched by i");
+
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(
+            state.detail_open,
+            "typing 'i' in the buffer must not toggle it"
+        );
+        assert_eq!(state.input.as_deref(), Some("i"));
+    }
+
+    #[test]
+    fn detail_can_be_open_in_any_zoom_level() {
+        for zoom in [Zoom::Layout, Zoom::Grid, Zoom::Focus] {
+            let mut state = ShellState {
+                zoom,
+                ..ShellState::default()
+            };
+            let mut handler = MockHandler::new(1);
+            state.handle_key(char_key('i'), &mut handler);
+            assert!(state.detail_open, "{zoom:?} should still let i open detail");
+            assert_eq!(state.zoom, zoom, "{zoom:?} zoom must not change from i");
+        }
+    }
+
+    #[test]
+    fn plus_and_minus_step_one_level_along_layout_grid_focus() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert_eq!(state.zoom, Zoom::Grid);
+
+        state.handle_key(char_key('-'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Layout);
+        state.handle_key(char_key('-'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Layout, "no-op at the outermost level");
+
+        state.handle_key(char_key('+'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Grid, "+ from Layout lands on Grid");
+        state.handle_key(char_key('+'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Focus, "+ from Grid enters Focus");
+        state.handle_key(char_key('+'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Focus, "no-op at the innermost level");
+
+        state.handle_key(char_key('-'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Grid, "- from Focus lands on Grid");
+    }
+
+    #[test]
+    fn equals_and_underscore_are_aliases_for_plus_and_minus() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key('='), &mut handler);
+        assert_eq!(state.zoom, Zoom::Focus);
+        state.handle_key(char_key('_'), &mut handler);
+        assert_eq!(state.zoom, Zoom::Grid);
+    }
+
+    #[test]
+    fn esc_goes_straight_home_to_grid_from_anywhere_and_never_quits() {
+        for zoom in [Zoom::Layout, Zoom::Focus] {
+            let mut state = ShellState {
+                zoom,
+                ..ShellState::default()
+            };
+            let mut handler = MockHandler::new(1);
+            assert!(!state.handle_key(press(KeyCode::Esc), &mut handler));
+            assert_eq!(
+                state.zoom,
+                Zoom::Grid,
+                "Esc from {zoom:?} goes home to Grid"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_at_grid_is_a_no_op() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert!(!state.handle_key(press(KeyCode::Esc), &mut handler));
+        assert_eq!(state.zoom, Zoom::Grid);
+    }
+
+    #[test]
+    fn esc_closes_detail_before_going_home_to_grid() {
+        let mut state = ShellState {
+            zoom: Zoom::Focus,
+            detail_open: true,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert!(!state.detail_open, "first Esc closes detail");
+        assert_eq!(
+            state.zoom,
+            Zoom::Focus,
+            "zoom stays put — a second Esc goes home"
+        );
+
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert_eq!(state.zoom, Zoom::Grid, "second Esc goes home to Grid");
+    }
+
+    #[test]
+    fn esc_while_editing_cancels_input_first_even_with_detail_open() {
+        let mut state = ShellState {
+            detail_open: true,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert!(state.input.is_none(), "input cancelled first");
+        assert!(
+            state.detail_open,
+            "detail stays open — a second Esc closes it"
+        );
     }
 
     #[test]

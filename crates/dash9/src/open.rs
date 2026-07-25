@@ -29,14 +29,15 @@ use std::time::Duration as StdDuration;
 use crossterm::event::{self, Event};
 use dash9_core::{load_path, validate, Command};
 use dash9_tui::chart::{ChartModel, ChartViewState};
-use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput, ShellState};
+use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput, ShellState, Zoom};
 use dash9_tui::{
-    draw_chart, draw_command_bar, draw_gauge, draw_stat, draw_status_bar, draw_table, grid_layout,
-    help_text, series_as_table, theme, StatusBarModel,
+    detail_height, draw_chart, draw_command_bar, draw_gauge, draw_output, draw_panel_outline,
+    draw_stat, draw_status_bar, draw_table, draw_zoom_bar, ensure_visible, grid_layout_fit,
+    grid_layout_scrolled, help_text, max_grid_scroll, output_height, panel_content_range,
+    series_as_table, StatusBarModel, ZoomBarModel,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
@@ -46,6 +47,18 @@ use crate::log_recorder::LogRecorder;
 const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
 const STATUS_BAR_HEIGHT: u16 = 1;
+const ZOOM_BAR_HEIGHT: u16 = 1;
+/// Reserved for the command bar (the command-echo log + input line)
+/// regardless of zoom level or dashboard size, so a large or
+/// `Zoom::Focus`-maximized main area never squeezes it to nothing
+/// (`docs/specs/session-layout.md` Section A.2's viewport-paging concern
+/// applies to the grid; the command bar needs its own floor for the same
+/// reason). `INPUT_HEIGHT` (`command_bar.rs`) plus a handful of log rows.
+/// The output pane (result text — `/help`, query results, …) and the
+/// `i`-toggled detail pane each have their own separate, dynamic
+/// reservation (`output_height`/`detail_height`), not folded into this
+/// constant — see `draw_session`.
+const MIN_BAR_HEIGHT: u16 = 6;
 
 pub fn run(path: &Path, assist: bool) -> anyhow::Result<()> {
     if assist {
@@ -125,15 +138,31 @@ fn shell_loop<H: CommandHandler + HasSession>(
     mut state: ShellState,
     recorder: &Arc<Mutex<LogRecorder>>,
 ) -> anyhow::Result<()> {
+    // The last-rendered Grid viewport height, used to nudge `grid_scroll`
+    // into keeping a newly-focused panel visible (`docs/specs/session-
+    // layout.md` Section B) right when focus actually changes, not
+    // recomputed every frame — recomputing it on every render would fight
+    // a manual `PageDown`/`PageUp` and snap the view back the very next
+    // tick. One frame stale on a terminal resize, self-correcting via the
+    // `.min(max_grid_scroll(..))` clamp `draw_session` always applies.
+    let mut grid_viewport_height: u16 = 0;
     ratatui::run(|terminal| -> anyhow::Result<()> {
         loop {
+            let focused_before = state.focused_panel;
             let before = state.log.len();
             state.apply_poll(&mut handler);
             record_new_lines(&state, recorder, before);
+            sync_grid_scroll_to_focus(
+                &mut state,
+                handler.session(),
+                grid_viewport_height,
+                focused_before,
+            );
 
             terminal.draw(|f| {
                 let status = handler.status_bar();
-                draw_session(f, f.area(), &state, handler.session(), &status);
+                grid_viewport_height =
+                    draw_session(f, f.area(), &state, handler.session(), &status);
             })?;
 
             if !event::poll(TICK)? {
@@ -142,14 +171,48 @@ fn shell_loop<H: CommandHandler + HasSession>(
             let Event::Key(key) = event::read()? else {
                 continue;
             };
+            let focused_before = state.focused_panel;
             let before = state.log.len();
             let should_quit = state.handle_key(key, &mut handler);
             record_new_lines(&state, recorder, before);
+            sync_grid_scroll_to_focus(
+                &mut state,
+                handler.session(),
+                grid_viewport_height,
+                focused_before,
+            );
             if should_quit {
                 return Ok(());
             }
         }
     })
+}
+
+/// After a `Tab`/`Shift+Tab` (or a `dash open` reload changing panel
+/// count, via `ShellState::apply_poll`'s own focus-reclamp) moves
+/// `focused_panel`, nudge `grid_scroll` the minimum amount to bring it
+/// into view (`layout::ensure_visible`) — a real, persisted mutation of
+/// `state.grid_scroll` made by the composition root (which knows the real
+/// terminal size) right at the moment focus changes, not a per-frame
+/// display-time computation (`ShellState` itself stays terminal-size-
+/// agnostic; see its `grid_scroll` field docs — this is the binary crate
+/// adjusting a public field after the fact, the same category as it
+/// already does with `state.log` for startup messages).
+fn sync_grid_scroll_to_focus(
+    state: &mut ShellState,
+    session: &LiveSession,
+    viewport_height: u16,
+    focused_before: usize,
+) {
+    if state.focused_panel == focused_before {
+        return;
+    }
+    let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
+    let Some(range) = panel_content_range(&grids, state.focused_panel) else {
+        return;
+    };
+    let max_scroll = max_grid_scroll(&grids, viewport_height);
+    state.grid_scroll = ensure_visible(state.grid_scroll, range, viewport_height).min(max_scroll);
 }
 
 /// Offers every log line added since `before` to the recorder — a
@@ -276,29 +339,109 @@ fn draw_session(
     state: &ShellState,
     session: &LiveSession,
     status: &StatusBarModel,
-) {
+) -> u16 {
     let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
 
-    // The grid gets exactly the height its panels need, not whatever
-    // space a `Min(0)`/stretch constraint would hand it — `grid_layout`
-    // positions panels by absolute grid units, so a grid area taller
-    // than its content just leaves a dead, unrendered gap below the
-    // last panel row otherwise. The command bar (log + input) gets
-    // everything left over instead, so it grows to use that space
-    // rather than staying pinned to a fixed height.
-    let [status_area, grid_area, bar_area] = Layout::vertical([
-        Constraint::Length(STATUS_BAR_HEIGHT),
-        Constraint::Length(dash9_tui::content_height(&grids)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    draw_status_bar(frame, status_area, status);
-    if state.detail_view {
-        let detail = panel_detail(session, state.focused_panel);
-        dash9_tui::draw_panel_detail(frame, grid_area, detail.as_ref());
+    // `Focus` gets the whole remaining main area — "one panel, full-pane"
+    // (`docs/specs/session-layout.md` Section A.3) — while `Grid`/`Layout`
+    // shrink-wrap to their content like before zoom levels existed
+    // (`content_height`'s own doc comment). The detail pane, output pane,
+    // and command bar are carved out first, top to bottom, so the grid
+    // never pushes any of them to nothing on a large or scrolled-open
+    // dashboard — detail and output are reserved *before* the grid gets
+    // whatever's left, not the grid stretching over them.
+    let reserved_fixed = STATUS_BAR_HEIGHT + ZOOM_BAR_HEIGHT + MIN_BAR_HEIGHT;
+    let available_after_fixed = area.height.saturating_sub(reserved_fixed);
+
+    let output_area_height = output_height(&state.log, available_after_fixed);
+    let available_after_output = available_after_fixed.saturating_sub(output_area_height);
+
+    // The detail pane (`i`) is independent of zoom (`ShellState::detail_open`
+    // docs) — it never replaces the grid/layout/focus area above it, only
+    // takes space below it, so the chart(s) stay visible the whole time
+    // you're inspecting one.
+    let detail_area_height = if state.detail_open {
+        let thresholds_len = session
+            .panels
+            .get(state.focused_panel)
+            .map_or(0, |p| p.thresholds.len());
+        detail_height(thresholds_len, available_after_output)
     } else {
-        draw_dashboard(frame, grid_area, &grids, session, state.focused_panel);
+        0
+    };
+    let available_for_grid = available_after_output.saturating_sub(detail_area_height);
+
+    let grid_height = match state.zoom {
+        Zoom::Focus => available_for_grid,
+        Zoom::Grid | Zoom::Layout => dash9_tui::content_height(&grids).min(available_for_grid),
+    };
+
+    let [status_area, zoom_area, grid_area, detail_area, output_area, bar_area] =
+        Layout::vertical([
+            Constraint::Length(STATUS_BAR_HEIGHT),
+            Constraint::Length(ZOOM_BAR_HEIGHT),
+            Constraint::Length(grid_height),
+            Constraint::Length(detail_area_height),
+            Constraint::Length(output_area_height),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+
+    draw_status_bar(frame, status_area, status);
+
+    // `state.grid_scroll` is already the right value going into this
+    // frame — `PageUp`/`PageDown` set it directly (`shell.rs`), and
+    // `sync_grid_scroll_to_focus` already nudged it for any focus change
+    // since the last frame. This is just the final defensive clamp
+    // against the content/viewport actually on screen right now.
+    let grid_scroll = state
+        .grid_scroll
+        .min(max_grid_scroll(&grids, grid_area.height));
+    draw_zoom_bar(
+        frame,
+        zoom_area,
+        &zoom_bar_model(state, &grids, grid_area, grid_scroll),
+    );
+
+    // While the command box is capturing keystrokes, `i` types a literal
+    // character instead of toggling detail (`shell.rs::handle_key`), so
+    // no panel's hint should claim otherwise — border/focus color stays
+    // as-is (`Tab` still moves it while editing), only the hint text is
+    // gated on this.
+    let editing = state.input.is_some();
+
+    match state.zoom {
+        Zoom::Grid => draw_dashboard(
+            frame,
+            grid_area,
+            &grids,
+            session,
+            state.focused_panel,
+            grid_scroll,
+            editing,
+        ),
+        Zoom::Layout => draw_layout(
+            frame,
+            grid_area,
+            &grids,
+            session,
+            state.focused_panel,
+            editing,
+        ),
+        Zoom::Focus => {
+            if let Some(panel) = session.panels.get(state.focused_panel) {
+                draw_panel(frame, grid_area, panel, true, !editing);
+            }
+        }
     }
+
+    if state.detail_open {
+        let detail = panel_detail(session, state.focused_panel);
+        dash9_tui::draw_panel_detail(frame, detail_area, detail.as_ref());
+    }
+
+    draw_output(frame, output_area, &state.log);
+
     draw_command_bar(
         frame,
         bar_area,
@@ -307,6 +450,70 @@ fn draw_session(
         &command_bar_hint(state, status),
         state.log_scroll,
     );
+
+    grid_area.height
+}
+
+fn zoom_bar_model(
+    state: &ShellState,
+    grids: &[dash9_core::GridSpec],
+    grid_area: Rect,
+    grid_scroll: u16,
+) -> ZoomBarModel {
+    let zoom_name = match state.zoom {
+        Zoom::Layout => "Layout",
+        Zoom::Grid => "Grid",
+        Zoom::Focus => "Focus",
+    };
+    let zoom_label = if state.detail_open {
+        format!("{zoom_name} + detail")
+    } else {
+        zoom_name.to_string()
+    };
+    let mut hint = dash9_tui::zoom_hint(state.zoom).to_string();
+    if state.zoom == Zoom::Grid {
+        if let Some(suffix) = grid_paging_suffix(grids, grid_area, grid_scroll) {
+            hint.push_str(&suffix);
+        }
+    }
+    ZoomBarModel { zoom_label, hint }
+}
+
+/// `"panels 5-8 of 12 — PageDown for more"`-style suffix
+/// (`docs/specs/session-layout.md` Section A.2's paging affordance) —
+/// `None` when every panel already fits (nothing to page), matching how
+/// `command_bar.rs`'s log title only changes "(scrolled...)" once there's
+/// actually somewhere else to scroll to.
+fn grid_paging_suffix(
+    grids: &[dash9_core::GridSpec],
+    grid_area: Rect,
+    scroll: u16,
+) -> Option<String> {
+    let total = grids.len();
+    let max_scroll = max_grid_scroll(grids, grid_area.height);
+    if total == 0 || max_scroll == 0 {
+        return None;
+    }
+    let rects = grid_layout_scrolled(grid_area, grids, scroll);
+    let visible_indices: Vec<usize> = rects
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.width > 0 && r.height > 0)
+        .map(|(i, _)| i)
+        .collect();
+    let (Some(&first), Some(&last)) = (visible_indices.first(), visible_indices.last()) else {
+        return Some(format!(" · 0 of {total} panels visible"));
+    };
+    let more = if scroll < max_scroll {
+        "PageDown for more"
+    } else {
+        "PageUp for more"
+    };
+    Some(format!(
+        " · panels {}-{} of {total} — {more}",
+        first + 1,
+        last + 1
+    ))
 }
 
 /// Extracts the plain fields `dash9_tui::PanelDetail` needs from the
@@ -336,14 +543,17 @@ fn panel_detail(session: &LiveSession, focused_panel: usize) -> Option<dash9_tui
 /// not actively typing: surfaces `y`/`n` only while a proposal is
 /// genuinely pending, and `a` only when there's an assist handler to
 /// toggle at all — never shown as options that would currently do
-/// nothing.
+/// nothing. Zoom/region-specific keys (Layout/Grid/Focus paging, `i`,
+/// `Esc`) live in the zoom bar (`zoom_bar_model`) instead — this hint
+/// stays about the command box itself, the one region that's the same
+/// regardless of zoom level.
 fn command_bar_hint(state: &ShellState, status: &StatusBarModel) -> String {
-    let mut hints = vec!["/command · text = AI", "Tab reaches this box", "/help"];
-    hints.push(if state.detail_view {
-        "i or Esc close detail"
-    } else {
-        "i panel detail"
-    });
+    let mut hints = vec![
+        "/command · text = AI",
+        "Tab reaches this box",
+        "+/- zoom",
+        "/help",
+    ];
     if !state.pending_proposals.is_empty() {
         hints.push("y/n confirm proposal");
     }
@@ -360,33 +570,69 @@ fn draw_dashboard(
     grids: &[dash9_core::GridSpec],
     session: &LiveSession,
     focused_panel: usize,
+    scroll: u16,
+    editing: bool,
 ) {
-    let rects = grid_layout(area, grids);
+    let rects = grid_layout_scrolled(area, grids, scroll);
 
     for (index, panel) in session.panels.iter().enumerate() {
         let rect = rects[index];
         if rect.width == 0 || rect.height == 0 {
-            continue; // Positioned entirely off-screen (v1 has no scrolling).
+            continue; // Scrolled or positioned entirely out of view.
         }
-        draw_panel(frame, rect, panel);
-        recolor_border(frame, rect, index == focused_panel);
+        let focused = index == focused_panel;
+        draw_panel(frame, rect, panel, focused, focused && !editing);
     }
 }
 
-fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel) {
+/// The Layout zoom level (`docs/specs/session-layout.md` Section A.1):
+/// every panel, all at once, title-and-border only — `grid_layout_fit`
+/// scales panels down to fit `area` instead of paging/clipping, so unlike
+/// `draw_dashboard` there is no "positioned off-screen" case to skip; a
+/// zero-size rect only happens in the genuinely degenerate case of an
+/// area shorter than the dashboard's total grid-row count even at the
+/// minimum 1-row-unit height (`grid_layout_fit`'s own doc comment).
+fn draw_layout(
+    frame: &mut Frame,
+    area: Rect,
+    grids: &[dash9_core::GridSpec],
+    session: &LiveSession,
+    focused_panel: usize,
+    editing: bool,
+) {
+    let rects = grid_layout_fit(area, grids);
+
+    for (index, panel) in session.panels.iter().enumerate() {
+        let rect = rects[index];
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let focused = index == focused_panel;
+        draw_panel_outline(frame, rect, &panel.title, focused, focused && !editing);
+    }
+}
+
+fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel, focused: bool, show_hint: bool) {
     let Some(result) = panel.last_result.as_ref() else {
-        draw_placeholder(frame, area, &panel.title, "(loading…)");
+        draw_placeholder(frame, area, &panel.title, "(loading…)", focused, show_hint);
         return;
     };
     let core_frame = match result {
         Err(err) => {
-            draw_placeholder(frame, area, &panel.title, &err.to_string());
+            draw_placeholder(
+                frame,
+                area,
+                &panel.title,
+                &err.to_string(),
+                focused,
+                show_hint,
+            );
             return;
         }
         Ok(core_frame) => core_frame,
     };
     if core_frame.is_empty() {
-        draw_placeholder(frame, area, &panel.title, "(no data)");
+        draw_placeholder(frame, area, &panel.title, "(no data)", focused, show_hint);
         return;
     }
 
@@ -402,12 +648,27 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel) {
                 usize::from(area.width),
             ) {
                 Ok(model) => match panel.panel_type {
-                    dash9_core::PanelType::Timeseries => draw_chart(frame, area, &model),
-                    dash9_core::PanelType::Gauge => draw_gauge(frame, area, &model),
-                    dash9_core::PanelType::Stat => draw_stat(frame, area, &model),
+                    dash9_core::PanelType::Timeseries => {
+                        draw_chart(frame, area, &model, focused, show_hint);
+                    }
+                    dash9_core::PanelType::Gauge => {
+                        draw_gauge(frame, area, &model, focused, show_hint);
+                    }
+                    dash9_core::PanelType::Stat => {
+                        draw_stat(frame, area, &model, focused, show_hint);
+                    }
                     dash9_core::PanelType::Table => unreachable!("handled in the outer match arm"),
                 },
-                Err(err) => draw_placeholder(frame, area, &panel.title, &err.to_string()),
+                Err(err) => {
+                    draw_placeholder(
+                        frame,
+                        area,
+                        &panel.title,
+                        &err.to_string(),
+                        focused,
+                        show_hint,
+                    );
+                }
             }
         }
         dash9_core::PanelType::Table => {
@@ -421,47 +682,35 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel) {
                 .clone()
                 .or_else(|| series_as_table(core_frame))
             {
-                Some(table) => draw_table(frame, area, &table, &panel.title),
-                None => draw_placeholder(frame, area, &panel.title, "(no table data)"),
+                Some(table) => draw_table(frame, area, &table, &panel.title, focused, show_hint),
+                None => {
+                    draw_placeholder(
+                        frame,
+                        area,
+                        &panel.title,
+                        "(no table data)",
+                        focused,
+                        show_hint,
+                    );
+                }
             }
         }
     }
 }
 
-fn draw_placeholder(frame: &mut Frame, area: Rect, title: &str, message: &str) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title.to_string());
+fn draw_placeholder(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: &str,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = dash9_tui::pane_block(
+        title,
+        focused,
+        None,
+        show_hint.then_some(dash9_tui::PANEL_HINT),
+    );
     frame.render_widget(Paragraph::new(message.to_string()).block(block), area);
-}
-
-/// Recolors `area`'s border ring after its content has already drawn
-/// its own bordered block — every panel-type draw function
-/// (`draw_chart`/`draw_stat`/`draw_gauge`/`draw_table`) already builds
-/// its own `Block`, so this restyles those cells directly via the
-/// buffer rather than adding a `focused: bool` parameter to four
-/// already-tested, already-used-by-`demo.rs` function signatures for
-/// a feature that's cosmetic only.
-fn recolor_border(frame: &mut Frame, area: Rect, focused: bool) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let color = if focused { theme::FOCUS } else { theme::MUTED };
-    let style = Style::default().fg(color);
-    let buffer = frame.buffer_mut();
-
-    for x in area.left()..area.right() {
-        for y in [area.top(), area.bottom().saturating_sub(1)] {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.set_style(style);
-            }
-        }
-    }
-    for y in area.top()..area.bottom() {
-        for x in [area.left(), area.right().saturating_sub(1)] {
-            if let Some(cell) = buffer.cell_mut((x, y)) {
-                cell.set_style(style);
-            }
-        }
-    }
 }

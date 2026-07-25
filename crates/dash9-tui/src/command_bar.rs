@@ -9,7 +9,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use dash9_core::{CommandSource, LogLine};
+use dash9_core::{CommandSource, LogLine, SessionLogEntry};
 
 use crate::theme;
 
@@ -17,14 +17,19 @@ use crate::theme;
 /// row + top/bottom border).
 const INPUT_HEIGHT: u16 = 3;
 
-/// Draws the scrollable log (above) and the command-bar input line
-/// (below) into `area`. `input` is `Some(buffer)` while the user is
-/// typing a command (`:` keybinding), `None` otherwise — in which
-/// case `hint` is shown instead, letting the composition root surface
-/// state-dependent guidance (e.g. "y/n confirm proposal" only while
-/// one is pending) without this module knowing why. `scroll` counts
-/// lines up from the newest (0 = pinned to the tail) — the
-/// composition root owns the value (`ShellState::log_scroll`,
+/// Draws the scrollable command log (above) and the command-bar input
+/// line (below) into `area`. The log here is command *echoes* only
+/// (`"> /help"`, `"> range 5m"`) — a compact audit trail of what was
+/// typed and when; `LogLine::Result` entries (help text, query results,
+/// error messages) are deliberately excluded and rendered elsewhere
+/// instead (`crate::output::draw_output`), since mixing full result text
+/// into this compact strip made both hard to read. `input` is
+/// `Some(buffer)` while the user is typing a command (`:` keybinding),
+/// `None` otherwise — in which case `hint` is shown instead, letting the
+/// composition root surface state-dependent guidance (e.g. "y/n confirm
+/// proposal" only while one is pending) without this module knowing why.
+/// `scroll` counts lines up from the newest (0 = pinned to the tail) —
+/// the composition root owns the value (`ShellState::log_scroll`,
 /// PageUp/PageDown), this module just renders it.
 pub fn draw_command_bar(
     frame: &mut Frame,
@@ -49,13 +54,18 @@ fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize) {
     };
     let block = Block::default().borders(Borders::ALL).title(title);
 
-    // A single `LogLine` (e.g. a multi-paragraph `/help` result) can
-    // render as many terminal rows, so the visible window is computed
-    // over actual rendered lines, not `LogLine` entries — slicing by
-    // entry count under-counts whenever an entry embeds newlines,
-    // which used to silently clip the newest output off the bottom
-    // of the area instead of showing it.
-    let rendered: Vec<String> = log.iter().map(format_log_line).collect();
+    // Command text is realistically always one line, but the window is
+    // still computed over actual rendered lines rather than entry count
+    // — same "don't undercount if something someday embeds a newline"
+    // discipline `crate::output::draw_output`'s sibling doesn't need
+    // (it shows one Result's full text, not a scrolling history).
+    let rendered: Vec<String> = log
+        .iter()
+        .filter_map(|line| match line {
+            LogLine::Command(entry) => Some(format_command_line(entry)),
+            LogLine::Result(_) => None,
+        })
+        .collect();
     let lines: Vec<&str> = rendered.iter().flat_map(|line| line.split('\n')).collect();
     if lines.is_empty() {
         frame.render_widget(Paragraph::new("(empty)").block(block), area);
@@ -85,17 +95,12 @@ fn visible_window(
     start..end
 }
 
-fn format_log_line(line: &LogLine) -> String {
-    match line {
-        LogLine::Command(entry) => {
-            let marker = match entry.source {
-                CommandSource::User => ">",
-                CommandSource::Assistant => "*",
-            };
-            format!("{marker} {}", entry.command_text)
-        }
-        LogLine::Result(text) => format!("  {text}"),
-    }
+fn format_command_line(entry: &SessionLogEntry) -> String {
+    let marker = match entry.source {
+        CommandSource::User => ">",
+        CommandSource::Assistant => "*",
+    };
+    format!("{marker} {}", entry.command_text)
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>, hint: &str) {
@@ -110,7 +115,6 @@ fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>, hint: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dash9_core::SessionLogEntry;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -126,11 +130,17 @@ mod tests {
             .unwrap();
     }
 
+    fn command_line(text: &str) -> LogLine {
+        LogLine::Command(SessionLogEntry {
+            source: CommandSource::User,
+            command_text: text.to_string(),
+            timestamp_ms: 0,
+        })
+    }
+
     #[test]
     fn log_longer_than_visible_area_draws_without_panicking() {
-        let log: Vec<LogLine> = (0..50)
-            .map(|i| LogLine::Result(format!("line {i}")))
-            .collect();
+        let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
         let mut terminal = backend(60, 10);
         terminal
             .draw(|f| draw_command_bar(f, f.area(), &log, None, "press : to enter a command", 0))
@@ -139,9 +149,7 @@ mod tests {
 
     #[test]
     fn scrolled_log_draws_without_panicking() {
-        let log: Vec<LogLine> = (0..50)
-            .map(|i| LogLine::Result(format!("line {i}")))
-            .collect();
+        let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
         let mut terminal = backend(60, 10);
         terminal
             .draw(|f| draw_command_bar(f, f.area(), &log, None, "press : to enter a command", 20))
@@ -149,13 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn command_and_result_lines_and_active_input_draw_without_panicking() {
+    fn only_command_echoes_are_shown_result_lines_are_excluded() {
         let log = vec![
-            LogLine::Command(SessionLogEntry {
-                source: CommandSource::User,
-                command_text: "range 5m".to_string(),
-                timestamp_ms: 0,
-            }),
+            command_line("range 5m"),
             LogLine::Command(SessionLogEntry {
                 source: CommandSource::Assistant,
                 command_text: "panel type gauge".to_string(),
@@ -176,6 +180,22 @@ mod tests {
                 );
             })
             .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("range 5m"), "user command echo shown");
+        assert!(
+            content.contains("panel type gauge"),
+            "assistant command echo shown"
+        );
+        assert!(
+            !content.contains("range set to 5m"),
+            "the Result's text must not appear in the command log"
+        );
     }
 
     #[test]
@@ -189,15 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn a_multiline_entry_is_sliced_by_rendered_lines_not_by_entry_count() {
-        // One `LogLine` whose text embeds 20 newlines must still be
-        // sliceable by actual rendered row, not treated as "1 entry"
-        // that either shows entirely or not at all.
-        let big = (0..20)
-            .map(|i| format!("inner {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let log = vec![LogLine::Result(big)];
+    fn many_command_lines_are_sliced_by_rendered_row_newest_visible_at_scroll_zero() {
+        // 20 separate `Command` entries (the realistic shape a long
+        // session's command log actually takes) must still be windowed
+        // by rendered row so the newest is visible and the oldest has
+        // scrolled off — the same `visible_window` mechanism, exercised
+        // end to end through `draw_log`'s filtering rather than a single
+        // pathological multi-line entry (which can no longer reach this
+        // box now that `LogLine::Result` is filtered out).
+        let log: Vec<LogLine> = (0..20)
+            .map(|i| command_line(&format!("inner {i}")))
+            .collect();
         let mut terminal = backend(60, 8);
         terminal
             .draw(|f| draw_command_bar(f, f.area(), &log, None, "hint", 0))

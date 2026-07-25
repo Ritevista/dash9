@@ -1,12 +1,12 @@
-//! The focused panel's `i`-toggled detail overlay: combined
-//! config (query, datasource, thresholds, grid position) and raw
-//! data (every row the panel's query actually returned, not just
-//! what the small chart box can show). Replaces the panel grid area
-//! while open — the log/command bar stay visible and usable
-//! underneath, so running a command that affects the focused panel
-//! (e.g. `/panel threshold crit gte 95`) shows its effect here
-//! immediately, since this redraws from live state every frame like
-//! everything else.
+//! The focused panel's `i`-toggled detail pane: combined config (query,
+//! datasource, thresholds, grid position) and raw data (every row the
+//! panel's query actually returned, not just what the small chart box can
+//! show). Rendered in its own area **below** the main grid/layout/focus
+//! area (`dash9/src/open.rs::draw_session`), never in place of it — the
+//! chart(s) stay visible and usable the whole time a panel's detail is
+//! open, so running a command that affects the focused panel (e.g.
+//! `/panel threshold crit gte 95`) shows its effect here immediately,
+//! since this redraws from live state every frame like everything else.
 //!
 //! Pure rendering, no I/O — same rule as every other module here.
 //! `dash9-tui` can't depend on the binary crate's `LivePanel`/
@@ -15,7 +15,7 @@
 //! split in `open.rs`).
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame as RatatuiFrame;
 
@@ -23,6 +23,7 @@ use dash9_core::{CommandError, Duration, Frame, GridSpec, PanelType, ValidatedTh
 
 use crate::draw::draw_table;
 use crate::export::table_for_export;
+use crate::pane::pane_block;
 use crate::theme;
 
 pub struct PanelDetail<'a> {
@@ -41,6 +42,38 @@ pub struct PanelDetail<'a> {
     pub last_result: Option<&'a Result<Frame, CommandError>>,
 }
 
+/// 6 fixed lines (title/type/datasource/query/grid/allow-empty) plus
+/// either one "(none)" line, or a "Thresholds:" header *and* one line
+/// per threshold — the header is a separate line from the entries it
+/// introduces, not absorbed into the count of one of them. Plus the
+/// block's own top/bottom border.
+fn config_area_height(thresholds_len: usize) -> u16 {
+    let config_lines = if thresholds_len == 0 {
+        7
+    } else {
+        7 + thresholds_len
+    };
+    u16::try_from(config_lines + 2).unwrap_or(u16::MAX)
+}
+
+/// Rows given to the data table beyond the config block, when the caller
+/// (`dash9/src/open.rs`) is sizing a *fixed-height* pane for this rather
+/// than handing it the rest of the screen — e.g. the `i`-toggled detail
+/// pane, which sits below the main area and must leave room for the
+/// output pane and command bar under it too.
+const DEFAULT_DATA_ROWS: u16 = 8;
+
+/// How tall a detail pane needs to be to show `thresholds_len`
+/// thresholds' worth of config plus a reasonable data preview, capped at
+/// `available`. Guarantees the config block (which `draw_panel_detail`
+/// never truncates) always fits; the data table gets whatever's left,
+/// same as it would if handed a taller area directly.
+pub fn detail_height(thresholds_len: usize, available: u16) -> u16 {
+    config_area_height(thresholds_len)
+        .saturating_add(DEFAULT_DATA_ROWS)
+        .min(available)
+}
+
 /// `None` when no panel is focused (an empty dashboard) — matches
 /// the "no panel focused" placeholder every other panel-scoped
 /// command already uses.
@@ -51,17 +84,7 @@ pub fn draw_panel_detail(frame: &mut RatatuiFrame, area: Rect, detail: Option<&P
         return;
     };
 
-    // 6 fixed lines (title/type/datasource/query/grid/allow-empty)
-    // plus either one "(none)" line, or a "Thresholds:" header *and*
-    // one line per threshold — the header is a separate line from
-    // the entries it introduces, not absorbed into the count of one
-    // of them.
-    let config_lines = if detail.thresholds.is_empty() {
-        7
-    } else {
-        7 + detail.thresholds.len()
-    };
-    let config_height = u16::try_from(config_lines + 2).unwrap_or(u16::MAX);
+    let config_height = config_area_height(detail.thresholds.len());
     let [config_area, data_area] =
         Layout::vertical([Constraint::Length(config_height), Constraint::Min(0)]).areas(area);
 
@@ -96,10 +119,12 @@ fn draw_config(frame: &mut RatatuiFrame, area: Rect, detail: &PanelDetail) {
         }
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("detail: {}", detail.title))
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let block = pane_block(
+        &format!("detail: {}", detail.title),
+        true,
+        None,
+        Some("Esc/i close"),
+    );
     frame.render_widget(Paragraph::new(lines.join("\n")).block(block), area);
 }
 
@@ -116,7 +141,7 @@ fn draw_data(frame: &mut RatatuiFrame, area: Rect, detail: &PanelDetail) {
         return draw_data_placeholder(frame, area, "(no data)");
     }
     match table_for_export(core_frame) {
-        Some(table) => draw_table(frame, area, &table, "data"),
+        Some(table) => draw_table(frame, area, &table, "data", false, false),
         None => draw_data_placeholder(frame, area, "(no table data)"),
     }
 }
@@ -290,5 +315,16 @@ mod tests {
                 draw_panel_detail(f, Rect::new(0, 0, 0, 0), Some(&detail));
             })
             .unwrap();
+    }
+
+    #[test]
+    fn detail_height_grows_with_threshold_count_but_never_exceeds_available() {
+        let no_thresholds = detail_height(0, 100);
+        let two_thresholds = detail_height(2, 100);
+        assert!(
+            two_thresholds > no_thresholds,
+            "more thresholds need a taller config block"
+        );
+        assert_eq!(detail_height(2, 5), 5, "never exceeds available space");
     }
 }

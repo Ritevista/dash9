@@ -8,11 +8,21 @@ against. Introduces three zoom levels for the main area, makes
 navigation keys contextual to whichever region is active, and phases
 in `/save png`.
 
-Status: **Proposed** — nothing in this document is implemented.
-`docs/specs/open.md` remains the accurate description of what's
-shipped today; this spec supersedes its Section E (keybindings) and
-Section I (`/save png`'s "not implemented" stance) once built, and
-`open.md` gets updated to match at that point, not before.
+Status: **Partially implemented** — Sections A-D (the three zoom
+levels, zoom-level keys, contextual `PageUp`/`PageDown`, and per-region
+key hints) are built and covered by unit tests
+(`crates/dash9-tui/src/{shell,layout,draw,status_bar,detail_view}.rs`)
+plus manual smoke tests against a live session; `docs/specs/open.md`
+Sections E and G now describe this shipped behavior directly. Section
+A.3's original "Focus has chart/inspect sub-views" design was revised
+after shipping — see that section's "Revised after shipping" note and
+`open.md` Section G.1 — direct user feedback on the live build found
+that replacing the whole main area to show detail hid every chart with
+no direct way back; detail is now a separate, always-below pane,
+decoupled from zoom entirely. Section E below (`/save png`, phased)
+remains **Proposed** — deliberately deferred, since it needs a new
+image/font-rasterization dependency this codebase doesn't have yet and
+is a separable follow-up, not a prerequisite for the zoom-level work.
 
 ## Contents
 
@@ -44,36 +54,45 @@ or the detail view") is really three distinct zoom levels, not two:
    everything" affordance the log already uses (`open.md` Section F's
    log retitles itself when scrolled; Grid gets the equivalent, e.g.
    `"panels 5-8 of 12 — PageDown for more"`).
-3. **Focus** — one panel, full-pane. This is `open.md` Section G's
-   existing detail view, generalized: `i` still means "toggle detail"
-   exactly as it does today (backward compatible, no existing test
-   changes meaning), but Focus now has two sub-views instead of one —
-   **chart** (the panel's chart, just bigger, no config/data) and
-   **inspect** (today's config + raw data table). Entering Focus via
-   `i` lands on inspect (matches today exactly); entering via `+`
-   (Section B) lands on chart. Once in Focus, `i` toggles between the
-   two sub-views regardless of which one you entered through.
+3. **Focus** — one panel's chart, full-pane, nothing more. **Revised
+   after shipping**: this section originally proposed Focus with two
+   sub-views (`i`-toggled "chart" and "inspect," the latter being
+   `open.md` Section G's pre-existing config+data detail view,
+   generalized into a zoom sub-view). That shipped, then real usage
+   immediately surfaced the problem the design review missed: entering
+   the inspect sub-view replaced the *entire* main area, so a panel's
+   chart(s) became completely invisible while inspecting one, with no
+   affordance more direct than `Esc`/`-` to get back. The fix, per
+   direct user feedback, decouples detail from zoom entirely: `i` now
+   toggles a **separate pane below** the main grid/layout/focus area
+   (`open.md` Section G.1) — the chart(s) stay visible and usable the
+   whole time. `Zoom::Focus` still exists and still means exactly what
+   this bullet's first sentence says (one panel's chart, enlarged, via
+   `+`); it just no longer has sub-views, and `i` no longer touches
+   zoom at all. See `open.md` Section G/G.1 for the shipped design.
 
 ## B. Zoom-level keys
 
 Editor/browser convention, not a new invention: the three levels
 (Section A) sit on one line, Layout ↔ Grid ↔ Focus, and `-`/`_` and
 `+`/`=` always move one step along it — `-` toward Layout, `+` toward
-Focus (on the currently focused panel, landing on the chart sub-view),
-from *either* neighboring level, not just from Grid. At the two ends,
-the key that would overshoot is a no-op: `-` at Layout does nothing
-(already outermost), `+` at Focus does nothing (already innermost).
-This is what makes Section D's "Layout shows `+` (back to Grid)" hint
-correct — `+` is genuinely valid from Layout, not just from Grid.
-`Esc` is the separate "go home" shortcut: it steps back one level
-toward Grid specifically — Focus → Grid, or Layout → Grid — the same
-incremental-undo shape `Esc` already has today (cancel input, *then*
-close detail view, `open.md` Section E); Grid is the fixed "home"
-level, so `Esc` at Grid is a no-op, unchanged from today. (`Esc` from
+Focus (the currently focused panel's chart, enlarged), from *either*
+neighboring level, not just from Grid. At the two ends, the key that
+would overshoot is a no-op: `-` at Layout does nothing (already
+outermost), `+` at Focus does nothing (already innermost). This is
+what makes Section D's "Layout shows `+` (back to Grid)" hint correct
+— `+` is genuinely valid from Layout, not just from Grid. `Esc` is the
+separate "go home" shortcut: it steps back one level toward Grid
+specifically — Focus → Grid, or Layout → Grid — but only once the
+detail pane (`open.md` Section G.1, independent of zoom — see Section
+A.3's revision above) is closed; Esc closes that first if it's open,
+the same layered shape Esc already had before zoom levels existed
+(cancel input, *then* close detail). Grid is the fixed "home" level,
+so `Esc` at Grid with detail already closed is a no-op. (`Esc` from
 Layout and `+` from Layout both land on Grid — that overlap is
 intentional, not a redundancy to remove: `Esc` is "go home" from
 anywhere, `+`/`-` are "one step" from wherever you are.) `Tab`/
-`Shift+Tab` continue to move panel focus within Grid or Focus exactly
+`Shift+Tab` continue to move panel focus within any zoom level exactly
 as today, and now also scroll the Grid viewport to keep the
 newly-focused panel visible — so casual navigation never requires
 learning the paging key below at all.
@@ -90,7 +109,7 @@ change meaning by active region:
 | Command box (editing) | Scroll the log — unchanged from `open.md` Section E, still works while typing without touching the buffer |
 | Grid, not editing | Page the panel viewport vertically (Section A.2) |
 | Layout, not editing | No-op — nothing to page; every panel is already visible by definition |
-| Focus, not editing | No-op for v1 — reserved for scrolling a single panel's own long content (e.g. a large table in the inspect sub-view); not built now, flagged so it isn't lost |
+| Focus, not editing | No-op for v1 — reserved for scrolling a single panel's own long content; not built now, flagged so it isn't lost. The detail pane's data table (`open.md` Section G.1) has the same unbuilt-scrolling gap, tracked there instead since it's no longer part of Focus. |
 
 This is the general rule the whole session follows going forward, not
 a one-off carve-out for this one key: a region-specific keymap, with
@@ -100,14 +119,31 @@ them and acting on them are the same data).
 
 ## D. Per-pane shortcut hints
 
-Each bordered region gets a one-line footer or title-suffix listing
-only its own relevant keys, instead of everything living solely in
-`/help`. Mechanically this is the existing `command_bar_hint`
-mechanism (`open.md`'s command box already does exactly this) applied
-to every other region: Grid's border shows its paging/zoom keys, Focus
-shows `i` (toggle sub-view) and `Esc`/`-` (back out), Layout shows `+`
-(back to Grid). `/help` remains the full reference; these are the
-"what can I press right here" complement, not a replacement.
+**Revised after shipping**, same reason and same shape as Section
+A.3's revision: this section originally proposed one hint per
+*region* (Grid/Focus/Layout), each showing its whole key set
+("Focus shows `i` (toggle sub-view) and `Esc`/`-`..."). Once Focus's
+sub-views were removed (Section A.3), "toggle sub-view" stopped being
+true, and the shipped design ended up richer than a region-level hint
+line anyway — it's now a genuine per-**pane** convention, not just
+per-region:
+
+- The **zoom bar** (`open.md` Section H) is what this section's
+  original per-region hint became: one line, region-level keys only
+  (`PageUp`/`PageDown` paging, `Tab`/`1`-`9` selection, `+`/`-` zoom) —
+  the things true of the *whole* active region, not any one panel.
+- Each individual **pane's own border** (`open.md` Section G.2,
+  `dash9_tui::pane::pane_block`) carries the genuinely pane-specific
+  bit instead: bottom-left key hint (just `i` — the only truly
+  per-panel action), top-right status, top-left name, all color-coded
+  by focus state. This is more than "a footer listing keys" — the
+  original ask here — it's a full per-pane chrome convention that
+  subsumed this section's goal and then some.
+
+`/help` remains the full reference either way; both the zoom bar and
+each pane's own border are the "what can I press right here"
+complement, not a replacement. See `open.md` Section G.2 for the
+shipped design in full.
 
 ## E. `/save png`, phased
 
