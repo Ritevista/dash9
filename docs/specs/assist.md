@@ -38,13 +38,16 @@ code is written until this document is reviewed and approved — see
 This spec covers the `dash9-assist` crate — the LLM client, prompt
 and context assembly, the validate/repair contract loop, the verb
 classification policy — and its integration into `dash9 demo
---assist`. It does **not** cover the interactive assist pane's
-keybinding (`a` / `:ask`) inside `dash9 open`, because `open`'s
-interactive session (focused panel, live session log) is not built
-yet. Everything in this spec is designed so that integration is a
-thin wiring exercise once `open` exists, not a redesign — the
-contract loop itself is fully exercisable today via `dash9 demo
---assist` and its fixture-replay test (Section K).
+--assist`. It does **not** cover the interactive session's own
+keybindings, meta-commands, or status bar (`docs/specs/open.md`), only
+what the assistant itself does once wired in: `open`'s `a` key toggles
+the assistant on/off (there is no separate `:ask` keybinding — a
+command-bar line with no leading `/` is unconditionally natural
+language and reaches the assistant whenever it's on,
+`docs/specs/open.md` Section C), and `y`/`n` accept or dismiss a
+pending proposal (`docs/specs/open.md` Section E). The contract loop
+itself is fully exercisable today via `dash9 demo --assist` and its
+fixture-replay test (Section K).
 
 Non-goals for v1 are listed in full in Section N; the short version:
 no streaming, no multi-turn tool use, the assistant never reads query
@@ -85,8 +88,9 @@ flowchart LR
   compile and fully function without it. `dash9 test`, `dash9 open`,
   and `dash9 demo` (without `--assist`) must not reference
   `dash9-assist` at all when the feature is off — `#[cfg(feature =
-  "assist")]` gates the `demo --assist` flag, the future `a`/`:ask`
-  keybinding, and nothing else.
+  "assist")]` gates the `demo --assist` flag, `open --assist`'s `a`
+  key/`y`/`n`/`/ai`/`/model` wiring (`docs/specs/open.md`), and
+  nothing else.
 
 **Why `dash9-assist` cannot fetch its own datasource metadata:**
 constraint 2 (see the task that produced this spec) says the
@@ -176,10 +180,12 @@ no existing row changes.
 ### C.3 Session log types
 
 Section I needs every assistant-originated command to land in "the
-session log ... exactly like user commands," but no session log
-exists yet (`dash9 open`'s interactive session isn't built). Rather
-than let assist invent its own log shape now and reconcile it with
-`open`'s later, both key off one small, shared type added now:
+session log ... exactly like user commands," but at the time this was
+written no session log existed yet (`dash9 open`'s interactive session
+wasn't built — it since has been, and does use this type; see
+`docs/specs/open.md` Section F). Rather than let assist invent its own
+log shape now and reconcile it with `open`'s later, both key off one
+small, shared type added now:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]

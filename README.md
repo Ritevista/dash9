@@ -31,9 +31,17 @@ no mocks. Requires Docker.
 ```console
 just up      # or: docker compose up -d
 cargo run -p dash9 -- test examples/node-overview.toml
-cargo run -p dash9 -- dash open examples/node-overview.toml
+cargo run -p dash9 -- open examples/node-overview.toml
 just down    # or: docker compose down
 ```
+
+`open` is the interactive session: a live panel grid, a scrollable
+command log, and a command bar running the same grammar. Press `:` to
+type a command (e.g. `/range 1h`), `Tab`/`Shift+Tab` to cycle panel
+focus, `i` to open the focused panel's full-screen detail view, `/help`
+for the full command list, and `q` or `Ctrl+C` to quit — see
+[`docs/specs/open.md`](docs/specs/open.md) for every keybinding and
+shell command (`/save`, `/record`, and, with `--assist`, `/ai`/`/model`).
 
 `node_exporter` reports on whatever the Docker daemon's kernel is —
 the host's on Linux, the Docker Desktop VM's on macOS/Windows — either
@@ -59,6 +67,7 @@ Start with [`SPEC.md`](SPEC.md) for the Phase 1 data model, command grammar, and
 just check
 just test
 just ci
+just deny    # license and dependency-ban check (cargo-deny)
 ```
 
 ## License
