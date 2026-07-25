@@ -293,7 +293,12 @@ fn draw_session(
     ])
     .areas(area);
     draw_status_bar(frame, status_area, status);
-    draw_dashboard(frame, grid_area, &grids, session, state.focused_panel);
+    if state.detail_view {
+        let detail = panel_detail(session, state.focused_panel);
+        dash9_tui::draw_panel_detail(frame, grid_area, detail.as_ref());
+    } else {
+        draw_dashboard(frame, grid_area, &grids, session, state.focused_panel);
+    }
     draw_command_bar(
         frame,
         bar_area,
@@ -304,6 +309,29 @@ fn draw_session(
     );
 }
 
+/// Extracts the plain fields `dash9_tui::PanelDetail` needs from the
+/// focused panel. Lives here, not in `dash9-tui`, because it needs
+/// both `LivePanel` *and* `LiveDatasource` (for the datasource's type
+/// and URL) — both binary-crate types `dash9-tui` can't depend on.
+fn panel_detail(session: &LiveSession, focused_panel: usize) -> Option<dash9_tui::PanelDetail<'_>> {
+    let panel = session.panels.get(focused_panel)?;
+    let datasource_line = match session.datasources.get(&panel.datasource) {
+        Some(ds) => format!("{}: {} {}", panel.datasource, ds.datasource_type, ds.url),
+        None => format!("{} (not configured)", panel.datasource),
+    };
+    Some(dash9_tui::PanelDetail {
+        title: &panel.title,
+        panel_type: panel.panel_type,
+        datasource_line,
+        query: &panel.query,
+        allow_empty: panel.allow_empty,
+        latency_budget: panel.latency_budget,
+        grid: panel.grid,
+        thresholds: &panel.thresholds,
+        last_result: panel.last_result.as_ref(),
+    })
+}
+
 /// State-dependent footer text for the command-bar input line when
 /// not actively typing: surfaces `y`/`n` only while a proposal is
 /// genuinely pending, and `a` only when there's an assist handler to
@@ -311,6 +339,11 @@ fn draw_session(
 /// nothing.
 fn command_bar_hint(state: &ShellState, status: &StatusBarModel) -> String {
     let mut hints = vec!["/command · text = AI", "Tab reaches this box", "/help"];
+    hints.push(if state.detail_view {
+        "i or Esc close detail"
+    } else {
+        "i panel detail"
+    });
     if !state.pending_proposals.is_empty() {
         hints.push("y/n confirm proposal");
     }

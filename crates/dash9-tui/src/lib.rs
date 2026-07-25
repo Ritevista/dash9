@@ -9,6 +9,7 @@
 
 pub mod chart;
 pub mod command_bar;
+pub mod detail_view;
 pub mod draw;
 pub mod export;
 pub mod layout;
@@ -17,6 +18,7 @@ pub mod status_bar;
 pub mod theme;
 
 pub use command_bar::draw_command_bar;
+pub use detail_view::{draw_panel_detail, PanelDetail};
 pub use draw::{draw_chart, draw_gauge, draw_stat, draw_table, series_as_table};
 pub use export::{table_for_export, table_to_csv, table_to_markdown, ExportFormat};
 pub use layout::{content_height, grid_layout};

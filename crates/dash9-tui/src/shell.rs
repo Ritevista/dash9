@@ -220,7 +220,8 @@ fn help_overview() -> String {
     );
     out.push_str(
         "Keys: Tab/Shift+Tab cycle panels + command box · : jump to command box \
-         (Esc cancels) · PageUp/PageDown scroll log · y/n confirm proposal · \
+         (Esc cancels) · i toggle focused panel's detail view (Esc closes) · \
+         PageUp/PageDown scroll log · y/n confirm proposal · \
          a toggle AI · q or Ctrl+C quit\n",
     );
     out
@@ -398,6 +399,11 @@ pub struct ShellState {
     /// where I was"; background results (pollers, assistant replies)
     /// never reset it, so reading old output isn't interrupted.
     pub log_scroll: usize,
+    /// `i`-toggled full-screen detail overlay for whichever panel is
+    /// currently focused. Always renders `focused_panel`'s live
+    /// state, so Tab-ing to a different panel while it's open just
+    /// follows — no separate "which panel" tracking needed.
+    pub detail_view: bool,
     history: VecDeque<String>,
     history_cursor: Option<usize>,
 }
@@ -489,6 +495,8 @@ impl ShellState {
             }
             KeyCode::Char('q') => return true,
             KeyCode::Char(':') => self.input = Some(String::new()),
+            KeyCode::Char('i') => self.detail_view = !self.detail_view,
+            KeyCode::Esc if self.detail_view => self.detail_view = false,
             KeyCode::Tab => self.advance_focus(handler, true),
             KeyCode::BackTab => self.advance_focus(handler, false),
             _ => {}
@@ -784,6 +792,55 @@ mod tests {
 
         assert!(!state.handle_key(press(KeyCode::PageDown), &mut handler));
         assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+    }
+
+    #[test]
+    fn i_toggles_the_detail_view_outside_input_but_types_a_literal_i_while_editing() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        assert!(!state.detail_view);
+
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(state.detail_view);
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(!state.detail_view);
+
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(
+            !state.detail_view,
+            "typing 'i' in the buffer must not toggle it"
+        );
+        assert_eq!(state.input.as_deref(), Some("i"));
+    }
+
+    #[test]
+    fn esc_closes_the_detail_view_when_open_and_not_editing() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.detail_view = true;
+
+        assert!(!state.handle_key(press(KeyCode::Esc), &mut handler));
+        assert!(
+            !state.detail_view,
+            "Esc closes the detail view, doesn't quit"
+        );
+    }
+
+    #[test]
+    fn esc_while_editing_cancels_input_first_even_if_detail_view_is_open() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.detail_view = true;
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert!(state.input.is_none(), "input cancelled first");
+        assert!(
+            state.detail_view,
+            "detail view stays open — a second Esc closes it"
+        );
     }
 
     #[test]
