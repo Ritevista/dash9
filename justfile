@@ -11,6 +11,9 @@ test:
 
 ci: check test
 
+deny:
+    cargo deny check
+
 demo:
     cargo run -p dash9 -- demo
 
