@@ -24,7 +24,10 @@
 //! grammar (`dash9_core::parse` is never called on it). `Tab`/
 //! `Shift+Tab` cycle through every panel and then into the command
 //! box itself (a `panel_count() + 1`-stop ring), so the command box
-//! is reachable without needing to already know about `:`.
+//! is reachable without needing to already know about `:` — but once
+//! inside and actively composing text, `Tab`/`Shift+Tab` are inert;
+//! they must never silently discard what's typed by navigating away,
+//! so only `Esc` (cancel) or `Enter` (submit) leave the box.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -451,8 +454,12 @@ impl ShellState {
                 }
                 KeyCode::Up => self.history_previous(),
                 KeyCode::Down => self.history_next(),
-                KeyCode::Tab => self.advance_focus(handler, true),
-                KeyCode::BackTab => self.advance_focus(handler, false),
+                // Deliberately not `advance_focus` here — Tab reaches
+                // the command box from *outside* it (see the
+                // non-editing branch below), but once you're actively
+                // composing text, Tab must not navigate away and
+                // discard it out from under you. Only Esc (cancel) or
+                // Enter (submit) leave the box while editing.
                 KeyCode::Char(c) => {
                     if let Some(buffer) = self.input.as_mut() {
                         buffer.push(c);
@@ -490,17 +497,15 @@ impl ShellState {
     }
 
     /// Moves focus one step around the `panel_count() + 1`-stop ring
-    /// (every panel, then the command box, wrapping). Entering the
-    /// command box always starts an empty buffer; leaving it discards
-    /// any uncommitted text, same as `Esc`.
+    /// (every panel, then the command box, wrapping). Only reachable
+    /// while *not* editing (see `handle_key` — Tab/BackTab are a
+    /// no-op while `input.is_some()`), so entering the command box
+    /// here always starts a fresh empty buffer; there's never an
+    /// in-progress one to discard.
     fn advance_focus<H: CommandHandler>(&mut self, handler: &H, forward: bool) {
         let panel_count = handler.panel_count();
         let total = panel_count + 1;
-        let current = if self.input.is_some() {
-            panel_count
-        } else {
-            self.focused_panel.min(panel_count.saturating_sub(1))
-        };
+        let current = self.focused_panel.min(panel_count.saturating_sub(1));
         let next = if forward {
             (current + 1) % total
         } else {
@@ -714,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_every_panel_then_reaches_the_command_box_then_wraps() {
+    fn tab_cycles_every_panel_then_reaches_the_command_box_and_stays_put() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(3);
 
@@ -731,9 +736,10 @@ mod tests {
             "the 4th Tab (past the last of 3 panels) reaches the command box"
         );
 
+        // Further Tabs, now that editing has started, must not
+        // navigate away — only Esc/Enter leave the box once inside.
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert!(state.input.is_none(), "Tab out of the command box wraps");
-        assert_eq!(state.focused_panel, 0);
+        assert!(state.input.is_some(), "Tab stays put while editing");
     }
 
     #[test]
@@ -744,25 +750,25 @@ mod tests {
 
         state.handle_key(press(KeyCode::BackTab), &mut handler);
         assert!(state.input.is_some());
-
-        state.handle_key(press(KeyCode::BackTab), &mut handler);
-        assert!(state.input.is_none());
-        assert_eq!(state.focused_panel, 2, "wraps backward to the last panel");
     }
 
     #[test]
-    fn tab_while_editing_discards_the_uncommitted_buffer() {
+    fn tab_and_backtab_while_editing_are_a_no_op_and_never_lose_the_buffer() {
         let mut state = ShellState::default();
-        let mut handler = MockHandler::new(1);
+        let mut handler = MockHandler::new(3);
         state.handle_key(char_key(':'), &mut handler);
         state.handle_key(char_key('x'), &mut handler);
         assert_eq!(state.input.as_deref(), Some("x"));
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert!(
-            state.input.is_none(),
-            "left the command box, dropping \"x\""
+        assert_eq!(
+            state.input.as_deref(),
+            Some("x"),
+            "Tab must not navigate away and drop what was typed"
         );
+
+        state.handle_key(press(KeyCode::BackTab), &mut handler);
+        assert_eq!(state.input.as_deref(), Some("x"));
     }
 
     #[test]
