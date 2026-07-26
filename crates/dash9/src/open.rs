@@ -10,7 +10,7 @@
 //! `ShellState`/`CommandHandler` — a pure state machine (no terminal/
 //! filesystem/network I/O, fully unit-tested there) calling into a
 //! `CommandHandler` implementation that does the real work. This
-//! module supplies two implementations: [`GrammarOnlyHandler`] (no
+//! module supplies two implementations: `GrammarOnlyHandler` (no
 //! assist awareness at all, used by `run_plain` — the only
 //! implementation compiled at all when the `assist` feature is off) and
 //! `assist_bridge::AssistHandler` (`#[cfg(feature = "assist")]`, used
@@ -139,7 +139,7 @@ pub(crate) trait HasSession {
 /// The shared render loop: identical for `run_plain` and
 /// `run_with_assist` now, generic over whichever `CommandHandler`
 /// implementation is driving it. `recorder` is the same handle the
-/// handler holds (see [`GrammarOnlyHandler`]/`AssistHandler`) — the
+/// handler holds (see `GrammarOnlyHandler`/`AssistHandler`) — the
 /// handler owns turning `/record on|off` into an open/closed file,
 /// this loop owns noticing every new `state.log` line and offering it
 /// to the recorder, since that's the one place that sees every line
