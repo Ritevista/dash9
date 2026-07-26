@@ -571,6 +571,18 @@ pub struct ShellState {
     /// should be read from its start, not wherever a stale scroll
     /// position from the *previous* result happened to leave off.
     pub output_scroll: usize,
+    /// Whether the currently focused `Output`/`Log` region (`region`) is
+    /// maximized — takes over most of the screen the same way `Zoom::Focus`
+    /// already does for `Main` (`docs/specs/open.md` Section F), instead
+    /// of staying capped to its small default size
+    /// (`dash9_tui::{output_height,log_height}`). `Main` doesn't use this
+    /// field at all — it already has `zoom` for the same purpose, three
+    /// levels instead of a plain toggle. Meaningless (and never read)
+    /// while `region == Region::Main`; reset to `false` by `advance_focus`
+    /// whenever `region` actually changes, since maximizing a pane you've
+    /// since `Tab`-ed away from would just leave it stuck oversized with
+    /// nothing pointing at why.
+    pub pane_maximized: bool,
     history: VecDeque<String>,
     history_cursor: Option<usize>,
 }
@@ -706,8 +718,19 @@ impl ShellState {
             // resetting here.
             KeyCode::Char(':') => self.input = Some(String::new()),
             KeyCode::Char(' ') => self.detail_open = !self.detail_open,
-            KeyCode::Char('+' | '=') => self.zoom = self.zoom.zoom_in(),
-            KeyCode::Char('-' | '_') => self.zoom = self.zoom.zoom_out(),
+            // `Main` already has three zoom levels for this (`+`/`-` walk
+            // Layout <-> Grid <-> Focus); `Output`/`Log` get a plain
+            // maximize/restore toggle instead — same keys, same "bigger/
+            // smaller" mental model, no new bindings to learn
+            // (`docs/specs/open.md` Section F).
+            KeyCode::Char('+' | '=') => match self.region {
+                Region::Main => self.zoom = self.zoom.zoom_in(),
+                Region::Output | Region::Log => self.pane_maximized = true,
+            },
+            KeyCode::Char('-' | '_') => match self.region {
+                Region::Main => self.zoom = self.zoom.zoom_out(),
+                Region::Output | Region::Log => self.pane_maximized = false,
+            },
             // Layered, same shape `Esc` already had before zoom levels
             // existed (cancel input, *then* close detail): close the
             // detail pane first if it's open; only once it's closed (or
@@ -772,6 +795,11 @@ impl ShellState {
             (current + TOTAL - 1) % TOTAL
         };
         self.input = None;
+        // Any `Tab` press is navigating away from wherever `region`
+        // currently is — a maximized `Output`/`Log` left behind would
+        // just be stuck oversized with the newly-focused region unable
+        // to explain why (`pane_maximized`'s own docs).
+        self.pane_maximized = false;
         if next == COMMAND_BOX_STOP {
             self.input = Some(String::new());
             // Landing on the command box via the ring — unlike `:` (which
@@ -1611,6 +1639,49 @@ mod tests {
 
         state.handle_key(char_key('-'), &mut handler);
         assert_eq!(state.zoom, Zoom::Grid, "- from Focus lands on Grid");
+    }
+
+    #[test]
+    fn plus_maximizes_output_or_log_instead_of_touching_zoom() {
+        let mut state = ShellState {
+            region: Region::Output,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+
+        state.handle_key(char_key('+'), &mut handler);
+        assert!(state.pane_maximized);
+        assert_eq!(
+            state.zoom,
+            Zoom::Grid,
+            "+ on Output must not touch Main's zoom level"
+        );
+
+        state.handle_key(char_key('-'), &mut handler);
+        assert!(!state.pane_maximized);
+
+        state.region = Region::Log;
+        state.handle_key(char_key('='), &mut handler);
+        assert!(state.pane_maximized, "= is an alias for +, same as zoom");
+        state.handle_key(char_key('_'), &mut handler);
+        assert!(!state.pane_maximized, "_ is an alias for -");
+    }
+
+    #[test]
+    fn tabbing_away_from_a_maximized_pane_restores_it() {
+        let mut state = ShellState {
+            region: Region::Output,
+            pane_maximized: true,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Log);
+        assert!(
+            !state.pane_maximized,
+            "leaving a maximized pane must restore it, not leave it stuck oversized"
+        );
     }
 
     #[test]

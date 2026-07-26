@@ -19,7 +19,9 @@ pub mod shell;
 pub mod status_bar;
 pub mod theme;
 
-pub use command_bar::{draw_command_bar, LogFocus};
+pub use command_bar::{
+    command_bar_height, draw_command_bar, log_height, LogFocus, MAX_LOG_HEIGHT, MIN_LOG_HEIGHT,
+};
 pub use detail_view::{detail_height, draw_panel_detail, PanelDetail};
 pub use draw::{
     draw_chart, draw_gauge, draw_panel_outline, draw_stat, draw_table, series_as_table, PANEL_HINT,

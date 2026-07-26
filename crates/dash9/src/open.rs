@@ -54,17 +54,6 @@ const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
 const STATUS_BAR_HEIGHT: u16 = 1;
 const ZOOM_BAR_HEIGHT: u16 = 1;
-/// Reserved for the command bar (the command-echo log + input line)
-/// regardless of zoom level or dashboard size, so a large or
-/// `Zoom::Focus`-maximized main area never squeezes it to nothing
-/// (`docs/specs/session-layout.md` Section A.2's viewport-paging concern
-/// applies to the grid; the command bar needs its own floor for the same
-/// reason). `INPUT_HEIGHT` (`command_bar.rs`) plus a handful of log rows.
-/// The output pane (result text — `/help`, query results, …) and the
-/// Space-toggled detail pane each have their own separate, dynamic
-/// reservation (`output_height`/`detail_height`), not folded into this
-/// constant — see `draw_session`.
-const MIN_BAR_HEIGHT: u16 = 6;
 
 pub fn run(path: &Path, assist: bool) -> anyhow::Result<()> {
     if assist {
@@ -422,6 +411,77 @@ pub(crate) fn status_bar_for(
     }
 }
 
+/// `(grid, detail, output, bar)` heights for `draw_session`'s outer
+/// `Layout::vertical`, in that order — split out from `draw_session`
+/// itself purely to stay under `clippy::too_many_lines`, not because
+/// this logic is reusable elsewhere.
+///
+/// `Output`/`Log` maximize (`+`, `docs/specs/open.md` Section F) takes
+/// over the space `Main` normally gets — the direct parallel to
+/// `Zoom::Focus` doing the same for a single panel: grid and detail both
+/// go to `0` (`Main` is fully hidden while another region is maximized),
+/// and the maximized pane gets everything left after the *other* of
+/// `Output`/`Log` keeps its own normal small size (so it's still visible,
+/// just not dominant). `Main` itself has no maximize case here — it
+/// already owns `zoom` for the same purpose. Every other case (including
+/// editing, which doesn't change `region`) falls through to the shared
+/// default sizing: output first, then the command bar, then detail, then
+/// whatever's left to the grid — same order `draw_session` always used,
+/// just using `dash9_tui::command_bar_height` (precise) instead of the
+/// old `MIN_BAR_HEIGHT` floor.
+/// `focused_panel_thresholds` is just `session.panels.get(state.focused_panel)
+/// .map_or(0, |p| p.thresholds.len())` — passed in rather than a full
+/// `&LiveSession`/`&Session` so this stays a pure function of plain data,
+/// directly unit-testable (`tests::pane_heights_*` below) without needing
+/// a real `LiveSession` fixture (async pollers, datasources, ...) just to
+/// exercise sizing math that never touches any of that.
+fn pane_heights(
+    state: &ShellState,
+    focused_panel_thresholds: usize,
+    grids: &[dash9_core::GridSpec],
+    available: u16,
+) -> (u16, u16, u16, u16) {
+    match (state.region, state.pane_maximized) {
+        (Region::Output, true) => {
+            let bar = dash9_tui::command_bar_height(&state.log, available);
+            let output = available.saturating_sub(bar);
+            (0, 0, output, bar)
+        }
+        (Region::Log, true) => {
+            let output = output_height(&state.log, available);
+            let bar = available.saturating_sub(output);
+            (0, 0, output, bar)
+        }
+        _ => {
+            let output = output_height(&state.log, available);
+            let available_after_output = available.saturating_sub(output);
+
+            let bar = dash9_tui::command_bar_height(&state.log, available_after_output);
+            let available_after_bar = available_after_output.saturating_sub(bar);
+
+            // The detail pane (`Space`) is independent of zoom
+            // (`ShellState::detail_open` docs) — it never replaces the
+            // grid/layout/focus area above it, only takes space below
+            // it, so the chart(s) stay visible the whole time you're
+            // inspecting one.
+            let detail = if state.detail_open {
+                detail_height(focused_panel_thresholds, available_after_bar)
+            } else {
+                0
+            };
+            let available_for_grid = available_after_bar.saturating_sub(detail);
+
+            let grid = match state.zoom {
+                Zoom::Focus => available_for_grid,
+                Zoom::Grid | Zoom::Layout => {
+                    dash9_tui::content_height(grids).min(available_for_grid)
+                }
+            };
+            (grid, detail, output, bar)
+        }
+    }
+}
+
 fn draw_session(
     frame: &mut Frame,
     area: Rect,
@@ -439,39 +499,35 @@ fn draw_session(
     // never pushes any of them to nothing on a large or scrolled-open
     // dashboard — detail and output are reserved *before* the grid gets
     // whatever's left, not the grid stretching over them.
-    let reserved_fixed = STATUS_BAR_HEIGHT + ZOOM_BAR_HEIGHT + MIN_BAR_HEIGHT;
+    let reserved_fixed = STATUS_BAR_HEIGHT + ZOOM_BAR_HEIGHT;
     let available_after_fixed = area.height.saturating_sub(reserved_fixed);
 
-    let output_area_height = output_height(&state.log, available_after_fixed);
-    let available_after_output = available_after_fixed.saturating_sub(output_area_height);
+    let focused_panel_thresholds = session
+        .panels
+        .get(state.focused_panel)
+        .map_or(0, |p| p.thresholds.len());
+    let (grid_height, detail_area_height, output_area_height, bar_area_height) = pane_heights(
+        state,
+        focused_panel_thresholds,
+        &grids,
+        available_after_fixed,
+    );
 
-    // The detail pane (`i`) is independent of zoom (`ShellState::detail_open`
-    // docs) — it never replaces the grid/layout/focus area above it, only
-    // takes space below it, so the chart(s) stay visible the whole time
-    // you're inspecting one.
-    let detail_area_height = if state.detail_open {
-        let thresholds_len = session
-            .panels
-            .get(state.focused_panel)
-            .map_or(0, |p| p.thresholds.len());
-        detail_height(thresholds_len, available_after_output)
-    } else {
-        0
-    };
-    let available_for_grid = available_after_output.saturating_sub(detail_area_height);
-
-    let grid_height = match state.zoom {
-        Zoom::Focus => available_for_grid,
-        Zoom::Grid | Zoom::Layout => dash9_tui::content_height(&grids).min(available_for_grid),
-    };
-
-    let [status_area, zoom_area, grid_area, detail_area, output_area, bar_area] =
+    // Every constraint below is an exact `Length`, not a soaking `Min(0)`
+    // — deliberate, see `dash9_tui::MAX_LOG_HEIGHT`'s docs for the bug
+    // that shape used to cause (the log silently absorbing every leftover
+    // row on a short dashboard or tall terminal). Genuinely leftover
+    // space — everything already capped/sized and still not filling the
+    // terminal — becomes unlabeled blank space in `_spacer`, at the very
+    // bottom, rather than being attributed to any one pane.
+    let [status_area, zoom_area, grid_area, detail_area, output_area, bar_area, _spacer] =
         Layout::vertical([
             Constraint::Length(STATUS_BAR_HEIGHT),
             Constraint::Length(ZOOM_BAR_HEIGHT),
             Constraint::Length(grid_height),
             Constraint::Length(detail_area_height),
             Constraint::Length(output_area_height),
+            Constraint::Length(bar_area_height),
             Constraint::Min(0),
         ])
         .areas(area);
@@ -608,8 +664,24 @@ fn zoom_bar_model(
             }
             (zoom_name.to_string(), hint)
         }
-        Region::Output => ("Output".to_string(), OUTPUT_OR_LOG_HINT.to_string()),
-        Region::Log => ("Log".to_string(), OUTPUT_OR_LOG_HINT.to_string()),
+        Region::Output | Region::Log => {
+            let name = if state.region == Region::Output {
+                "Output"
+            } else {
+                "Log"
+            };
+            let hint = if state.pane_maximized {
+                format!("{OUTPUT_OR_LOG_HINT} · - restore")
+            } else {
+                format!("{OUTPUT_OR_LOG_HINT} · + maximize")
+            };
+            let name = if state.pane_maximized {
+                format!("{name} (maximized)")
+            } else {
+                name.to_string()
+            };
+            (name, hint)
+        }
     };
     let zoom_label = if state.detail_open {
         format!("{region_name} + detail")
@@ -853,4 +925,137 @@ fn draw_placeholder(
         show_hint.then_some(dash9_tui::PANEL_HINT),
     );
     frame.render_widget(Paragraph::new(message.to_string()).block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dash9_core::GridSpec;
+
+    /// Regression test for the real bug this session's changes fixed: an
+    /// earlier version gave the whole command bar an uncapped
+    /// `Constraint::Min(0)`, so it silently absorbed every leftover
+    /// terminal row — confirmed live, 17 blank rows on a 50-row terminal.
+    /// `bar`/`output` must stay at their small default sizes no matter
+    /// how much `available` space there is, with the difference going
+    /// nowhere in particular (an unlabeled spacer in `draw_session`, not
+    /// exercised here) rather than into the log.
+    #[test]
+    fn pane_heights_caps_output_and_bar_even_with_lots_of_available_space() {
+        let state = ShellState::default();
+        let (grid, detail, output, bar) = pane_heights(&state, 0, &[], 200);
+        assert_eq!(grid, 0, "empty dashboard: no panels to size");
+        assert_eq!(detail, 0, "detail closed by default");
+        assert_eq!(
+            output,
+            dash9_tui::MIN_OUTPUT_HEIGHT,
+            "empty output pane stays at its minimum, not 200"
+        );
+        assert_eq!(
+            bar,
+            dash9_tui::MIN_LOG_HEIGHT + 3,
+            "empty log stays at its minimum (+ the input line), not 200"
+        );
+    }
+
+    #[test]
+    fn pane_heights_output_maximized_takes_over_mains_space_log_stays_small() {
+        let mut state = ShellState::default();
+        state.region = Region::Output;
+        state.pane_maximized = true;
+        let (grid, detail, output, bar) = pane_heights(&state, 0, &[], 100);
+        assert_eq!(grid, 0, "Main is fully hidden while Output is maximized");
+        assert_eq!(detail, 0);
+        let expected_bar = dash9_tui::command_bar_height(&state.log, 100);
+        assert_eq!(bar, expected_bar, "log/input keep their normal small size");
+        assert_eq!(
+            output,
+            100 - expected_bar,
+            "output takes everything Main and the bar aren't using"
+        );
+    }
+
+    #[test]
+    fn pane_heights_log_maximized_takes_over_mains_space_output_stays_small() {
+        let mut state = ShellState::default();
+        state.region = Region::Log;
+        state.pane_maximized = true;
+        let (grid, detail, output, bar) = pane_heights(&state, 0, &[], 100);
+        assert_eq!(grid, 0, "Main is fully hidden while Log is maximized");
+        assert_eq!(detail, 0);
+        let expected_output = output_height(&state.log, 100);
+        assert_eq!(
+            output, expected_output,
+            "output keeps its normal small size"
+        );
+        assert_eq!(
+            bar,
+            100 - expected_output,
+            "the log takes everything Main and output aren't using"
+        );
+    }
+
+    #[test]
+    fn pane_heights_maximize_is_ignored_while_region_is_main() {
+        // `pane_maximized` is meaningless for `Main` (it has `zoom`
+        // instead) — a state where it's somehow `true` alongside
+        // `Region::Main` must still fall through to the default sizing,
+        // not be treated as some fourth maximize case.
+        let default_state = ShellState::default();
+        let mut quirky_state = ShellState::default();
+        quirky_state.pane_maximized = true;
+        assert_eq!(
+            pane_heights(&default_state, 0, &[], 80),
+            pane_heights(&quirky_state, 0, &[], 80),
+        );
+    }
+
+    #[test]
+    fn pane_heights_focus_zoom_gives_the_grid_the_whole_remaining_area() {
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Focus;
+        let (grid, _detail, output, bar) = pane_heights(&state, 0, &[], 50);
+        // Unlike Grid/Layout (capped to `content_height`), Focus claims
+        // everything left after output/bar, regardless of panel content.
+        assert_eq!(grid, 50 - output - bar);
+    }
+
+    #[test]
+    fn pane_heights_detail_open_reserves_space_computed_by_the_real_detail_height_fn() {
+        let mut state = ShellState::default();
+        state.detail_open = true;
+        // Empty `grids` (`content_height([]) == 0`) so `grid` isolates to
+        // exactly 0 regardless of leftover space, same as the dedicated
+        // Grid-zoom-capping test — this test's own focus is `detail`.
+        let (grid, detail, output, bar) = pane_heights(&state, 2, &[], 60);
+        let available_for_detail = 60 - output - bar;
+        assert_eq!(
+            detail,
+            detail_height(2, available_for_detail),
+            "must match the real detail_height computation, not a hardcoded number"
+        );
+        assert!(detail > 0, "2 thresholds must need some real space");
+        assert_eq!(grid, 0, "empty dashboard: content_height([]) is 0");
+    }
+
+    #[test]
+    fn pane_heights_grid_zoom_is_capped_to_content_height_not_all_available_space() {
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 4,
+        }];
+        let state = ShellState::default(); // Zoom::Grid by default
+        let (grid, _detail, output, bar) = pane_heights(&state, 0, &grids, 200);
+        let expected = dash9_tui::content_height(&grids);
+        assert_eq!(
+            grid, expected,
+            "Grid zoom must not stretch past its content height, unlike Focus"
+        );
+        assert!(
+            grid < 200 - output - bar,
+            "there must be real leftover space this doesn't claim"
+        );
+    }
 }
