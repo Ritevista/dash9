@@ -375,6 +375,7 @@ unmodified. Every other verb uses the tokenized grammar above.
 | `ds add` | `<name> <type> <url>` | 3 | `ds add prom prometheus http://localhost:9090` |
 | `ds list` | — | 0 | `ds list` |
 | `ds metrics` | `[name]` | 0 or 1 | `ds metrics prom` |
+| `ds metric` | `<name> [ds_name]` | 1 or 2 | `ds metric up prom` |
 | `q` | `<query>` (raw-tail, see B.2) | 1 | `q up{job="api"}` |
 | `panel type` | `<type>` | 1 | `panel type gauge` |
 | `panel threshold` | `<name> <op> <value>` | 3 | `panel threshold crit gte 95` |

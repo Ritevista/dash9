@@ -10,7 +10,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dash9_core::{Datasource, Frame, FrameKind, FrameMeta, Labels, Point, Series};
+use dash9_core::{Datasource, Frame, FrameKind, FrameMeta, Labels, MetricMetadata, Point, Series};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -120,6 +120,13 @@ impl Datasource for PrometheusDatasource {
     async fn label_names(&self) -> Result<Vec<String>, PrometheusError> {
         let body = self.get("/api/v1/labels", &[]).await?;
         parse_label_list_response(&body)
+    }
+
+    async fn metric_metadata(&self, name: &str) -> Result<Option<MetricMetadata>, PrometheusError> {
+        let body = self
+            .get("/api/v1/metadata", &[("metric", name.to_string())])
+            .await?;
+        parse_metadata_response(&body, name)
     }
 }
 
@@ -274,6 +281,55 @@ fn parse_label_list_response(body: &str) -> Result<Vec<String>, PrometheusError>
     let mut names = parsed.data.ok_or(PrometheusError::MissingData)?;
     names.sort();
     Ok(names)
+}
+
+/// `/api/v1/metadata?metric=<name>` — `data` maps metric name to a
+/// *list* of metadata entries (rare in practice for one metric queried
+/// by exact name, but the API always returns a list — different
+/// targets can in principle expose different `HELP` text for the same
+/// metric name), never absent for a `success` response: an *empty*
+/// object is how Prometheus reports "no such metric" here, distinct
+/// from `MissingData` (a malformed response missing the field
+/// entirely). The first entry is good enough for a one-line
+/// description (`docs/specs/open.md`'s `ds metric` doesn't need to
+/// reconcile conflicting `HELP` text across targets for v1).
+#[derive(Deserialize)]
+struct RawMetadataResponse {
+    status: String,
+    #[serde(default)]
+    data: Option<std::collections::HashMap<String, Vec<RawMetadataEntry>>>,
+    #[serde(rename = "errorType", default)]
+    error_type: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawMetadataEntry {
+    #[serde(rename = "type")]
+    metric_type: String,
+    help: String,
+}
+
+fn parse_metadata_response(
+    body: &str,
+    name: &str,
+) -> Result<Option<MetricMetadata>, PrometheusError> {
+    let parsed: RawMetadataResponse = serde_json::from_str(body)?;
+    if parsed.status != "success" {
+        return Err(PrometheusError::Api {
+            error_type: parsed.error_type.unwrap_or_default(),
+            message: parsed.error.unwrap_or_default(),
+        });
+    }
+    let data = parsed.data.ok_or(PrometheusError::MissingData)?;
+    Ok(data
+        .get(name)
+        .and_then(|entries| entries.first())
+        .map(|entry| MetricMetadata {
+            metric_type: entry.metric_type.clone(),
+            help: entry.help.clone(),
+        }))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -529,5 +585,43 @@ mod live_tests {
         let ds = PrometheusDatasource::new("prom", base_url);
         let names = ds.label_names().await.unwrap();
         assert_eq!(names, vec!["instance", "job"]);
+    }
+
+    #[tokio::test]
+    async fn metric_metadata_hits_the_http_api_and_returns_type_and_help() {
+        let body = r#"{"status":"success","data":{"up":[{"type":"gauge","help":"1 if the instance is up.","unit":""}]}}"#;
+        let base_url = respond_once(body).await;
+        let ds = PrometheusDatasource::new("prom", base_url);
+        let metadata = ds.metric_metadata("up").await.unwrap().unwrap();
+        assert_eq!(metadata.metric_type, "gauge");
+        assert_eq!(metadata.help, "1 if the instance is up.");
+    }
+
+    #[tokio::test]
+    async fn metric_metadata_is_none_for_a_metric_with_no_metadata() {
+        // Prometheus reports "no such metric" as a `success` response
+        // with an empty `data` object, not an error.
+        let body = r#"{"status":"success","data":{}}"#;
+        let base_url = respond_once(body).await;
+        let ds = PrometheusDatasource::new("prom", base_url);
+        let metadata = ds.metric_metadata("nonexistent_metric").await.unwrap();
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn parse_metadata_response_takes_the_first_entry_when_several_are_reported() {
+        let body = r#"{"status":"success","data":{"up":[
+            {"type":"gauge","help":"first"},
+            {"type":"gauge","help":"second"}
+        ]}}"#;
+        let metadata = parse_metadata_response(body, "up").unwrap().unwrap();
+        assert_eq!(metadata.help, "first");
+    }
+
+    #[test]
+    fn parse_metadata_response_propagates_an_api_error() {
+        let body = r#"{"status":"error","errorType":"bad_data","error":"boom"}"#;
+        let err = parse_metadata_response(body, "up").unwrap_err();
+        assert!(matches!(err, PrometheusError::Api { .. }), "{err}");
     }
 }
