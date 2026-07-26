@@ -454,6 +454,8 @@ it is assist-internal.
 | Verb | Blast radius | Execution |
 |---|---|---|
 | `ds list` | read-only (pure enumeration) | auto-run, renders immediately |
+| `ds metrics` | read-only (pure enumeration) | auto-run |
+| `ds metric` | read-only (pure enumeration) | auto-run |
 | `q` | read-only (executes a query, no state mutation) | auto-run |
 | `range` | read-only (current-session view only, no external/persistent effect) | auto-run |
 | `panel type` | read-only (current-session view only) | auto-run |

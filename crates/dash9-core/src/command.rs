@@ -20,6 +20,17 @@ pub enum Command {
     DsMetrics {
         name: Option<String>,
     },
+    /// Type and description for one specific metric on the given (or,
+    /// when omitted, the focused panel's) datasource — the singular
+    /// counterpart to `DsMetrics`' plural "list every name." Unlike
+    /// `DsMetrics`, the metric name comes first and is required
+    /// (there's nothing useful to describe without one); the
+    /// datasource name is the trailing optional argument, same
+    /// position/meaning it has everywhere else in the grammar.
+    DsMetric {
+        name: String,
+        datasource: Option<String>,
+    },
     /// Raw-tail: `query` is the remainder of the line verbatim, with
     /// no quote stripping (SPEC.md B.2).
     Q {
@@ -235,6 +246,24 @@ fn parse_ds(tokens: &[String]) -> Result<Command, CommandError> {
                 )),
             }
         }
+        "metric" => {
+            let args = &tokens[2..];
+            match args.len() {
+                1 => Ok(Command::DsMetric {
+                    name: args[0].clone(),
+                    datasource: None,
+                }),
+                2 => Ok(Command::DsMetric {
+                    name: args[0].clone(),
+                    datasource: Some(args[1].clone()),
+                }),
+                got => Err(CommandError::new(
+                    ErrorCode::E005,
+                    format!("\"ds metric\" expects 1 or 2 arguments (name, ds_name?), got {got}"),
+                    None,
+                )),
+            }
+        }
         other => Err(unknown_subverb("ds", other)),
     }
 }
@@ -430,6 +459,12 @@ pub const VERB_REFERENCE: &[VerbSpec] = &[
         description: "List every metric name the given (or focused panel's) datasource reports.",
     },
     VerbSpec {
+        verb: "ds metric",
+        args: &["name", "ds_name?"],
+        example: "ds metric up prom",
+        description: "Show one metric's type and description (\"HELP\" text) on the given (or focused panel's) datasource.",
+    },
+    VerbSpec {
         verb: "q",
         args: &["query"],
         example: r#"q up{job="api"}"#,
@@ -493,6 +528,7 @@ mod tests {
             Command::DsAdd { .. } => "ds add",
             Command::DsList => "ds list",
             Command::DsMetrics { .. } => "ds metrics",
+            Command::DsMetric { .. } => "ds metric",
             Command::Q { .. } => "q",
             Command::PanelType { .. } => "panel type",
             Command::PanelThreshold { .. } => "panel threshold",
@@ -526,6 +562,7 @@ mod tests {
             "ds add",
             "ds list",
             "ds metrics",
+            "ds metric",
             "q",
             "panel type",
             "panel threshold",
@@ -586,6 +623,40 @@ mod tests {
     #[test]
     fn ds_metrics_with_too_many_args_is_e005() {
         let err = parse("ds metrics prom extra").unwrap_err();
+        assert_eq!(err.code, ErrorCode::E005);
+    }
+
+    #[test]
+    fn ds_metric_requires_a_name() {
+        let err = parse("ds metric").unwrap_err();
+        assert_eq!(err.code, ErrorCode::E005);
+    }
+
+    #[test]
+    fn ds_metric_with_name_only_has_no_datasource() {
+        assert_eq!(
+            parse("ds metric up").unwrap(),
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ds_metric_with_name_and_datasource() {
+        assert_eq!(
+            parse("ds metric up prom").unwrap(),
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: Some("prom".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn ds_metric_with_too_many_args_is_e005() {
+        let err = parse("ds metric up prom extra").unwrap_err();
         assert_eq!(err.code, ErrorCode::E005);
     }
 

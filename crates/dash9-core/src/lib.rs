@@ -22,7 +22,7 @@ pub use dashboard::{
     ValidatedDatasource, ValidatedPanel, ValidatedThreshold, DEFAULT_TEST_LATENCY_BUDGET,
     GRID_COLUMNS,
 };
-pub use datasource::Datasource;
+pub use datasource::{Datasource, MetricMetadata};
 pub use duration::{Duration, DurationParseError, DurationUnit, RefreshInterval};
 pub use error::{CommandError, ErrorCode};
 pub use frame::{

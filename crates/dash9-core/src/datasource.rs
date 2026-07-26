@@ -53,4 +53,31 @@ pub trait Datasource: Sync {
     fn label_names(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send;
+
+    /// Type and description for one specific metric, when the
+    /// datasource has any (`ds metric <name>`, SPEC.md B.3) — `None`,
+    /// not an error, for a metric with no metadata (common for custom
+    /// or older exporters; not every metric ships a `HELP`/`TYPE`
+    /// line). Filtered by `name` at the adapter's own boundary rather
+    /// than fetching every metric's metadata and searching client-side
+    /// — cheap regardless of how many metrics the datasource has.
+    fn metric_metadata(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<Option<MetricMetadata>, Self::Error>> + Send;
+}
+
+/// One metric's type and human-readable description, datasource-agnostic
+/// the same way [`Frame`] is — Prometheus's `/api/v1/metadata` also
+/// reports a `unit` field, deliberately not carried here since nothing
+/// in `dash9 open` shows it yet (YAGNI; add it if/when something needs
+/// it, same as any other field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricMetadata {
+    /// e.g. `"counter"`, `"gauge"`, `"histogram"`, `"summary"`, or
+    /// `"unknown"` — whatever string the datasource itself reports,
+    /// not a closed `dash9-core` enum (a new Prometheus metric type
+    /// someday must never require a `dash9-core` release to display).
+    pub metric_type: String,
+    pub help: String,
 }

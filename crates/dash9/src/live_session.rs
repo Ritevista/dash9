@@ -21,8 +21,8 @@ use std::time::Duration as StdDuration;
 use dash9_core::{
     load_path, validate, validate_workspace_relative_path, Command, CommandError, DashboardFile,
     DashboardMeta, Datasource, DatasourceSpec, DatasourceType, Duration, ErrorCode, Frame,
-    GridSpec, LogLine, PanelSpec, PanelType, RefreshInterval, ThresholdSpec, ValidatedDashboard,
-    ValidatedThreshold,
+    GridSpec, LogLine, MetricMetadata, PanelSpec, PanelType, RefreshInterval, ThresholdSpec,
+    ValidatedDashboard, ValidatedThreshold,
 };
 use dash9_prom::PrometheusDatasource;
 use dash9_tui::{table_for_export, table_to_csv, table_to_markdown, ExportFormat};
@@ -46,6 +46,11 @@ pub enum SessionUpdate {
     DsMetrics {
         datasource: String,
         result: Result<Vec<String>, CommandError>,
+    },
+    DsMetric {
+        datasource: String,
+        metric: String,
+        result: Result<Option<MetricMetadata>, CommandError>,
     },
     Shell {
         command: String,
@@ -172,6 +177,17 @@ impl LiveSession {
             SessionUpdate::DsMetrics { datasource, result } => {
                 log.push(LogLine::Result(format_ds_metrics_result(
                     &datasource,
+                    result,
+                )));
+            }
+            SessionUpdate::DsMetric {
+                datasource,
+                metric,
+                result,
+            } => {
+                log.push(LogLine::Result(format_ds_metric_result(
+                    &datasource,
+                    &metric,
                     result,
                 )));
             }
@@ -331,6 +347,49 @@ impl LiveSession {
                 .await;
         });
         "ds metrics: fetching…".to_string()
+    }
+
+    /// `ds metric <name> [ds_name]` (SPEC.md B.3) — the singular
+    /// counterpart to `spawn_ds_metrics_query`'s plural "list every
+    /// name": type + description for exactly one metric. Datasource
+    /// resolution is identical to `spawn_ds_metrics_query` (explicit
+    /// name, or the focused panel's datasource) — deliberately, so the
+    /// two verbs behave the same way for the argument they share.
+    fn spawn_ds_metric_query(
+        &self,
+        focused_panel: usize,
+        metric: &str,
+        datasource: Option<String>,
+    ) -> String {
+        let target_name = if let Some(name) = datasource {
+            name
+        } else {
+            let Some(panel) = self.panels.get(focused_panel) else {
+                return no_panel_focused_error();
+            };
+            panel.datasource.clone()
+        };
+        let Some(ds) = self.datasources.get(&target_name) else {
+            return format!("{}: unknown datasource \"{target_name}\"", ErrorCode::E101);
+        };
+        let ds_name = target_name;
+        let adapter = Arc::clone(&ds.adapter);
+        let update_tx = self.update_tx.clone();
+        let metric_for_task = metric.to_string();
+        tokio::spawn(async move {
+            let result = adapter
+                .metric_metadata(&metric_for_task)
+                .await
+                .map_err(|err| CommandError::new(ErrorCode::E106, err.to_string(), None));
+            let _ = update_tx
+                .send(SessionUpdate::DsMetric {
+                    datasource: ds_name,
+                    metric: metric_for_task,
+                    result,
+                })
+                .await;
+        });
+        format!("ds metric {metric}: fetching…")
     }
 
     /// `!<command>` (`docs/specs/open.md` Section K). Runs `command`
@@ -597,15 +656,50 @@ fn default_export_path(panel_title: &str, format: ExportFormat) -> String {
     format!("exports/{slug}-{}.{}", epoch_ms_now(), format.extension())
 }
 
+/// One metric name per line, not comma-joined on a single line — the
+/// output pane's `Paragraph` has no `.wrap()` (`dash9_tui::output::
+/// draw_output`), so a single unbroken line just gets clipped at the
+/// pane's width, not wrapped: with a few hundred metrics (a realistic
+/// count for a real Prometheus instance, not the handful this codebase's
+/// own examples/tests use), everything past what fit in that one line
+/// was completely inaccessible — not even scrollable, since scrolling
+/// is line-based and there were only ever two lines of content
+/// (heading + one giant clipped line). Confirmed live. One-per-line
+/// matches `ds list`'s existing, already-correct convention, and now
+/// that the output pane scrolls and can be maximized
+/// (`docs/specs/open.md` Section F), a long list is fully readable
+/// instead of silently truncated.
 fn format_ds_metrics_result(datasource: &str, result: Result<Vec<String>, CommandError>) -> String {
     match result {
         Ok(names) if names.is_empty() => format!("ds metrics {datasource}: (no metrics)"),
         Ok(names) => format!(
             "ds metrics {datasource}: {} metrics\n{}",
             names.len(),
-            names.join(", ")
+            names.join("\n")
         ),
         Err(err) => format!("ds metrics {datasource}: {err}"),
+    }
+}
+
+/// `ds metric <name> [ds_name]` — type + `HELP` text for one metric, or
+/// a plain "(no metadata)" note when the datasource has none for it
+/// (common for custom/older exporters, not every metric ships one —
+/// `Datasource::metric_metadata`'s own docs). Deliberately terse (one
+/// line for type, one for the description) rather than trying to
+/// reproduce every field Prometheus's `/api/v1/metadata` reports —
+/// `MetricMetadata` itself already dropped `unit` for the same reason.
+fn format_ds_metric_result(
+    datasource: &str,
+    metric: &str,
+    result: Result<Option<MetricMetadata>, CommandError>,
+) -> String {
+    match result {
+        Ok(None) => format!("ds metric {datasource}/{metric}: (no metadata)"),
+        Ok(Some(metadata)) => format!(
+            "ds metric {datasource}/{metric}: {}\n{}",
+            metadata.metric_type, metadata.help
+        ),
+        Err(err) => format!("ds metric {datasource}/{metric}: {err}"),
     }
 }
 
@@ -745,6 +839,9 @@ pub fn execute_command(session: &mut LiveSession, focused_panel: usize, cmd: Com
             }
         }
         Command::DsMetrics { name } => session.spawn_ds_metrics_query(focused_panel, name),
+        Command::DsMetric { name, datasource } => {
+            session.spawn_ds_metric_query(focused_panel, &name, datasource)
+        }
         Command::Q { query } => session.spawn_ad_hoc_query(focused_panel, &query),
         Command::PanelType { panel_type } => {
             if session.panels.is_empty() {
@@ -1038,12 +1135,104 @@ mod tests {
         assert!(outcome.contains("fetching"), "{outcome}");
     }
 
+    #[tokio::test]
+    async fn ds_metric_unknown_datasource_is_e101() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: Some("bogus".to_string()),
+            },
+        );
+        assert!(outcome.contains("E101"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metric_bare_datasource_with_no_panels_reports_e103() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: None,
+            },
+        );
+        assert!(outcome.contains("E103"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metric_bare_datasource_uses_the_focused_panels_datasource_and_starts_fetching() {
+        let (mut session, _workspace) = session_with(vec![sample_panel("CPU")]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: None,
+            },
+        );
+        assert!(outcome.contains("fetching"), "{outcome}");
+        assert!(outcome.contains("up"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn ds_metric_named_known_datasource_starts_fetching() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let outcome = execute_command(
+            &mut session,
+            0,
+            Command::DsMetric {
+                name: "up".to_string(),
+                datasource: Some("prom".to_string()),
+            },
+        );
+        assert!(outcome.contains("fetching"), "{outcome}");
+    }
+
+    #[test]
+    fn format_ds_metric_result_shows_type_and_help() {
+        let text = format_ds_metric_result(
+            "prom",
+            "up",
+            Ok(Some(MetricMetadata {
+                metric_type: "gauge".to_string(),
+                help: "1 if the instance is up.".to_string(),
+            })),
+        );
+        assert!(text.contains("gauge"), "{text}");
+        assert!(text.contains("1 if the instance is up."), "{text}");
+    }
+
+    #[test]
+    fn format_ds_metric_result_with_no_metadata_says_so() {
+        let text = format_ds_metric_result("prom", "custom_metric", Ok(None));
+        assert!(text.contains("(no metadata)"), "{text}");
+    }
+
+    #[test]
+    fn format_ds_metric_result_with_an_error_reports_it() {
+        let text = format_ds_metric_result(
+            "prom",
+            "up",
+            Err(CommandError::new(ErrorCode::E106, "boom", None)),
+        );
+        assert!(text.contains("boom"), "{text}");
+    }
+
     #[test]
     fn format_ds_metrics_result_lists_names_and_count() {
         let text =
             format_ds_metrics_result("prom", Ok(vec!["up".to_string(), "node_load1".to_string()]));
         assert!(text.contains("2 metrics"), "{text}");
-        assert!(text.contains("up, node_load1"), "{text}");
+        // One name per line, not comma-joined on a single unwrapped
+        // line — regression test, see `format_ds_metrics_result`'s docs
+        // for why the comma-joined shape was a real bug (hundreds of
+        // metric names silently inaccessible, not just less readable).
+        assert!(text.contains("up\nnode_load1"), "{text}");
+        assert!(!text.contains("up, node_load1"), "{text}");
     }
 
     #[test]
