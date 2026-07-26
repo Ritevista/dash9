@@ -28,7 +28,7 @@ const MIN_CHART_WIDTH: u16 = 40;
 /// selection, `PageUp`/`PageDown` paging, `+`/`-` zoom) is region-level,
 /// not a property of any one panel, so it stays in the zoom bar instead
 /// of being repeated on every panel's border.
-pub const PANEL_HINT: &str = "i detail";
+pub const PANEL_HINT: &str = "space detail";
 
 /// Draws one timeseries panel into `area`. Falls back to
 /// [`ChartModel::render_text`] when the terminal is too narrow for an

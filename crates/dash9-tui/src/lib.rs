@@ -19,7 +19,7 @@ pub mod shell;
 pub mod status_bar;
 pub mod theme;
 
-pub use command_bar::draw_command_bar;
+pub use command_bar::{draw_command_bar, LogFocus};
 pub use detail_view::{detail_height, draw_panel_detail, PanelDetail};
 pub use draw::{
     draw_chart, draw_gauge, draw_panel_outline, draw_stat, draw_table, series_as_table, PANEL_HINT,
@@ -29,10 +29,12 @@ pub use layout::{
     content_height, ensure_visible, grid_layout, grid_layout_fit, grid_layout_scrolled,
     max_grid_scroll, panel_content_range,
 };
-pub use output::{draw_output, output_height, MAX_OUTPUT_HEIGHT, MIN_OUTPUT_HEIGHT};
+pub use output::{
+    draw_output, max_output_scroll, output_height, MAX_OUTPUT_HEIGHT, MIN_OUTPUT_HEIGHT,
+};
 pub use pane::pane_block;
 pub use shell::{
-    help_text, parse_shell_input, zoom_hint, CommandHandler, CommandResponse, ShellInput,
+    help_text, parse_shell_input, zoom_hint, CommandHandler, CommandResponse, Region, ShellInput,
     ShellState, Zoom,
 };
 pub use status_bar::{

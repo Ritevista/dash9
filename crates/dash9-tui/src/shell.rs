@@ -19,17 +19,31 @@
 //! starting with `/` is always a structured command (a shell
 //! meta-verb, or SPEC.md grammar via `dash9_core::parse`) —
 //! unrecognized text after `/` is a hard error, never silently
-//! retried as natural language. A line with **no** leading `/` is
+//! retried as natural language. A line starting with `!` always runs
+//! through the user's shell (`docs/specs/open.md` Section K), unrelated
+//! to SPEC.md's grammar. A line with **no** leading `/` or `!` is
 //! always natural language, even if it happens to look like valid
-//! grammar (`dash9_core::parse` is never called on it). `Tab`/
-//! `Shift+Tab` cycle through every panel and then into the command
-//! box itself (a `panel_count() + 1`-stop ring), so the command box
-//! is reachable without needing to already know about `:` — once
-//! inside and actively composing text, `Tab`/`Shift+Tab` no longer
-//! leave the box (only `Esc`/cancel or `Enter`/submit do), but they
-//! still cycle which panel is focused underneath without touching the
-//! buffer, so you can glance at another panel mid-command without
-//! losing what you've typed.
+//! grammar (`dash9_core::parse` is never called on it).
+//!
+//! Focus is one of four **regions** ([`Region`] — `Main` the panel
+//! grid/layout/focus area, `Output`, `Log` — plus editing the command
+//! box, `input.is_some()`, layered on top rather than a fifth `Region`
+//! variant since it's orthogonal, checked first, everywhere). `Tab`/
+//! `Shift+Tab` cycle forward/backward through all four, a fixed 4-stop
+//! ring regardless of panel count — Main is *one* stop, not one per
+//! panel, so a large dashboard doesn't need N `Tab` presses just to
+//! reach Output/Log/the command box. `1`-`9` (panel selection) only do
+//! anything when `region == Region::Main` — elsewhere they're inert,
+//! since "which panel" is meaningless outside the grid. The command
+//! box, once reached, doesn't lose focus on its own: `Enter` submits
+//! and immediately reopens an empty buffer (seamless back-to-back
+//! commands) — only `Tab`/`Shift+Tab` (deliberate navigation) or `Esc`
+//! (deliberate cancel) actually leave it. While editing, `Tab`/
+//! `Shift+Tab` still cycle which panel is focused underneath without
+//! leaving the box or touching the buffer, so you can glance at
+//! another panel's chart mid-command without losing what you've typed
+//! — this one is unaffected by the region ring above, it's a separate,
+//! narrower `panel_count()`-stop cycle over panels only.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -78,6 +92,12 @@ pub enum ShellInput {
     /// A line that started with `/` but didn't match any shell
     /// meta-verb or `dash9_core` grammar verb.
     CommandError(CommandError),
+    /// A line starting with `!` — everything after it is run through
+    /// the user's shell (`docs/specs/open.md` Section K), unrelated to
+    /// SPEC.md's command grammar. Checked before the `/` discriminator
+    /// (`parse_shell_input`), so `!`/`/`/plain-text are three mutually
+    /// exclusive leading-character cases, not a fallback chain.
+    Shell(String),
 }
 
 /// Shell-level meta-commands (`help`, `model`, `ai`, `save`, `quit`)
@@ -218,16 +238,20 @@ fn help_overview() -> String {
     }
     out.push_str(
         "\nNo leading / — the whole line goes to the AI as natural language \
-         (needs --assist and AI on).\n",
+         (needs --assist and AI on). Prefix with ! to run a shell command \
+         (e.g. !ls) — output appears in the output pane.\n",
     );
     out.push_str(
-        "Keys: Tab/Shift+Tab cycle panels + command box · 1-9 jump straight \
-         to a panel · : jump to command box (Esc cancels) · +/- zoom \
-         Layout/Grid/Focus (an enlarged single chart) · i toggle the \
-         focused panel's detail pane below the main area · Esc closes \
-         detail, then goes home to Grid · PageUp/PageDown page panels \
-         (Grid) or scroll the log (editing) · y/n confirm proposal · \
-         a toggle AI · q or Ctrl+C quit\n",
+        "Keys: Tab/Shift+Tab cycle Main (the panel grid), Output, Log, \
+         and the command box, one Tab per region regardless of panel \
+         count · 1-9 select a panel, only while Main has focus · : jump \
+         to command box (Enter submits and stays put — Esc is what \
+         leaves it) · +/- zoom Layout/Grid/Focus (an enlarged single \
+         chart) · Space toggle the focused panel's detail pane below \
+         the main area · Esc closes detail, then goes home to Grid · \
+         PageUp/PageDown page panels (Main + Grid zoom), scroll Output \
+         or Log (whichever has focus), or scroll the log (editing) · \
+         y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
     );
     out
 }
@@ -278,14 +302,21 @@ pub fn zoom_hint(zoom: Zoom) -> &'static str {
     }
 }
 
-/// Parses one submitted line. A leading `/` is the only thing that
-/// makes a line a structured command — everything after it must
-/// match a shell meta-verb or `dash9_core::parse`, or the result is
-/// [`ShellInput::CommandError`]. No leading `/` is always
-/// [`ShellInput::NaturalLanguage`], unconditionally — the text is
-/// never handed to `dash9_core::parse` at all.
+/// Parses one submitted line. Three mutually exclusive cases, decided
+/// by the first character alone, checked in this order: a leading `!`
+/// is always [`ShellInput::Shell`] (`docs/specs/open.md` Section K —
+/// the rest of the line runs through the user's shell, never
+/// `dash9_core::parse`); a leading `/` is a structured command —
+/// everything after it must match a shell meta-verb or
+/// `dash9_core::parse`, or the result is [`ShellInput::CommandError`];
+/// anything else is always [`ShellInput::NaturalLanguage`],
+/// unconditionally — the text is never handed to `dash9_core::parse`
+/// at all.
 pub fn parse_shell_input(text: &str) -> ShellInput {
     let trimmed = text.trim();
+    if let Some(command) = trimmed.strip_prefix('!') {
+        return ShellInput::Shell(command.trim().to_string());
+    }
     let Some(body) = trimmed.strip_prefix('/') else {
         return ShellInput::NaturalLanguage(trimmed.to_string());
     };
@@ -463,6 +494,32 @@ impl Zoom {
     }
 }
 
+/// Which of the three non-editing regions currently has `Tab`-focus
+/// (`docs/specs/open.md` Section E) — `Main` is the panel grid/layout/
+/// focus area as *one* stop, not one per panel, so a large dashboard
+/// doesn't cost N `Tab` presses to get past. Editing the command box is
+/// deliberately not a fourth variant here — it's orthogonal state
+/// (`ShellState.input.is_some()`), checked first everywhere a region
+/// would otherwise matter (`handle_key`'s `PageUp`/`PageDown` dispatch,
+/// digit-key gating). Entering it via `:` never touches `region` — a
+/// quick interrupt returns to wherever you were. Entering it via `Tab`
+/// (`advance_focus`) *does* set `region` to `Main` on the way in — not
+/// left alone the way `:` leaves it, on purpose: an earlier version left
+/// it untouched here too, which meant `Esc` bounced straight back to
+/// whichever region you `Tab`-ed in from (typically `Log`, the stop
+/// right before the command box), and the very next `Tab` just
+/// re-entered the box — an inescapable two-region loop, confirmed live,
+/// never reaching `Main`/`Output`. Setting `region` to `Main` (the
+/// stop right *after* the command box) when `Tab` lands there means
+/// `Esc` resumes the ring's forward progress instead of dead-ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Region {
+    #[default]
+    Main,
+    Output,
+    Log,
+}
+
 /// Pure shell state: the command-bar buffer, the session log, pending
 /// AI proposals awaiting `y`/`n`, and which panel has focus. No
 /// terminal, filesystem, or network access anywhere in this type.
@@ -484,7 +541,7 @@ pub struct ShellState {
     /// panel while zoomed in just follows — no separate "which panel"
     /// tracking needed.
     pub zoom: Zoom,
-    /// `i`-toggled config+data overlay (`PanelDetail`/`draw_panel_detail`)
+    /// Space-toggled config+data overlay (`PanelDetail`/`draw_panel_detail`)
     /// for whichever panel is currently focused — rendered in its own pane
     /// **below** the main area (grid/layout/focus), never in place of it,
     /// so the chart(s) stay visible the whole time you're inspecting one.
@@ -500,6 +557,20 @@ pub struct ShellState {
     /// layer additionally nudges it to keep the focused panel visible on
     /// `Tab` (Section B) without writing that nudge back here.
     pub grid_scroll: u16,
+    /// Which region has `Tab`-focus when not editing (`Region`'s own
+    /// docs). Independent of `zoom` the same way `detail_open` is: none
+    /// of `Main`/`Output`/`Log` ever changes which zoom level is active.
+    pub region: Region,
+    /// Lines scrolled down from the top of the output pane's current
+    /// text (0 = top) — the opposite anchor from `log_scroll` (which is
+    /// tail-anchored) since the output pane shows one long block of text
+    /// meant to be read top-to-bottom (a `/help` listing, a long `!`
+    /// command's output), not a running history read newest-first. Reset
+    /// to 0 whenever a new `Result` line arrives (`apply_response`) —
+    /// same reasoning `log_scroll`'s reset-on-submit has: a new result
+    /// should be read from its start, not wherever a stale scroll
+    /// position from the *previous* result happened to leave off.
+    pub output_scroll: usize,
     history: VecDeque<String>,
     history_cursor: Option<usize>,
 }
@@ -532,7 +603,23 @@ impl ShellState {
                 self.scroll_log(key.code);
                 return false;
             }
-            KeyCode::PageUp | KeyCode::PageDown if self.zoom == Zoom::Grid => {
+            // `Output`/`Log` region focus (`advance_focus`'s ring, `Region`'s
+            // docs) outranks zoom-level paging the same way editing does
+            // above — each is its own region, independent of which zoom
+            // level the main area happens to be showing. `Log`'s scroll
+            // reuses `scroll_log` — same tail-anchored pane, same behavior
+            // whether you got there by editing or by `Tab`-focusing it.
+            KeyCode::PageUp | KeyCode::PageDown if self.region == Region::Output => {
+                self.scroll_output(key.code);
+                return false;
+            }
+            KeyCode::PageUp | KeyCode::PageDown if self.region == Region::Log => {
+                self.scroll_log(key.code);
+                return false;
+            }
+            KeyCode::PageUp | KeyCode::PageDown
+                if self.region == Region::Main && self.zoom == Zoom::Grid =>
+            {
                 self.scroll_grid(key.code);
                 return false;
             }
@@ -550,12 +637,21 @@ impl ShellState {
                     self.input = None;
                     self.history_cursor = None;
                 }
+                // Deliberately never leaves the command box — only `Esc`
+                // (cancel) or `Tab`/`Shift+Tab` (navigate away) do (module
+                // docs). A non-empty submission reopens a fresh empty
+                // buffer right after, so a second command can be typed
+                // immediately without re-pressing `:` or `Tab`-ing back;
+                // an empty/whitespace-only line is already an implicit
+                // no-op (nothing submitted) and just gets the same fresh
+                // buffer.
                 KeyCode::Enter => {
                     let text = self.input.take().unwrap_or_default();
                     self.history_cursor = None;
-                    if !text.trim().is_empty() {
-                        return self.submit(&text, handler);
+                    if !text.trim().is_empty() && self.submit(&text, handler) {
+                        return true;
                     }
+                    self.input = Some(String::new());
                 }
                 KeyCode::Backspace => {
                     if let Some(buffer) = self.input.as_mut() {
@@ -604,8 +700,12 @@ impl ShellState {
                 return self.apply_response(response);
             }
             KeyCode::Char('q') => return true,
+            // Entering the command box never touches `region` — whichever
+            // of Main/Output/Log was current before `:` is still current
+            // once you leave it (`Region`'s docs), so nothing needs
+            // resetting here.
             KeyCode::Char(':') => self.input = Some(String::new()),
-            KeyCode::Char('i') => self.detail_open = !self.detail_open,
+            KeyCode::Char(' ') => self.detail_open = !self.detail_open,
             KeyCode::Char('+' | '=') => self.zoom = self.zoom.zoom_in(),
             KeyCode::Char('-' | '_') => self.zoom = self.zoom.zoom_out(),
             // Layered, same shape `Esc` already had before zoom levels
@@ -615,9 +715,15 @@ impl ShellState {
             // zoom. One press always does at most one thing.
             KeyCode::Esc if self.detail_open => self.detail_open = false,
             KeyCode::Esc => self.zoom = self.zoom.zoom_home(),
-            KeyCode::Tab => self.advance_focus(handler, true),
-            KeyCode::BackTab => self.advance_focus(handler, false),
-            KeyCode::Char(c @ '1'..='9') => self.focus_panel_by_number(c, handler),
+            KeyCode::Tab => self.advance_focus(true),
+            KeyCode::BackTab => self.advance_focus(false),
+            // Only meaningful within the Main region — "which panel" has
+            // no meaning while Output or Log has focus, so a digit is
+            // inert there instead of silently doing something to a panel
+            // you can't currently see highlighted anywhere.
+            KeyCode::Char(c @ '1'..='9') if self.region == Region::Main => {
+                self.focus_panel_by_number(c, handler);
+            }
             _ => {}
         }
         false
@@ -630,7 +736,9 @@ impl ShellState {
     /// empty dashboard) is a no-op rather than clamping to the last panel
     /// — silently landing on the wrong panel would be more surprising
     /// than nothing happening. Works in every zoom level, same as `Tab`
-    /// (`advance_focus` itself is never zoom-gated).
+    /// (`advance_focus` itself is never zoom-gated). Only reachable when
+    /// `region == Region::Main` already (the `handle_key` guard), so
+    /// there's nothing to reset here — `region` is already right.
     fn focus_panel_by_number<H: CommandHandler>(&mut self, digit: char, handler: &H) {
         let index = digit
             .to_digit(10)
@@ -641,26 +749,46 @@ impl ShellState {
         }
     }
 
-    /// Moves focus one step around the `panel_count() + 1`-stop ring
-    /// (every panel, then the command box, wrapping). Only called from
-    /// the non-editing branch of `handle_key` — while editing,
-    /// `cycle_focused_panel` (below) is the one Tab/BackTab reach
-    /// instead — so entering the command box here always starts a fresh
-    /// empty buffer; there's never an in-progress one to discard.
-    fn advance_focus<H: CommandHandler>(&mut self, handler: &H, forward: bool) {
-        let panel_count = handler.panel_count();
-        let total = panel_count + 1;
-        let current = self.focused_panel.min(panel_count.saturating_sub(1));
+    /// Moves focus one step around the fixed 4-stop ring: `Main`,
+    /// `Output`, `Log`, then the command box, wrapping — regardless of
+    /// panel count, since `Main` is one stop, not one per panel (see
+    /// `Region`'s docs for why). Only called from the non-editing branch
+    /// of `handle_key` — while editing, `cycle_focused_panel` (below) is
+    /// the one Tab/BackTab reach instead — so entering the command box
+    /// here always starts a fresh empty buffer; there's never an
+    /// in-progress one to discard.
+    fn advance_focus(&mut self, forward: bool) {
+        const RING: [Region; 3] = [Region::Main, Region::Output, Region::Log];
+        const COMMAND_BOX_STOP: usize = RING.len();
+        const TOTAL: usize = RING.len() + 1;
+
+        let current = RING
+            .iter()
+            .position(|r| *r == self.region)
+            .expect("region is always one of RING's variants");
         let next = if forward {
-            (current + 1) % total
+            (current + 1) % TOTAL
         } else {
-            (current + total - 1) % total
+            (current + TOTAL - 1) % TOTAL
         };
-        if next == panel_count {
+        self.input = None;
+        if next == COMMAND_BOX_STOP {
             self.input = Some(String::new());
+            // Landing on the command box via the ring — unlike `:` (which
+            // leaves `region` untouched, a quick interrupt that returns to
+            // wherever you were), Tab is continuing the cycle, so `region`
+            // advances too, straight to `Main` (`RING[0]`, the stop right
+            // after Command going forward). Without this, `region` stayed
+            // wherever it was before this Tab (e.g. `Log`), and since Tab
+            // never leaves the box while editing (only Esc/Enter do —
+            // `cycle_focused_panel` below), `Esc` would land right back on
+            // that same stale region — one more Tab would just re-enter
+            // the box. That's an inescapable Log<->Command loop, not a
+            // ring: confirmed live, this was a real dead end, not a
+            // hypothetical one.
+            self.region = Region::Main;
         } else {
-            self.input = None;
-            self.focused_panel = next;
+            self.region = RING[next];
         }
         self.history_cursor = None;
     }
@@ -726,6 +854,25 @@ impl ShellState {
         }
     }
 
+    /// Same top-anchored direction convention as `scroll_grid` (`PageDown`
+    /// grows the offset, revealing more of the content below) rather than
+    /// the log's tail-anchored one — the output pane shows one block of
+    /// text meant to be read top-to-bottom, not a history read
+    /// newest-first. Render-layer clamping (mirroring `grid_scroll`'s
+    /// `.min(max_grid_scroll(..))` pattern) keeps this from scrolling past
+    /// the actual content once a real terminal size is known.
+    fn scroll_output(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::PageDown => {
+                self.output_scroll = self.output_scroll.saturating_add(LOG_SCROLL_STEP);
+            }
+            KeyCode::PageUp => {
+                self.output_scroll = self.output_scroll.saturating_sub(LOG_SCROLL_STEP);
+            }
+            _ => unreachable!("only called for PageUp/PageDown"),
+        }
+    }
+
     fn submit<H: CommandHandler>(&mut self, text: &str, handler: &mut H) -> bool {
         self.log_scroll = 0;
         self.push_history(text.to_string());
@@ -740,6 +887,13 @@ impl ShellState {
     }
 
     fn apply_response(&mut self, response: CommandResponse) -> bool {
+        if response
+            .log_entries
+            .iter()
+            .any(|line| matches!(line, LogLine::Result(_)))
+        {
+            self.output_scroll = 0;
+        }
         self.log.extend(response.log_entries);
         self.pending_proposals.extend(response.new_proposals);
         self.trim_log();
@@ -848,8 +1002,14 @@ mod tests {
         }
     }
 
+    /// Only presses `:` if the box isn't already open — the command box
+    /// stays open after a submit now (`docs/specs/open.md` Section E), so
+    /// blindly pressing `:` on a second call would type a literal `:`
+    /// into the still-open buffer instead of doing nothing new.
     fn type_and_submit(state: &mut ShellState, handler: &mut MockHandler, text: &str) -> bool {
-        state.handle_key(char_key(':'), handler);
+        if state.input.is_none() {
+            state.handle_key(char_key(':'), handler);
+        }
         for c in text.chars() {
             state.handle_key(char_key(c), handler);
         }
@@ -912,29 +1072,123 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_every_panel_then_reaches_the_command_box_and_stays_put() {
+    fn tab_cycles_main_output_log_then_reaches_the_command_box_regardless_of_panel_count() {
+        // A dashboard with many panels must still take exactly one Tab to
+        // leave Main — the whole point of the fixed 4-stop ring (Region's
+        // docs) is that panel count never affects how many Tabs it takes
+        // to reach Output/Log/the command box.
         let mut state = ShellState::default();
-        let mut handler = MockHandler::new(3);
+        let mut handler = MockHandler::new(50);
+
+        assert_eq!(state.region, Region::Main);
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert_eq!(state.focused_panel, 1);
+        assert_eq!(state.region, Region::Output, "one Tab leaves Main");
         assert!(state.input.is_none());
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert_eq!(state.focused_panel, 2);
+        assert_eq!(state.region, Region::Log);
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
         assert!(
             state.input.is_some(),
-            "the 4th Tab (past the last of 3 panels) reaches the command box"
+            "the 4th Tab (past Main, Output, Log) reaches the command box"
         );
 
         // Further Tabs, now that editing has started, must not leave
-        // the command box — only Esc/Enter do that. They still cycle
-        // which panel is focused underneath, though (see
-        // `tab_and_backtab_while_editing_cycle_panel_focus_without_losing_the_buffer`).
+        // the command box — only Esc does that (or Enter submitting,
+        // which reopens it immediately — see
+        // `enter_never_leaves_the_command_box_even_after_a_real_submit`).
+        // They still cycle which panel is focused underneath, though
+        // (`tab_and_backtab_while_editing_cycle_panel_focus_without_losing_the_buffer`).
         state.handle_key(press(KeyCode::Tab), &mut handler);
         assert!(state.input.is_some(), "Tab does not leave the command box");
+    }
+
+    /// Regression test: reaching the command box via `Tab` and then
+    /// cancelling used to return to whichever region was current *before*
+    /// that `Tab` (e.g. `Log`) — but `Tab` never leaves the box while
+    /// editing (only `Esc`/`Enter` do), so the very next `Tab` after that
+    /// `Esc` just re-entered the box again. `Tab` → `Esc` → `Tab` → `Esc`
+    /// looped between `Log` and the command box forever, never reaching
+    /// `Main`/`Output` — confirmed live, a genuine dead end, not
+    /// hypothetical. Fixed: landing on the command box *via the ring*
+    /// advances `region` to `Main` (the next stop, continuing the cycle),
+    /// so `Esc` from there resumes forward progress instead of bouncing
+    /// back to a stop that only leads right back to the box.
+    #[test]
+    fn cancelling_out_of_a_tab_reached_command_box_continues_the_ring_to_main() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(3);
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Log -> command box
+        assert!(state.input.is_some());
+
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert!(state.input.is_none());
+        assert_eq!(
+            state.region,
+            Region::Main,
+            "Esc must continue the ring to Main, not bounce back to Log"
+        );
+
+        // And the ring keeps working from here — no dead end.
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Output);
+    }
+
+    /// The other entry path (`:`, bypassing Tab entirely) is unaffected —
+    /// it's a quick interrupt, not ring navigation, so cancelling out of
+    /// it must still return to exactly where you were.
+    #[test]
+    fn cancelling_out_of_a_colon_reached_command_box_returns_to_the_same_region() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(3);
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
+        assert_eq!(state.region, Region::Log);
+
+        state.handle_key(char_key(':'), &mut handler);
+        assert!(state.input.is_some());
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert_eq!(
+            state.region,
+            Region::Log,
+            "`:` doesn't advance the ring, so Esc returns to the same region"
+        );
+    }
+
+    /// Deterministic end-to-end guard for the same bug: driving `Tab`
+    /// (cancelling out with `Esc` whenever it lands on the command box)
+    /// repeatedly must trace out full `Main -> Output -> Log -> Command`
+    /// cycles indefinitely, never repeating the same two regions forever.
+    #[test]
+    fn repeated_tab_and_cancel_completes_full_cycles_without_getting_stuck() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        let mut regions = Vec::new();
+        for _ in 0..8 {
+            state.handle_key(press(KeyCode::Tab), &mut handler);
+            if state.input.is_some() {
+                state.handle_key(press(KeyCode::Esc), &mut handler);
+            }
+            regions.push(state.region);
+        }
+        assert_eq!(
+            regions,
+            vec![
+                Region::Output,
+                Region::Log,
+                Region::Main,
+                Region::Output,
+                Region::Log,
+                Region::Main,
+                Region::Output,
+                Region::Log,
+            ],
+            "two full cycles, always making forward progress: {regions:?}"
+        );
     }
 
     #[test]
@@ -1049,6 +1303,153 @@ mod tests {
     }
 
     #[test]
+    fn tab_on_an_empty_dashboard_still_reaches_output_and_log_before_the_command_box() {
+        // Main being empty of panels doesn't change the ring at all — it's
+        // still exactly one Tab per region, panel count never enters into
+        // it (`Region`'s docs).
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(0);
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Output);
+        assert!(state.input.is_none());
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Log);
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert!(state.input.is_some());
+    }
+
+    #[test]
+    fn digit_keys_are_inert_outside_main_and_never_change_region() {
+        // "Which panel" has no meaning while Output or Log has focus — a
+        // digit press there must do nothing at all, not fall back to
+        // jumping a panel and silently switching back to Main.
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(5);
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Output);
+
+        state.handle_key(char_key('3'), &mut handler);
+        assert_eq!(
+            state.region,
+            Region::Output,
+            "digit press must not implicitly return focus to Main"
+        );
+        assert_eq!(
+            state.focused_panel, 0,
+            "and must not change which panel is remembered as focused"
+        );
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Log);
+        state.handle_key(char_key('2'), &mut handler);
+        assert_eq!(state.region, Region::Log, "same for Log");
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn digit_key_works_normally_once_back_on_main() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(5);
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Log -> command box
+        state.handle_key(press(KeyCode::Esc), &mut handler); // cancel — ring continues to Main
+
+        assert_eq!(state.region, Region::Main);
+        state.handle_key(char_key('3'), &mut handler);
+        assert_eq!(state.focused_panel, 2, "digits work again once on Main");
+    }
+
+    #[test]
+    fn output_region_is_reachable_via_tab() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Output);
+    }
+
+    #[test]
+    fn log_region_is_reachable_via_tab_and_scrolls_with_page_up_down() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
+        assert_eq!(state.region, Region::Log);
+
+        assert!(!state.handle_key(press(KeyCode::PageUp), &mut handler));
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+        assert_eq!(
+            state.grid_scroll, 0,
+            "Log focus must not also page the grid"
+        );
+        assert_eq!(state.output_scroll, 0, "or scroll the output pane");
+    }
+
+    #[test]
+    fn page_up_and_page_down_scroll_output_when_output_region_is_focused() {
+        let mut state = ShellState {
+            region: Region::Output,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+
+        assert!(!state.handle_key(press(KeyCode::PageDown), &mut handler));
+        assert_eq!(state.output_scroll, LOG_SCROLL_STEP);
+        assert_eq!(
+            state.grid_scroll, 0,
+            "output focus must not also page the grid"
+        );
+
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.output_scroll, 0);
+    }
+
+    #[test]
+    fn output_scroll_saturates_instead_of_underflowing() {
+        let mut state = ShellState {
+            region: Region::Output,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.output_scroll, 0);
+    }
+
+    #[test]
+    fn a_new_result_resets_output_scroll_to_the_top() {
+        let mut state = ShellState {
+            output_scroll: 40,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        handler.next_response = Some(CommandResponse::result("fresh result"));
+        type_and_submit(&mut state, &mut handler, "/range 5m");
+        assert_eq!(state.output_scroll, 0);
+    }
+
+    #[test]
+    fn editing_still_scrolls_the_log_even_if_output_region_was_focused_before_entering_it() {
+        // `region` is untouched by entering the command box (`Region`'s
+        // docs), so this guards the dispatch order directly: editing
+        // (`input.is_some()`) must outrank `region` in the PageUp/PageDown
+        // match, never misrouted to `scroll_output` just because `region`
+        // still says `Output` underneath.
+        let mut state = ShellState {
+            region: Region::Output,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(press(KeyCode::PageUp), &mut handler);
+        assert_eq!(state.log_scroll, LOG_SCROLL_STEP);
+        assert_eq!(state.output_scroll, 0);
+    }
+
+    #[test]
     fn page_up_and_page_down_while_editing_adjust_log_scroll_and_never_quit() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
@@ -1135,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn i_toggles_detail_open_and_types_a_literal_i_while_editing() {
+    fn space_toggles_detail_open_and_types_a_literal_space_while_editing() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(1);
         assert!(!state.detail_open);
@@ -1145,17 +1546,32 @@ mod tests {
             "opening detail must not change zoom — it renders below the main area, not in place of it"
         );
 
-        state.handle_key(char_key('i'), &mut handler);
+        state.handle_key(char_key(' '), &mut handler);
         assert!(state.detail_open);
-        assert_eq!(state.zoom, Zoom::Grid, "zoom is untouched by i");
+        assert_eq!(state.zoom, Zoom::Grid, "zoom is untouched by Space");
 
         state.handle_key(char_key(':'), &mut handler);
-        state.handle_key(char_key('i'), &mut handler);
+        state.handle_key(char_key(' '), &mut handler);
         assert!(
             state.detail_open,
-            "typing 'i' in the buffer must not toggle it"
+            "typing a space in the buffer must not toggle it"
         );
-        assert_eq!(state.input.as_deref(), Some("i"));
+        assert_eq!(state.input.as_deref(), Some(" "));
+    }
+
+    /// Regression guard: `i` was the detail-toggle key before it was
+    /// switched to Space (`docs/specs/open.md` Section E) — it must now
+    /// be inert outside the command box, not silently still toggle
+    /// detail alongside Space.
+    #[test]
+    fn i_no_longer_toggles_detail() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key('i'), &mut handler);
+        assert!(
+            !state.detail_open,
+            "i must be inert outside the command box now that Space is the detail-toggle key"
+        );
     }
 
     #[test]
@@ -1166,9 +1582,12 @@ mod tests {
                 ..ShellState::default()
             };
             let mut handler = MockHandler::new(1);
-            state.handle_key(char_key('i'), &mut handler);
-            assert!(state.detail_open, "{zoom:?} should still let i open detail");
-            assert_eq!(state.zoom, zoom, "{zoom:?} zoom must not change from i");
+            state.handle_key(char_key(' '), &mut handler);
+            assert!(
+                state.detail_open,
+                "{zoom:?} should still let Space open detail"
+            );
+            assert_eq!(state.zoom, zoom, "{zoom:?} zoom must not change from Space");
         }
     }
 
@@ -1284,6 +1703,76 @@ mod tests {
         assert_eq!(state.log.len(), 2, "one Command line, one Result line");
     }
 
+    /// Regression test: the command box used to lose focus on every
+    /// submit — after `Enter`, `input` became `None`, so a second command
+    /// needed either `:` again or Tab-cycling all the way back around the
+    /// ring (`docs/specs/open.md` Section E). Fixed so `Enter` reopens an
+    /// empty buffer immediately instead.
+    #[test]
+    fn enter_never_leaves_the_command_box_even_after_a_real_submit() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        handler.next_response = Some(CommandResponse::result("range set to 5m"));
+
+        type_and_submit(&mut state, &mut handler, "/range 5m");
+        assert_eq!(
+            state.input.as_deref(),
+            Some(""),
+            "Enter must reopen an empty buffer, not leave the command box"
+        );
+    }
+
+    /// Same regression, exercised the way a user actually hits it: two
+    /// commands typed back to back with only one `:` press, no Tab or
+    /// re-pressing `:` in between.
+    #[test]
+    fn back_to_back_commands_work_without_re_pressing_colon_or_tab() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        handler.next_response = Some(CommandResponse::result("range set to 5m"));
+
+        state.handle_key(char_key(':'), &mut handler);
+        for c in "/range 5m".chars() {
+            state.handle_key(char_key(c), &mut handler);
+        }
+        state.handle_key(press(KeyCode::Enter), &mut handler);
+        assert_eq!(handler.calls.len(), 1);
+
+        handler.next_response = Some(CommandResponse::result("refresh set to 10s"));
+        for c in "/refresh 10s".chars() {
+            state.handle_key(char_key(c), &mut handler);
+        }
+        state.handle_key(press(KeyCode::Enter), &mut handler);
+        assert_eq!(
+            handler.calls.len(),
+            2,
+            "second command must reach the handler without any Tab/: in between"
+        );
+        assert!(matches!(
+            handler.calls[1],
+            ShellInput::Grammar(Command::Refresh { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_enter_also_keeps_the_command_box_open() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(press(KeyCode::Enter), &mut handler);
+        assert_eq!(state.input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn esc_is_still_the_way_to_actually_leave_the_command_box() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(1);
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('x'), &mut handler);
+        state.handle_key(press(KeyCode::Esc), &mut handler);
+        assert!(state.input.is_none(), "Esc, unlike Enter, leaves the box");
+    }
+
     #[test]
     fn text_without_a_leading_slash_is_always_natural_language() {
         let mut state = ShellState::default();
@@ -1293,6 +1782,24 @@ mod tests {
             handler.calls[0],
             ShellInput::NaturalLanguage("please rename this".to_string())
         );
+    }
+
+    #[test]
+    fn bang_prefix_is_always_shell_checked_before_slash_and_natural_language() {
+        assert_eq!(
+            parse_shell_input("!ls -la"),
+            ShellInput::Shell("ls -la".to_string())
+        );
+        // Leading/trailing whitespace around the command is trimmed,
+        // same as every other `parse_shell_input` case.
+        assert_eq!(
+            parse_shell_input("  !  echo hi  "),
+            ShellInput::Shell("echo hi".to_string())
+        );
+        // A bare `!` (no command text) is still `Shell`, just with an
+        // empty command — the handler decides what an empty shell
+        // command means, not the parser.
+        assert_eq!(parse_shell_input("!"), ShellInput::Shell(String::new()));
     }
 
     #[test]
@@ -1465,7 +1972,8 @@ mod tests {
         type_and_submit(&mut state, &mut handler, "/range 1h");
         type_and_submit(&mut state, &mut handler, "/range 2h");
 
-        state.handle_key(char_key(':'), &mut handler);
+        // The box is already open (sticky post-submit) — no `:` needed.
+        assert!(state.input.is_some());
         state.handle_key(press(KeyCode::Up), &mut handler);
         assert_eq!(
             state.input.as_deref(),

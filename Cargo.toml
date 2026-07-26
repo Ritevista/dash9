@@ -23,6 +23,7 @@ dash9-tui = { path = "crates/dash9-tui" }
 
 anyhow = "1.0.98"
 assert_cmd = "2.0.17"
+base64 = "0.22.1"
 clap = { version = "4.5.40", features = ["derive"] }
 crossterm = "0.29.0"
 predicates = "3.1.3"

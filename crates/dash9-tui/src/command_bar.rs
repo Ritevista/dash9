@@ -6,16 +6,35 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use dash9_core::{CommandSource, LogLine, SessionLogEntry};
 
+use crate::pane::pane_block;
 use crate::theme;
 
 /// Rows reserved for the input line's own bordered block (1 content
 /// row + top/bottom border).
 const INPUT_HEIGHT: u16 = 3;
+
+/// Bottom-left border hint shown only when the log has `Tab`-focus and
+/// isn't itself shadowed by command-box editing — same `focused &&
+/// !editing` gating every other pane's hint uses (`docs/specs/open.md`
+/// Section G.2), and the same hint text `output::draw_output` shows for
+/// the same reason: both panes share the same scroll mechanism.
+const LOG_HINT: &str = "PageUp/PageDown scroll";
+
+/// The log's own `Region::Log` chrome (`docs/specs/open.md` Section E) —
+/// bundled into one struct, not two more loose `bool` params on
+/// `draw_command_bar`, purely to stay under `clippy::too_many_arguments`;
+/// same shared-pane convention (`focused`/`show_hint`) every other
+/// bordered area uses.
+#[derive(Debug, Clone, Copy)]
+pub struct LogFocus {
+    pub focused: bool,
+    pub show_hint: bool,
+}
 
 /// Draws the scrollable command log (above) and the command-bar input
 /// line (below) into `area`. The log here is command *echoes* only
@@ -38,21 +57,27 @@ pub fn draw_command_bar(
     input: Option<&str>,
     hint: &str,
     scroll: usize,
+    log_focus: LogFocus,
 ) {
     let [log_area, input_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(INPUT_HEIGHT)]).areas(area);
 
-    draw_log(frame, log_area, log, scroll);
+    draw_log(frame, log_area, log, scroll, log_focus);
     draw_input(frame, input_area, input, hint);
 }
 
-fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize) {
+fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize, log_focus: LogFocus) {
     let title = if scroll > 0 {
         "log (scrolled — PageDown to catch up)"
     } else {
         "log"
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = pane_block(
+        title,
+        log_focus.focused,
+        None,
+        log_focus.show_hint.then_some(LOG_HINT),
+    );
 
     // Command text is realistically always one line, but the window is
     // still computed over actual rendered lines rather than entry count
@@ -104,11 +129,16 @@ fn format_command_line(entry: &SessionLogEntry) -> String {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>, hint: &str) {
+    let focused = input.is_some();
     let (text, style) = match input {
         Some(buffer) => (format!(": {buffer}"), Style::default().fg(theme::FOCUS)),
         None => (hint.to_string(), Style::default().fg(theme::MUTED)),
     };
-    let block = Block::default().borders(Borders::ALL);
+    // "command" gets the same shared pane chrome as every other region
+    // (`docs/specs/open.md` Section E) — no separate hint text here, the
+    // input line's own contents already say what's happening (the `:
+    // <buffer>` prompt while editing, the passed-in `hint` otherwise).
+    let block = pane_block("command", focused, None, None);
     frame.render_widget(Paragraph::new(text).style(style).block(block), area);
 }
 
@@ -122,11 +152,26 @@ mod tests {
         Terminal::new(TestBackend::new(width, height)).unwrap()
     }
 
+    const UNFOCUSED: LogFocus = LogFocus {
+        focused: false,
+        show_hint: false,
+    };
+
     #[test]
     fn empty_log_draws_without_panicking() {
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &[], None, "press : to enter a command", 0))
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &[],
+                    None,
+                    "press : to enter a command",
+                    0,
+                    UNFOCUSED,
+                );
+            })
             .unwrap();
     }
 
@@ -143,7 +188,17 @@ mod tests {
         let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &log, None, "press : to enter a command", 0))
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &log,
+                    None,
+                    "press : to enter a command",
+                    0,
+                    UNFOCUSED,
+                );
+            })
             .unwrap();
     }
 
@@ -152,7 +207,17 @@ mod tests {
         let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
         let mut terminal = backend(60, 10);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &log, None, "press : to enter a command", 20))
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &log,
+                    None,
+                    "press : to enter a command",
+                    20,
+                    UNFOCUSED,
+                );
+            })
             .unwrap();
     }
 
@@ -177,6 +242,7 @@ mod tests {
                     Some("range 1"),
                     "press : to enter a command",
                     0,
+                    UNFOCUSED,
                 );
             })
             .unwrap();
@@ -203,7 +269,7 @@ mod tests {
         let mut terminal = backend(60, 10);
         terminal
             .draw(|f| {
-                draw_command_bar(f, Rect::new(0, 0, 0, 0), &[], None, "hint", 0);
+                draw_command_bar(f, Rect::new(0, 0, 0, 0), &[], None, "hint", 0, UNFOCUSED);
             })
             .unwrap();
     }
@@ -222,7 +288,7 @@ mod tests {
             .collect();
         let mut terminal = backend(60, 8);
         terminal
-            .draw(|f| draw_command_bar(f, f.area(), &log, None, "hint", 0))
+            .draw(|f| draw_command_bar(f, f.area(), &log, None, "hint", 0, UNFOCUSED))
             .unwrap();
         let content: String = terminal
             .backend()
@@ -259,5 +325,68 @@ mod tests {
     #[test]
     fn visible_window_when_everything_fits_shows_all_of_it() {
         assert_eq!(visible_window(3, 10, 0), 0..3);
+    }
+
+    #[test]
+    fn focused_log_shows_the_scroll_hint_only_when_show_hint_is_true() {
+        let log = vec![command_line("range 5m")];
+        let mut terminal = backend(60, 10);
+        terminal
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &log,
+                    None,
+                    "hint",
+                    0,
+                    LogFocus {
+                        focused: true,
+                        show_hint: true,
+                    },
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("scroll"), "{content}");
+    }
+
+    #[test]
+    fn focused_but_editing_log_shows_no_scroll_hint() {
+        let log = vec![command_line("range 5m")];
+        let mut terminal = backend(60, 10);
+        terminal
+            .draw(|f| {
+                draw_command_bar(
+                    f,
+                    f.area(),
+                    &log,
+                    None,
+                    "hint",
+                    0,
+                    LogFocus {
+                        focused: true,
+                        show_hint: false,
+                    },
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.contains("scroll"),
+            "focused-but-editing must not claim the scroll hint: {content}"
+        );
     }
 }

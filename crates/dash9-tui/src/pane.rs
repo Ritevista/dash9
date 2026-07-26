@@ -90,12 +90,12 @@ mod tests {
             "CPU Usage",
             true,
             Some(("● ok".to_string(), theme::SUCCESS)),
-            Some("i detail"),
+            Some("space detail"),
         );
         let content = render(block, 40, 5);
         assert!(content.contains("CPU Usage"));
         assert!(content.contains("ok"));
-        assert!(content.contains("i detail"));
+        assert!(content.contains("space detail"));
     }
 
     #[test]

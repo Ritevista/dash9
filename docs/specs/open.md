@@ -14,7 +14,7 @@ Status: **Accepted** — every behavior below is implemented and has
 unit or integration coverage
 (`crates/dash9-tui/src/{shell,layout,pane,output}.rs`,
 `crates/dash9-tui/src/{detail_view,status_bar,command_bar,draw}.rs`,
-`crates/dash9/src/{open,live_session,log_recorder}.rs`). Prerequisites:
+`crates/dash9/src/{open,live_session,log_recorder,selection}.rs`). Prerequisites:
 `SPEC.md` (grammar, error codes, dashboard schema), `docs/architecture/rendering.md`.
 This spec does not cover the `--assist` flag's AI behavior (context
 assembly, the contract loop, the LLM client) — that is
@@ -39,7 +39,9 @@ png`) is not — Section I below still accurately says so.
 - [H. Status bar](#h-status-bar)
 - [I. Panel export (`/save`)](#i-panel-export-save)
 - [J. Continuous log recording (`/record`)](#j-continuous-log-recording-record)
-- [K. Non-goals](#k-non-goals)
+- [K. Shell command execution (`!`)](#k-shell-command-execution)
+- [L. Mouse selection and clipboard copy](#l-mouse-selection-and-clipboard-copy)
+- [M. Non-goals](#m-non-goals)
 
 ---
 
@@ -83,13 +85,16 @@ separate copy for each view.
 ## C. Input routing
 
 The command bar has exactly one discriminator for what a submitted
-line means, decided before anything else: a leading `/`.
+line means, decided before anything else: its leading character —
+`!`, `/`, or neither.
 
+- A line starting with `!` always runs through the user's shell
+  (Section K) — unrelated to `SPEC.md`'s grammar, and checked first.
 - A line starting with `/` is always a **structured command**: a shell
   meta-command (Section D) or `SPEC.md` grammar via `dash9_core::parse`.
   Text after `/` that matches neither is a hard error (`E002`/`E003`,
   `SPEC.md` B.5) — it is never silently retried as natural language.
-- A line with **no** leading `/` is always **natural language**,
+- A line with **no** leading `!` or `/` is always **natural language**,
   unconditionally — even if it happens to parse as valid grammar
   (`range 5m` with no `/` is sent as natural language, not executed).
   It is handed to the assistant only when the session has `--assist`
@@ -139,20 +144,50 @@ unavailable rather than treating them as unknown commands. Full
 assistant behavior (context assembly, the contract loop, proposal
 classification) is `docs/specs/assist.md`.
 
-## E. Keybindings
+## E. Focus regions, and keybindings
+
+Focus is one of four **regions** (`dash9_tui::shell::Region` — `Main`
+the panel grid/layout/focus area, `Output`, `Log` — plus editing the
+command box, layered on top rather than a fourth `Region` variant since
+it's orthogonal and always checked first). `Tab`/`Shift+Tab` cycle
+forward/backward through all four, a **fixed 4-stop ring regardless of
+panel count** — `Main` is *one* stop, not one per panel. This is a
+deliberate simplification over an earlier design where `Tab` walked
+every panel individually before ever reaching Output/the command box —
+on a large, real-world (e.g. imported Grafana) dashboard that meant
+dozens of `Tab` presses just to leave the grid. Digit keys (`1`-`9`)
+still select a specific panel, but only mean anything once you're
+*on* `Main` — see the table below.
+
+Reaching the command box via `:` doesn't cost you anywhere you were:
+`region` is untouched, so cancelling with `Esc` returns to exactly
+wherever you were. Reaching it via `Tab` is different, deliberately:
+`region` advances to `Main` right then, as part of the ring step, not
+left alone the way `:` leaves it. **This was a real bug, not a
+hypothetical one**: an earlier version left `region` untouched for
+`Tab`-entry too, which meant `Esc` bounced straight back to whichever
+region you `Tab`-ed in from (`Log`, the stop right before the command
+box, in the common case of `Tab`-ing all the way through) — and since
+`Tab` never leaves the command box while editing (only `Esc`/`Enter`
+do — see below), the very next `Tab` just re-entered it. `Tab` → `Esc`
+→ `Tab` → `Esc` looped between `Log` and the command box forever,
+never reaching `Main`/`Output` at all. Setting `region` to `Main`
+(the stop right after the command box) when `Tab` lands there fixes
+it: `Esc` now resumes the ring's forward progress instead of
+dead-ending.
 
 | Key | Effect |
 |---|---|
-| `:` | Enter the command box (starts an empty buffer). |
-| `Esc` | While editing: cancel input, discard the buffer. Else, layered: if the detail pane (Section G.1) is open, close it; only once it's closed does Esc fall through to zoom "home" — one hop to Grid from Layout or Focus (Section G); no-op once at Grid with detail closed. One press always does at most one thing. **Never quits**, regardless of how many times pressed. |
-| `Enter` | While editing: submit the buffer (no-op on an empty/whitespace-only line — nothing is logged and no handler call happens). |
-| `Tab` / `Shift+Tab` | Outside the command box: cycle focus forward/backward around every panel, then the command box itself, then wrap (`panel_count() + 1` stops total); in Grid zoom, also scrolls the viewport to keep the newly-focused panel visible. While editing: **never leaves the command box** — only `Esc` or `Enter` do that, so a stray press never silently discards an in-progress command by navigating away — but it still cycles which panel is focused (a plain `panel_count()`-stop ring, no command-box stop needed), so you can glance at another panel's chart mid-command without losing what you've typed. |
-| `1`-`9` | Outside the command box: jump focus straight to that panel (1-indexed), instead of stepping through `Tab`'s cycle one at a time. A digit past `panel_count()` (or on an empty dashboard) is a no-op. Works in every zoom level. While editing, a literal character. |
+| `:` | Enter the command box (starts an empty buffer) without disturbing `region` underneath. |
+| `Esc` | While editing: cancel input, discard the buffer, leave the command box — `region` returns to wherever it was if you got here via `:`, or advances to `Main` if you got here via `Tab` (see above). Else, layered: if the detail pane (Section G.1) is open, close it; only once it's closed does Esc fall through to zoom "home" — one hop to Grid from Layout or Focus (Section G); no-op once at Grid with detail closed. One press always does at most one thing. **Never quits**, regardless of how many times pressed. |
+| `Enter` | While editing: submits the buffer, then **immediately reopens an empty one** — the command box never loses focus on its own, so a second (or third...) command can be typed right away without re-pressing `:` or `Tab`-ing back around the ring. An empty/whitespace-only line submits nothing (no log entry, no handler call) but still reopens the same way. `Tab`/`Shift+Tab` (deliberate navigation) or `Esc` (deliberate cancel) are the only ways to actually leave. |
+| `Tab` / `Shift+Tab` | Outside the command box: cycle forward/backward through `Main` → `Output` → `Log` → the command box, wrapping — one `Tab` per region, independent of panel count (see above); in `Main` + Grid zoom, also scrolls the viewport to keep the focused panel visible. While editing: **never leaves the command box** — only `Esc`/`Enter` do that — but still cycles which panel is focused underneath (a plain `panel_count()`-stop ring, unrelated to the region ring above), so you can glance at another panel's chart mid-command without losing what you've typed. |
+| `1`-`9` | Only while `region == Main`: jump focus straight to that panel (1-indexed), instead of stepping through `Tab`'s cycle one at a time. Inert while `Output`/`Log` has focus — "which panel" has no meaning there, so a digit does nothing rather than silently pulling focus back to a panel you can't currently see highlighted. A digit past `panel_count()` (or on an empty dashboard) is a no-op. Works in every zoom level. While editing, a literal character. |
 | `↑` / `↓` | While editing: cycle command history, most recent first; `↓` past the newest clears back to an empty buffer. |
-| `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C): scrolls the log while editing, in or out of the command box; pages the Grid viewport vertically when not editing and zoomed to Grid (Section G); a no-op in Layout or Focus. Submitting a new command always resets the log scroll to the tail; background results (poller updates, assistant replies) never do, so reading old output is never interrupted out from under you. |
+| `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C, extended by Section F below): scrolls the log while editing, in or out of the command box; scrolls the log's own text when `region == Log`, or the output pane's when `region == Output`; otherwise pages the `Main` grid viewport vertically when zoomed to Grid (Section G); a no-op in Layout or Focus. Submitting a new command always resets the log scroll to the tail, and any new `Result` line always resets the output pane's scroll to its top (Section F); background poller/assistant results never reset the log, so reading old output there is never interrupted out from under you. |
 | `+` / `=` | Zoom in one level (Section G): Layout → Grid → Focus. No-op already at Focus. |
 | `-` / `_` | Zoom out one level: Focus → Grid → Layout. No-op already at Layout. |
-| `i` | Outside the command box: toggles the focused panel's detail pane (Section G.1) open/closed. Independent of zoom — works, and stays open, in Layout, Grid, or Focus alike, and never changes which zoom level is active. While editing, `i` is a literal character. |
+| `Space` | Outside the command box: toggles the focused panel's detail pane (Section G.1) open/closed. Independent of both zoom and `region` — works, and stays open, whichever of Layout/Grid/Focus is active and whichever region has `Tab`-focus, and pressing it never changes either. While editing, `Space` is a literal character (as it must be — most multi-arg commands need it, e.g. `ds add`). **Was `i`** until this section's region model landed; switched because a plain `i` collided with nothing functionally, but the previous design review flagged it as worth reconsidering once digit keys became region-gated — no other reason. |
 | `y` / `n` | Only while a proposal is pending (assist-only, `docs/specs/assist.md`): accept/execute or dismiss the oldest pending proposal. Inert with nothing pending. |
 | `a` | Toggle the assistant on/off (assist sessions only; unlike `/ai on`/`/ai off`, this always flips the current state rather than setting an explicit one). |
 | `q` | Outside the command box: quit. While editing, a literal character. |
@@ -176,22 +211,48 @@ box. Mixing full result text (a `/help` listing, a query result, an
 error message) into the same compact strip as command echoes made both
 hard to read, so the two are rendered separately:
 
-- **The command log** (`dash9_tui::command_bar::draw_log`, bottom of
-  the screen, above the input line): `Command` entries only — a
-  compact, scrollable history of what was typed and when (`"> /range
+- **The command log** (`Region::Log`, `dash9_tui::command_bar::draw_log`,
+  bottom of the screen, above the input line): `Command` entries only —
+  a compact, scrollable history of what was typed and when (`"> /range
   5m"`, `"* panel type gauge"` for an assistant-issued one). `Result`
   entries never appear here.
-- **The output pane** (`dash9_tui::output::draw_output`, between the
-  main area and the command log — see Section G/H): the most recent
-  `Result`'s full text, dynamically sized to its content (`output_height`,
-  clamped between `MIN_OUTPUT_HEIGHT` and `MAX_OUTPUT_HEIGHT` terminal
-  rows, never more than the space available) rather than a fixed size
-  that wastes room on a one-line result or crowds out the grid for a
-  long one. Shows `"(no output yet)"` before anything has run.
+- **The output pane** (`Region::Output`, `dash9_tui::output::draw_output`,
+  between the main area and the command log — see Section G/H): the
+  most recent `Result`'s full text, dynamically sized to its content
+  (`output_height`, clamped between `MIN_OUTPUT_HEIGHT` and
+  `MAX_OUTPUT_HEIGHT` terminal rows, never more than the space
+  available) rather than a fixed size that wastes room on a one-line
+  result or crowds out the grid for a long one. Shows `"(no output
+  yet)"` before anything has run.
 
 Nothing about the underlying `LogLine`/`ShellState.log` model changed
 to support this — it is a rendering-only split, two filtered views onto
 the same append-only log.
+
+**Both panes are focusable and scrollable** — each is a real `Tab`-ring
+stop (Section E), not a fixed, unreachable box. When focused, a pane's
+border brightens and shows a `"PageUp/PageDown scroll"` hint (the same
+shared pane chrome every bordered area uses, `pane::pane_block`,
+Section G.2), and `PageUp`/`PageDown` scroll its own text instead of
+paging the Grid. This exists because the output pane's height is
+deliberately capped (`MAX_OUTPUT_HEIGHT`) so it never crowds out the
+panel grid above it, and the log has always rendered into a fixed-height
+area — without scrolling, either one taller than its visible area (a
+long `!` command's output, a big `/help` listing, a long command
+history) had no way to be read past what fit on screen. Scroll
+direction differs between the two, deliberately: the output pane is
+top-anchored (`ShellState::output_scroll` — `PageDown` moves further
+into the content, `PageUp` back toward the top), since it shows one
+block of text meant to be read top-to-bottom; the log is tail-anchored
+(`ShellState::log_scroll`, unchanged from before regions existed —
+`PageUp` grows the offset, walking back from the newest entry), since
+it's a running history naturally read newest-first, the same whether
+you got there by `region == Log` or by editing (Section E). Both scroll
+fields self-clamp against whatever's actually rendered this frame
+(`max_output_scroll`/`command_bar::visible_window`), and `output_scroll`
+additionally resets to `0` whenever a new `Result` line arrives
+(submitted or background), so a stale scroll position from the
+*previous* result is never carried into a new one.
 
 ## G. Zoom levels: Layout, Grid, Focus
 
@@ -220,10 +281,11 @@ jumps straight to Grid ("home") from either end, once the detail pane
 
 ### G.1. The detail pane
 
-The `i` key toggles a panel's config+data detail pane open or
-closed — entirely independent of zoom (Section G): it works the same
-way, and stays open the same way, whichever of Layout/Grid/Focus is
-active, and pressing it never changes which zoom level is active. It
+The `Space` key toggles a panel's config+data detail pane open or
+closed — entirely independent of zoom (Section G) and of which region
+has `Tab`-focus (Section E): it works the same way, and stays open the
+same way, whichever of Layout/Grid/Focus is active, and pressing it
+never changes which zoom level is active. It
 is rendered in its own area **below** the main grid/layout/focus area
 (`dash9_tui::draw_panel_detail`, sized by `dash9_tui::detail_height`),
 never in place of it — the chart(s) above stay visible and usable the
@@ -284,14 +346,20 @@ the title.
   already says so.
 - **Bottom-left: key hint**, shown only on the currently focused pane
   — an unfocused pane's keys don't do anything right now, so it stays
-  quiet rather than advertising something inert. The one genuinely
-  panel-specific action is `i` (`"i detail"`, `dash9_tui::draw::PANEL_HINT`)
-  — broader navigation (`Tab`/`1`-`9`, `PageUp`/`PageDown`, `+`/`-`) is
-  region-level, not a property of any one panel, so it stays in the
-  zoom bar (Section H) instead of being repeated on every panel's
-  border; the zoom bar's own hint text deliberately excludes `i` for
-  the same reason, in reverse — showing it in both places would just
-  be the same text twice on screen at once.
+  quiet rather than advertising something inert. A panel's border
+  focus (and so this hint) only lights up while `region == Main`
+  (Section E) — Tabbing away to Output/Log dims whichever panel was
+  highlighted, since only one thing on screen should ever look focused
+  at a time. The one genuinely panel-specific action is `Space`
+  (`"space detail"`, `dash9_tui::draw::PANEL_HINT`) — broader navigation
+  (`Tab`/`1`-`9`, `PageUp`/`PageDown`, `+`/`-`) is region-level, not a
+  property of any one panel, so it stays in the zoom bar (Section H)
+  instead of being repeated on every panel's border; the zoom bar's own
+  hint text deliberately excludes `Space` for the same reason, in
+  reverse — showing it in both places would just be the same text
+  twice on screen at once. The output pane and the log get this same
+  bottom-left hint treatment (`"PageUp/PageDown scroll"`) while they
+  have `region`'s focus, Section F.
 - **Bottom-right:** reserved, not yet used.
 - **Border color** itself is the same `theme::FOCUS`/`theme::MUTED`
   split the border color already used before this section existed —
@@ -302,7 +370,7 @@ the title.
   adds — which needed real parameters on `draw_chart`/`draw_stat`/
   `draw_gauge`/`draw_table`/`draw_panel_outline`, not a buffer patch).
 
-Phase 2 (deferred, Section K): a temporary per-pane pop-up showing a
+Phase 2 (deferred, Section M): a temporary per-pane pop-up showing a
 pane's *full* reference on demand, building on this section's hint
 text as its content once it exists.
 
@@ -320,17 +388,23 @@ omitted entirely (not shown "off") when the session has no assist
 wiring at all — there is nothing configured to toggle.
 
 Directly below it, a second one-line zoom bar
-(`dash9_tui::status_bar::draw_zoom_bar`) shows the active zoom level
-(Section G) and that region's own key hint —
+(`dash9_tui::status_bar::draw_zoom_bar`) shows whichever region
+currently has `Tab`-focus (Section E) and that region's own key hint —
 `docs/specs/session-layout.md` Section D's "per bordered region" key
 discoverability, kept as its own small bar rather than folded into the
-status bar above since it tracks a different concern (zoom/keys, not
-dashboard/AI state). In Grid, it also appends the `"panels X-Y of Z —
-PageDown/PageUp for more"` paging indicator whenever the dashboard
-doesn't fully fit the viewport. The zoom label itself appends `" +
-detail"` (e.g. `"[Grid + detail]"`) whenever the detail pane
-(Section G.1) is open, since that's independent of which zoom level is
-active and worth surfacing alongside it.
+status bar above since it tracks a different concern (region/keys, not
+dashboard/AI state). While `region == Main`, it shows `Main`'s active
+zoom level (Layout/Grid/Focus, Section G) instead of the literal word
+"Main" — zoom is Main-specific state, so naming the zoom level is more
+useful there than a region name that's true of three different views —
+and, in Grid, appends the `"panels X-Y of Z — PageDown/PageUp for
+more"` paging indicator whenever the dashboard doesn't fully fit the
+viewport. While `region == Output` or `Log`, it shows that region's
+name and its own `"PageUp/PageDown scroll"` hint instead (Section F).
+The label itself appends `" + detail"` (e.g. `"[Grid + detail]"`,
+`"[Output + detail]"`) whenever the detail pane (Section G.1) is open,
+since that's independent of both zoom and region and worth surfacing
+alongside whichever of the two is currently shown.
 
 ## I. Panel export (`/save`)
 
@@ -381,7 +455,107 @@ appends to the log offers those lines to the recorder unconditionally,
 and the recorder itself decides whether that's a write or nothing —
 callers never branch on "is recording on" first.
 
-## K. Non-goals
+## K. Shell command execution (`!`)
+
+A line starting with `!` (Section C) runs the rest of the line through
+the user's shell: `$SHELL -c <command>`, falling back to `/bin/sh` if
+`$SHELL` isn't set — the same pattern any REPL that shells out uses
+(`psql`'s `\!`, `ipython`'s `!`). Runs on a blocking thread
+(`tokio::task::spawn_blocking`) so the render loop never stalls
+waiting on it; the command bar gets an immediate `"! <command>:
+running…"` acknowledgment (`LiveSession::spawn_shell_command`) and the
+real result — exit status, stdout, then stderr, trimmed of trailing
+newlines — arrives later as a `Result` log line in the output pane
+(Section F), the same async-ack shape ad-hoc `q` and `ds metrics`
+already use. A signal-terminated process reports "(terminated by
+signal)" instead of a fake exit code, since `ExitStatus::code()` itself
+returns `None` in that case. A bare `!` (no command text) is rejected
+synchronously — nothing to run, no task spawned.
+
+**Deliberately no gating.** No allow-list, no confirmation prompt, no
+sandboxing: `dash9 open` is a local dev/ops tool driven by hand, and
+`!` is trusted the same as a real shell prompt would be. This is a
+different trust model from `dash9-assist`'s command proposals
+(`docs/specs/assist.md` Section H's blast-radius classification) on
+purpose — the assistant is untrusted, autonomous input that only ever
+emits grammar text through the same validated path a human's keystrokes
+go through (`docs/specs/assist.md`'s "exactly one effector" invariant);
+`!` is not reachable through the assistant's contract loop at all, only
+through a human typing at the command bar, so the two never need the
+same gating.
+
+## L. Mouse selection and clipboard copy
+
+`dash9 open` enables mouse capture (`crossterm::event::EnableMouseCapture`,
+layered onto `ratatui::init()`'s raw-mode/alternate-screen setup in
+`open::shell_loop`) so it can draw its own left-button drag-to-select
+instead of relying on the terminal's/tmux's native selection. This is
+a deliberate choice, not decoration: `dash9 open` redraws live-
+refreshing panel data continuously, and a terminal's or tmux's own
+click-drag selection tracks *screen cells*, not the text that was
+there when you started dragging — a panel refresh mid-drag silently
+changes what's under the selection or breaks it outright. Owning
+selection end-to-end sidesteps that: dash9 knows exactly what it drew
+and when.
+
+- **Drag** (`crate::selection::Selection`, screen cell coordinates —
+  the same space `MouseEvent::{column,row}` reports): `Down` starts a
+  fresh selection at that cell (replacing any previous one, same as a
+  new click in a real terminal); `Drag` extends it; `Up` finalizes it.
+  A `Down`/`Up` at the same cell with no drag between (a plain click)
+  clears any existing selection instead of "selecting" one character.
+  Every other mouse event (scroll, right/middle click, plain move) is
+  a deliberate no-op — nothing else has a binding yet.
+- **Highlight**: reverse-video (`Modifier::REVERSED`) applied to every
+  selected cell each frame the selection is active
+  (`Selection::highlight`, rendered via a `Widget for &Selection` impl
+  since `ratatui::Frame::buffer` is crate-private — a widget is the
+  only way application code reaches a `&mut Buffer` to paint into).
+  Style-only; cell content is untouched, so what gets highlighted is
+  exactly what `extract_text` later reads.
+- **Extraction** (`Selection::extract_text`) is reading-order (linear)
+  text selection, not a rectangular block: the first row runs from the
+  selection's start column to the row's right edge, the last row from
+  the row's left edge to the end column, full rows in between — matching
+  how terminal-native click-drag selection reads, not tmux's rectangle-
+  toggle mode. Each line is trimmed of trailing whitespace (buffer cells
+  pad unused width with spaces) before a multi-row selection is joined
+  with `\n`. Reads from the most recently rendered frame's buffer
+  (`Terminal::draw`'s returned `CompletedFrame::buffer`, cloned into
+  `shell_loop`'s `last_buffer` after every draw) — exactly what was on
+  screen when the button was released, never a re-render.
+- **Copy** (`crate::selection::copy_to_clipboard`) writes a bare OSC 52
+  escape (`\x1b]52;c;<base64>\x07`) straight to stdout on `Up`, for any
+  selection covering more than one cell — **never wrapped** in tmux's
+  DCS passthrough, even when `$TMUX` is set. An earlier version did
+  wrap it there, on the assumption tmux needed help forwarding the
+  sequence; that was wrong and actively broke copying under tmux's
+  default config: DCS passthrough is gated behind `allow-passthrough`,
+  which defaults to **off**, so the wrapped sequence was silently
+  dropped (confirmed live: wrapped writes produced no tmux paste
+  buffer; the identical bare sequence did). tmux recognizes and handles
+  bare OSC 52 natively — that's what `set-clipboard` (on by default)
+  configures — so sending it unwrapped is what actually works, both
+  inside and outside tmux, without depending on a tmux option dash9
+  doesn't control and can't assume is set. A copy failure (e.g. the
+  terminal doesn't support OSC 52 at all) is silently ignored — the
+  highlight and the text underneath it are still correct, only the
+  clipboard hand-off may not land; **holding Shift while dragging**
+  bypasses dash9's mouse capture entirely in most terminals (iTerm2,
+  GNOME Terminal, Alacritty, kitty, Windows Terminal) and falls back to
+  the terminal's own native selection, same as with any full-screen
+  terminal app that captures the mouse.
+- Mouse capture is disabled on exit and on panic alike — `shell_loop`
+  wraps whatever panic hook `ratatui::init()` installed with one that
+  also disables mouse capture first, so a crash never leaves the
+  terminal with mouse reporting stuck on.
+
+Any keypress dismisses a lingering post-copy selection highlight
+(typing means you've moved on from what you just selected) — `Down`
+starting a fresh drag does too, implicitly, since it always replaces
+`selection` outright.
+
+## M. Non-goals
 
 - **No configurable keybindings.** Every binding in Section E is fixed
   for v1; remapping is not implemented.
@@ -410,3 +584,16 @@ callers never branch on "is recording on" first.
   or driven straight by live session state, never a transient UI
   layer), and makes the most sense to build once Phase 1's per-pane
   hint text already exists to reuse/expand into the pop-up's content.
+- **No shell command gating.** Section K's `!` runs with no allow-list,
+  confirmation, or sandboxing — deliberate, see Section K.
+- **No stdin piping into `!` commands, no interactivity, no timeout.**
+  A shell command runs to completion and its full output appears at
+  once; there's no way to feed it input, attach to a long-running/
+  interactive process (`vim`, `top`), or cap how long it can run.
+- **No selection beyond one screen's cells.** Section L's selection is
+  screen-coordinate state with no notion of scrollback — it cannot
+  reach content that has scrolled out of the log/output pane, only
+  whatever is currently rendered on screen.
+- **No block/rectangular selection mode.** Section L's drag-select is
+  always reading-order (linear) text selection; there's no toggle for
+  tmux-style rectangular selection.

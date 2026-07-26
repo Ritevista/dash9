@@ -1,4 +1,4 @@
-//! The focused panel's `i`-toggled detail pane: combined config (query,
+//! The focused panel's Space-toggled detail pane: combined config (query,
 //! datasource, thresholds, grid position) and raw data (every row the
 //! panel's query actually returned, not just what the small chart box can
 //! show). Rendered in its own area **below** the main grid/layout/focus
@@ -58,7 +58,7 @@ fn config_area_height(thresholds_len: usize) -> u16 {
 
 /// Rows given to the data table beyond the config block, when the caller
 /// (`dash9/src/open.rs`) is sizing a *fixed-height* pane for this rather
-/// than handing it the rest of the screen — e.g. the `i`-toggled detail
+/// than handing it the rest of the screen — e.g. the Space-toggled detail
 /// pane, which sits below the main area and must leave room for the
 /// output pane and command bar under it too.
 const DEFAULT_DATA_ROWS: u16 = 8;

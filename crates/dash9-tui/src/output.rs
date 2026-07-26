@@ -9,12 +9,19 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use dash9_core::LogLine;
 
+use crate::pane::pane_block;
 use crate::theme;
+
+/// Bottom-left border hint shown only when the output pane is focused and
+/// not itself being shadowed by the command box editing (`show_hint`,
+/// same `focused && !editing` gating every other pane's hint uses —
+/// `docs/specs/open.md` Section G.2).
+const OUTPUT_HINT: &str = "PageUp/PageDown scroll";
 
 /// Lower/upper bound on the pane's height (border rows included) — small
 /// enough that a one-line result (`"range set to 5m"`) doesn't waste
@@ -46,16 +53,46 @@ pub fn output_height(log: &[LogLine], available: u16) -> u16 {
         .min(available)
 }
 
+/// How far `scroll` (`ShellState::output_scroll`) can grow before it stops
+/// revealing anything new, given `visible_rows` content rows actually
+/// available (the pane's rendered height minus its two border rows) —
+/// self-clamping the same way `layout::max_grid_scroll` is for the panel
+/// grid; the composition root uses this to clamp `output_scroll` before
+/// passing it to `draw_output`, since `ShellState` itself has no notion of
+/// terminal size.
+pub fn max_output_scroll(log: &[LogLine], visible_rows: u16) -> usize {
+    let content_lines = latest_result_text(log).map_or(1, |text| text.lines().count().max(1));
+    content_lines.saturating_sub(usize::from(visible_rows))
+}
+
 /// Draws the latest result's full text into `area` — a placeholder
 /// before anything has run yet, never a blank pane (same convention
-/// `detail_view.rs`'s data placeholder already uses).
-pub fn draw_output(frame: &mut Frame, area: Rect, log: &[LogLine]) {
-    let block = Block::default().borders(Borders::ALL).title("output");
+/// `detail_view.rs`'s data placeholder already uses). `scroll` (already
+/// clamped by the caller against `max_output_scroll`) is lines down from
+/// the top, opposite anchor from the log's tail-anchored scroll — see
+/// `ShellState::output_scroll`'s docs for why. `focused`/`show_hint`
+/// follow the same shared-chrome convention every other pane uses
+/// (`pane::pane_block`, `docs/specs/open.md` Section G.2): `focused`
+/// drives the border/name color, `show_hint` (`focused && !editing`,
+/// computed by the caller) gates whether the scroll hint is actually
+/// shown — while the command box is editing, `PageUp`/`PageDown` scroll
+/// the log instead, so a focused-but-editing output pane must not claim a
+/// hint that wouldn't currently do what it says.
+pub fn draw_output(
+    frame: &mut Frame,
+    area: Rect,
+    log: &[LogLine],
+    scroll: usize,
+    focused: bool,
+    show_hint: bool,
+) {
+    let block = pane_block("output", focused, None, show_hint.then_some(OUTPUT_HINT));
     match latest_result_text(log) {
         Some(text) => {
             frame.render_widget(
                 Paragraph::new(text.to_string())
                     .style(Style::default().fg(theme::TEXT))
+                    .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
                     .block(block),
                 area,
             );
@@ -138,7 +175,9 @@ mod tests {
     #[test]
     fn draws_the_placeholder_before_any_result_without_panicking() {
         let mut terminal = backend(40, 5);
-        terminal.draw(|f| draw_output(f, f.area(), &[])).unwrap();
+        terminal
+            .draw(|f| draw_output(f, f.area(), &[], 0, false, false))
+            .unwrap();
     }
 
     #[test]
@@ -148,7 +187,9 @@ mod tests {
             LogLine::Result("Commands — prefix with /\n  ds  manage datasources".to_string()),
         ];
         let mut terminal = backend(40, 8);
-        terminal.draw(|f| draw_output(f, f.area(), &log)).unwrap();
+        terminal
+            .draw(|f| draw_output(f, f.area(), &log, 0, false, false))
+            .unwrap();
         let content: String = terminal
             .backend()
             .buffer()
@@ -163,7 +204,82 @@ mod tests {
     fn zero_area_draws_without_panicking() {
         let mut terminal = backend(40, 5);
         terminal
-            .draw(|f| draw_output(f, Rect::new(0, 0, 0, 0), &[]))
+            .draw(|f| draw_output(f, Rect::new(0, 0, 0, 0), &[], 0, false, false))
             .unwrap();
+    }
+
+    #[test]
+    fn focused_pane_shows_the_scroll_hint_only_when_show_hint_is_true() {
+        let log = vec![LogLine::Result("hello".to_string())];
+        let mut terminal = backend(40, 5);
+        terminal
+            .draw(|f| draw_output(f, f.area(), &log, 0, true, true))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("scroll"), "{content}");
+    }
+
+    #[test]
+    fn focused_but_editing_shows_no_hint() {
+        let log = vec![LogLine::Result("hello".to_string())];
+        let mut terminal = backend(40, 5);
+        terminal
+            .draw(|f| draw_output(f, f.area(), &log, 0, true, false))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !content.contains("scroll"),
+            "focused-but-editing must not claim the scroll hint: {content}"
+        );
+    }
+
+    #[test]
+    fn scrolling_reveals_later_lines_and_hides_earlier_ones() {
+        let big = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log = vec![LogLine::Result(big)];
+        let mut terminal = backend(40, 8);
+        terminal
+            .draw(|f| draw_output(f, f.area(), &log, 10, false, false))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("line 10"), "{content}");
+        assert!(!content.contains("line 0\n"), "{content}");
+    }
+
+    #[test]
+    fn max_output_scroll_is_zero_when_everything_already_fits() {
+        let log = vec![LogLine::Result("one\ntwo".to_string())];
+        assert_eq!(max_output_scroll(&log, 10), 0);
+    }
+
+    #[test]
+    fn max_output_scroll_grows_with_content_past_the_visible_rows() {
+        let big = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log = vec![LogLine::Result(big)];
+        assert_eq!(max_output_scroll(&log, 10), 20);
     }
 }

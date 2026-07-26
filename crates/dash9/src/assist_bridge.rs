@@ -251,6 +251,9 @@ impl CommandHandler for AssistHandler {
             ShellInput::AssistStatus => CommandResponse::result(self.assist_status()),
             ShellInput::SetAssist(on) => CommandResponse::result(self.set_assist(on)),
             ShellInput::ToggleAssist => CommandResponse::result(self.toggle_assist()),
+            ShellInput::Shell(command) => {
+                CommandResponse::result(self.session.spawn_shell_command(&command))
+            }
             ShellInput::NaturalLanguage(text) => self.ask_or_fallback(focused_panel, text),
         }
     }
