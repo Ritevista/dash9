@@ -65,6 +65,23 @@ impl<C: LlmClient> AssistSession<C> {
         self.enabled
     }
 
+    /// Number of messages (user + assistant, repair exchanges included)
+    /// in the running conversation history — `/ai context`
+    /// (`docs/specs/open.md` Section D)'s window into otherwise-opaque
+    /// session state, so "why doesn't it remember X" is answerable
+    /// without guessing.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// `/ai clear` — resets the conversation, independent of model or
+    /// endpoint (unlike switching models, which resets history only as
+    /// a side effect of rebuilding the whole session for a different
+    /// model/client).
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
     /// Distinct from the `assist` Cargo feature (Section B), which
     /// controls whether this code is compiled in at all. This toggles
     /// whether *this session* currently calls out to the LLM: turning
@@ -307,5 +324,29 @@ mod tests {
         let status = session.status();
         assert_eq!(status.model, "demo-fixture");
         assert_eq!(status.connectivity, ConnectivityState::Idle);
+    }
+
+    #[tokio::test]
+    async fn history_len_is_zero_before_any_turn() {
+        let client = FixtureLlmClient::new(vec![]);
+        let session = AssistSession::new(client, &config(), std::env::temp_dir());
+        assert_eq!(session.history_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_grows_history_and_clear_history_resets_it() {
+        let client = FixtureLlmClient::new(vec![Fixture {
+            request: "show cpu".to_string(),
+            reply: "Sure.\n```\nq up\n```".to_string(),
+        }]);
+        let mut session = AssistSession::new(client, &config(), std::env::temp_dir());
+        session.ask(&empty_context(), "show cpu", true).await;
+        assert!(
+            session.history_len() > 0,
+            "a completed turn should leave the user request + assistant reply in history"
+        );
+
+        session.clear_history();
+        assert_eq!(session.history_len(), 0);
     }
 }

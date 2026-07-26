@@ -72,6 +72,19 @@ pub enum ShellInput {
     /// `a` key, which toggles).
     SetAssist(bool),
     ToggleAssist,
+    /// `/ai context` — a snapshot of what the assistant currently knows:
+    /// configured datasources, whether a dashboard TOML is available to
+    /// send, the active time range, and how many messages are in the
+    /// running conversation. A debugging/discoverability aid for "why
+    /// doesn't it know about X" — distinct from `/ai` (on/off + model),
+    /// which says nothing about conversation state.
+    AssistContext,
+    /// `/ai clear` — resets the running conversation history without
+    /// switching models (`/model <name>` already resets history as a
+    /// side effect of rebuilding the session for the new model; this is
+    /// the same reset, available on its own for "start fresh, same
+    /// model").
+    AssistClear,
     Export {
         format: ExportFormat,
         path: Option<String>,
@@ -150,6 +163,18 @@ const SHELL_META_REFERENCE: &[VerbSpec] = &[
         description: "Switch the AI model (alias of \"/model <name>\").",
     },
     VerbSpec {
+        verb: "ai context",
+        args: &[],
+        example: "/ai context",
+        description: "Show what the assistant currently knows: datasources, dashboard availability, time range, conversation size.",
+    },
+    VerbSpec {
+        verb: "ai clear",
+        args: &[],
+        example: "/ai clear",
+        description: "Clear the running conversation history without switching models.",
+    },
+    VerbSpec {
         verb: "save",
         args: &["format", "path?"],
         example: "/save csv exports/out.csv",
@@ -200,7 +225,7 @@ const GROUP_BLURBS: &[(&str, &str)] = &[
     ("save", "export the focused panel's data (csv, md, png)"),
     ("record", "continuously record the log to a file (JSONL)"),
     ("model", "show or switch the AI model"),
-    ("ai", "AI on/off/model (--assist only)"),
+    ("ai", "AI on/off/model/context/clear"),
     ("help", "show this list, or /help <name> for detail"),
     ("quit", "end the session"),
 ];
@@ -238,8 +263,8 @@ fn help_overview() -> String {
     }
     out.push_str(
         "\nNo leading / — the whole line goes to the AI as natural language \
-         (needs --assist and AI on). Prefix with ! to run a shell command \
-         (e.g. !ls) — output appears in the output pane.\n",
+         (needs the assist feature and /ai on). Prefix with ! to run a \
+         shell command (e.g. !ls) — output appears in the output pane.\n",
     );
     out.push_str(
         "Keys: Tab/Shift+Tab cycle Main (the panel grid), Output, Log, \
@@ -346,6 +371,12 @@ pub fn parse_shell_input(text: &str) -> ShellInput {
     }
     if body == "ai off" {
         return ShellInput::SetAssist(false);
+    }
+    if body == "ai context" {
+        return ShellInput::AssistContext;
+    }
+    if body == "ai clear" {
+        return ShellInput::AssistClear;
     }
     if let Some(name) = body.strip_prefix("ai model ") {
         let name = name.trim();
@@ -1918,6 +1949,8 @@ mod tests {
             parse_shell_input("/ai model gemini-flash"),
             ShellInput::ModelSwitch("gemini-flash".to_string())
         );
+        assert_eq!(parse_shell_input("/ai context"), ShellInput::AssistContext);
+        assert_eq!(parse_shell_input("/ai clear"), ShellInput::AssistClear);
     }
 
     #[test]

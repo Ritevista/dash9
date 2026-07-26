@@ -88,9 +88,13 @@ flowchart LR
   compile and fully function without it. `dash9 test`, `dash9 open`,
   and `dash9 demo` (without `--assist`) must not reference
   `dash9-assist` at all when the feature is off — `#[cfg(feature =
-  "assist")]` gates the `demo --assist` flag, `open --assist`'s `a`
-  key/`y`/`n`/`/ai`/`/model` wiring (`docs/specs/open.md`), and
-  nothing else.
+  "assist")]` gates the `demo --assist` flag, `open`'s wiring of the
+  `a` key/`y`/`n`/`/ai`/`/model` (`docs/specs/open.md`), and nothing
+  else. `open` itself has no separate `--assist` flag of its own (an
+  earlier version did — removed, `docs/specs/open.md` Section A —
+  since the feature flag already decides whether assist wiring is
+  even attempted; `/ai on`/`/ai off` is the one remaining runtime
+  on/off switch).
 
 **Why `dash9-assist` cannot fetch its own datasource metadata:**
 constraint 2 (see the task that produced this spec) says the

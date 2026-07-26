@@ -41,7 +41,8 @@ type a command (e.g. `/range 1h`), `Tab`/`Shift+Tab` to cycle panel
 focus, `i` to open the focused panel's full-screen detail view, `/help`
 for the full command list, and `q` or `Ctrl+C` to quit — see
 [`docs/specs/open.md`](docs/specs/open.md) for every keybinding and
-shell command (`/save`, `/record`, and, with `--assist`, `/ai`/`/model`).
+shell command (`/save`, `/record`, and, when built with the `assist`
+feature — on by default — `/ai`/`/model`).
 
 `node_exporter` reports on whatever the Docker daemon's kernel is —
 the host's on Linux, the Docker Desktop VM's on macOS/Windows — either

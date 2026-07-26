@@ -251,6 +251,8 @@ impl CommandHandler for AssistHandler {
             ShellInput::AssistStatus => CommandResponse::result(self.assist_status()),
             ShellInput::SetAssist(on) => CommandResponse::result(self.set_assist(on)),
             ShellInput::ToggleAssist => CommandResponse::result(self.toggle_assist()),
+            ShellInput::AssistContext => CommandResponse::result(self.context_summary()),
+            ShellInput::AssistClear => CommandResponse::result(self.clear_context()),
             ShellInput::Shell(command) => {
                 CommandResponse::result(self.session.spawn_shell_command(&command))
             }
@@ -377,6 +379,64 @@ impl AssistHandler {
             if core.enabled { "on" } else { "off" },
             self.model_status()
         )
+    }
+
+    /// `/ai context` — everything `ask_or_fallback` would assemble into
+    /// an `AssistContext` if you asked something right now, plus the
+    /// running conversation's size, so "why doesn't it know about X" or
+    /// "did my last message actually get remembered" are answerable
+    /// without guessing. Datasource/dashboard/time-range parts reuse
+    /// `static_context_parts` directly — this is a read of the exact
+    /// same data `ask_or_fallback` sends, not a separate approximation
+    /// of it. Conversation size needs a peek inside `core.handle`'s
+    /// `Mutex`; `try_lock` (not `.await`) since `execute()` is
+    /// synchronous — a request in flight (holding the lock) reports
+    /// "busy" rather than blocking the render loop.
+    fn context_summary(&self) -> String {
+        let Some(core) = &self.assist else {
+            return "assist unavailable".to_string();
+        };
+        let (datasources, dashboard_toml, _time_range) =
+            static_context_parts(&self.session, epoch_ms_now());
+        let datasource_summary = if datasources.is_empty() {
+            "none configured".to_string()
+        } else {
+            datasources
+                .iter()
+                .map(|ds| format!("{} ({})", ds.name, ds.datasource_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let dashboard_summary = if dashboard_toml.is_some() {
+            "available"
+        } else {
+            "unavailable (failed to serialize)"
+        };
+        let conversation_summary = match core.handle.try_lock() {
+            Ok(session) => format!("{} message(s)", session.history_len()),
+            Err(_) => "busy — a request is in flight, try again".to_string(),
+        };
+        format!(
+            "datasources: {datasource_summary}\ndashboard: {dashboard_summary}\ntime range: {}\nconversation: {conversation_summary}",
+            self.session.range(),
+        )
+    }
+
+    /// `/ai clear` — resets the running conversation without switching
+    /// models (`switch_model` already resets history too, but only as
+    /// a side effect of rebuilding the whole session for a *different*
+    /// model). Same `try_lock` reasoning as `context_summary`.
+    fn clear_context(&mut self) -> String {
+        let Some(core) = &mut self.assist else {
+            return "assist unavailable".to_string();
+        };
+        match core.handle.try_lock() {
+            Ok(mut session) => {
+                session.clear_history();
+                "conversation history cleared".to_string()
+            }
+            Err(_) => "busy — a request is in flight, try again".to_string(),
+        }
     }
 
     fn ask_or_fallback(&mut self, focused_panel: usize, text: String) -> CommandResponse {

@@ -1,5 +1,6 @@
 //! Top status bar: dashboard/datasource summary and, when built with
-//! `--assist`, AI status (model, on/off, connectivity, token usage).
+//! the `assist` feature and its config loaded successfully, AI status
+//! (model, on/off, connectivity, token usage).
 //! Pure rendering, plain data in — `dash9-tui` has no `dash9-assist`
 //! dependency, so [`AssistStatusLine`] is a plain struct the
 //! composition root fills in from its own locally-tracked state, not
@@ -46,9 +47,9 @@ pub struct StatusBarModel {
     pub panel_count: usize,
     pub datasource_summary: String,
     pub health: DatasourceHealth,
-    /// `None` when not built with `--assist` (or `--assist` wasn't
-    /// passed) — the AI segment is omitted entirely rather than shown
-    /// disabled, since there's nothing configured to toggle.
+    /// `None` when not built with the `assist` feature, or its config
+    /// couldn't be loaded — the AI segment is omitted entirely rather
+    /// than shown disabled, since there's nothing configured to toggle.
     pub assist: Option<AssistStatusLine>,
 }
 
