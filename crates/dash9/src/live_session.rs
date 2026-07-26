@@ -47,6 +47,21 @@ pub enum SessionUpdate {
         datasource: String,
         result: Result<Vec<String>, CommandError>,
     },
+    Shell {
+        command: String,
+        result: Result<ShellOutput, String>,
+    },
+}
+
+/// The result of one `!<command>` run to completion
+/// (`docs/specs/open.md` Section K). `status` is `None` only on a
+/// signal-terminated process (Unix) — `std::process::ExitStatus::code()`
+/// itself already returns `None` in that case, this just carries it
+/// through rather than inventing a fake code.
+pub struct ShellOutput {
+    pub status: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 pub struct LiveDatasource {
@@ -159,6 +174,9 @@ impl LiveSession {
                     &datasource,
                     result,
                 )));
+            }
+            SessionUpdate::Shell { command, result } => {
+                log.push(LogLine::Result(format_shell_result(&command, result)));
             }
         }
     }
@@ -313,6 +331,57 @@ impl LiveSession {
                 .await;
         });
         "ds metrics: fetching…".to_string()
+    }
+
+    /// `!<command>` (`docs/specs/open.md` Section K). Runs `command`
+    /// through `$SHELL -c` (falling back to `/bin/sh` if `$SHELL` isn't
+    /// set), same as every other REPL that shells out — no allow-list,
+    /// no confirmation prompt: this is a local dev/ops tool driven by
+    /// hand, deliberately trusted the same as a real shell. Runs on a
+    /// blocking thread (`tokio::task::spawn_blocking`) since
+    /// `std::process::Command::output()` blocks; the render loop never
+    /// stalls waiting on it, same async-ack shape `spawn_ad_hoc_query`/
+    /// `spawn_ds_metrics_query` already use. An empty command (bare
+    /// `!`) is rejected synchronously — nothing to run, no task spawned.
+    /// `pub`, unlike its two siblings above: those are only ever reached
+    /// through `execute_command`'s `Command` dispatch (same file),
+    /// `!` is parsed as `ShellInput::Shell` in `dash9-tui::shell`
+    /// (`docs/specs/open.md` Section C) and handled directly by each
+    /// `CommandHandler::execute` in `open.rs`/`assist_bridge.rs`,
+    /// same as `export_panel`.
+    pub fn spawn_shell_command(&self, command: &str) -> String {
+        if command.is_empty() {
+            return "!: no command given".to_string();
+        }
+        let update_tx = self.update_tx.clone();
+        let command_for_task = command.to_string();
+        let command_for_result = command_for_task.clone();
+        tokio::spawn(async move {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let output = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(&shell)
+                    .arg("-c")
+                    .arg(&command_for_task)
+                    .output()
+            })
+            .await;
+            let result = match output {
+                Ok(Ok(output)) => Ok(ShellOutput {
+                    status: output.status.code(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                }),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = update_tx
+                .send(SessionUpdate::Shell {
+                    command: command_for_result,
+                    result,
+                })
+                .await;
+        });
+        format!("! {command}: running…")
     }
 
     /// `:save <format> [path]`. Exports the focused panel's *current*
@@ -538,6 +607,36 @@ fn format_ds_metrics_result(datasource: &str, result: Result<Vec<String>, Comman
         ),
         Err(err) => format!("ds metrics {datasource}: {err}"),
     }
+}
+
+/// `stdout`/`stderr` are trimmed of trailing newlines (the shell
+/// always adds one) but otherwise shown verbatim, in that order —
+/// `stderr` last since it's usually the more interesting half on
+/// failure and the output pane shows most-recent-relevant content at
+/// the bottom-most-visible edge (`docs/specs/open.md` Section F). A
+/// non-zero/missing status is prefixed to make failure obvious without
+/// having to read the whole body.
+fn format_shell_result(command: &str, result: Result<ShellOutput, String>) -> String {
+    let output = match result {
+        Err(err) => return format!("! {command}: failed to run: {err}"),
+        Ok(output) => output,
+    };
+    let mut out = match output.status {
+        Some(0) => format!("! {command}"),
+        Some(code) => format!("! {command} (exit {code})"),
+        None => format!("! {command} (terminated by signal)"),
+    };
+    let stdout = output.stdout.trim_end_matches('\n');
+    let stderr = output.stderr.trim_end_matches('\n');
+    if !stdout.is_empty() {
+        out.push('\n');
+        out.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        out.push('\n');
+        out.push_str(stderr);
+    }
+    out
 }
 
 fn format_ad_hoc_result(query: &str, frame: &Frame) -> String {
@@ -962,6 +1061,53 @@ mod tests {
         assert!(text.contains("boom"), "{text}");
     }
 
+    #[test]
+    fn format_shell_result_success_shows_stdout_with_no_exit_annotation() {
+        let text = format_shell_result(
+            "echo hi",
+            Ok(ShellOutput {
+                status: Some(0),
+                stdout: "hi\n".to_string(),
+                stderr: String::new(),
+            }),
+        );
+        assert_eq!(text, "! echo hi\nhi");
+    }
+
+    #[test]
+    fn format_shell_result_nonzero_exit_is_annotated_and_shows_stderr() {
+        let text = format_shell_result(
+            "false-ish",
+            Ok(ShellOutput {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "boom\n".to_string(),
+            }),
+        );
+        assert!(text.contains("(exit 1)"), "{text}");
+        assert!(text.contains("boom"), "{text}");
+    }
+
+    #[test]
+    fn format_shell_result_signal_terminated_has_no_exit_code() {
+        let text = format_shell_result(
+            "kill -9 $$",
+            Ok(ShellOutput {
+                status: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        );
+        assert!(text.contains("terminated by signal"), "{text}");
+    }
+
+    #[test]
+    fn format_shell_result_spawn_failure_reports_it() {
+        let text = format_shell_result("whatever", Err("No such file or directory".to_string()));
+        assert!(text.contains("failed to run"), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+    }
+
     #[tokio::test]
     async fn apply_update_ds_metrics_pushes_a_result_log_line() {
         let (mut session, _workspace) = session_with(vec![]);
@@ -1122,6 +1268,41 @@ grid = { row = 0, col = 1, w = 1, h = 1 }
             &mut log,
         );
         assert!(session.panels[0].last_result.is_some());
+    }
+
+    #[tokio::test]
+    async fn shell_command_empty_is_rejected_synchronously_with_no_task_spawned() {
+        let (session, _workspace) = session_with(vec![]);
+        let outcome = session.spawn_shell_command("");
+        assert!(outcome.contains("no command given"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn shell_command_non_empty_acks_immediately_and_runs_in_the_background() {
+        let (session, _workspace) = session_with(vec![]);
+        let outcome = session.spawn_shell_command("echo hi");
+        assert!(outcome.contains("running"), "{outcome}");
+    }
+
+    #[tokio::test]
+    async fn apply_update_shell_pushes_a_result_log_line() {
+        let (mut session, _workspace) = session_with(vec![]);
+        let mut log = Vec::new();
+        session.apply_update(
+            SessionUpdate::Shell {
+                command: "echo hi".to_string(),
+                result: Ok(ShellOutput {
+                    status: Some(0),
+                    stdout: "hi\n".to_string(),
+                    stderr: String::new(),
+                }),
+            },
+            &mut log,
+        );
+        match log.as_slice() {
+            [LogLine::Result(text)] => assert!(text.contains("hi"), "{text}"),
+            other => panic!("expected exactly one Result log line, got {other:?}"),
+        }
     }
 
     #[tokio::test]

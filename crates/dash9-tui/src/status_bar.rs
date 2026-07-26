@@ -188,7 +188,7 @@ mod tests {
     fn zoom_bar_draws_without_panicking() {
         let model = ZoomBarModel {
             zoom_label: "Grid".to_string(),
-            hint: "PageUp/PageDown page panels · +/- zoom · i detail".to_string(),
+            hint: "PageUp/PageDown page panels · +/- zoom · space detail".to_string(),
         };
         let mut terminal = backend(120, 1);
         terminal

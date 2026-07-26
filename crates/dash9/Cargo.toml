@@ -20,6 +20,7 @@ assist = ["dep:dash9-assist"]
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
 dash9-assist = { workspace = true, optional = true }

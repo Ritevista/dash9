@@ -7,6 +7,7 @@ mod demo;
 mod live_session;
 mod log_recorder;
 mod open;
+mod selection;
 mod test_cmd;
 
 use std::path::PathBuf;

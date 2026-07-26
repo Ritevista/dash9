@@ -22,20 +22,25 @@
 //! second, local, non-generic-crate-boundary trait, [`HasSession`],
 //! implemented by both handlers alongside `CommandHandler`.
 
+use std::io::stdout;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+};
+use crossterm::execute;
 use dash9_core::{load_path, validate, Command};
 use dash9_tui::chart::{ChartModel, ChartViewState};
-use dash9_tui::shell::{CommandHandler, CommandResponse, ShellInput, ShellState, Zoom};
+use dash9_tui::shell::{CommandHandler, CommandResponse, Region, ShellInput, ShellState, Zoom};
 use dash9_tui::{
     detail_height, draw_chart, draw_command_bar, draw_gauge, draw_output, draw_panel_outline,
     draw_stat, draw_status_bar, draw_table, draw_zoom_bar, ensure_visible, grid_layout_fit,
     grid_layout_scrolled, help_text, max_grid_scroll, output_height, panel_content_range,
     series_as_table, StatusBarModel, ZoomBarModel,
 };
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -43,6 +48,7 @@ use tokio::sync::mpsc;
 
 use crate::live_session::{execute_command, LivePanel, LiveSession, SessionUpdate};
 use crate::log_recorder::LogRecorder;
+use crate::selection::{self, Selection};
 
 const TICK: StdDuration = StdDuration::from_millis(250);
 const CHANNEL_CAPACITY: usize = 64;
@@ -55,7 +61,7 @@ const ZOOM_BAR_HEIGHT: u16 = 1;
 /// applies to the grid; the command bar needs its own floor for the same
 /// reason). `INPUT_HEIGHT` (`command_bar.rs`) plus a handful of log rows.
 /// The output pane (result text — `/help`, query results, …) and the
-/// `i`-toggled detail pane each have their own separate, dynamic
+/// Space-toggled detail pane each have their own separate, dynamic
 /// reservation (`output_height`/`detail_height`), not folded into this
 /// constant — see `draw_session`.
 const MIN_BAR_HEIGHT: u16 = 6;
@@ -146,7 +152,33 @@ fn shell_loop<H: CommandHandler + HasSession>(
     // tick. One frame stale on a terminal resize, self-correcting via the
     // `.min(max_grid_scroll(..))` clamp `draw_session` always applies.
     let mut grid_viewport_height: u16 = 0;
-    ratatui::run(|terminal| -> anyhow::Result<()> {
+
+    // In-app drag-to-select + OSC 52 clipboard copy (`docs/specs/open.md`
+    // Section L), screen-coordinate state — lives here, not in
+    // `ShellState`, for the same reason `grid_viewport_height` does (it's
+    // meaningless without a real terminal). `last_buffer` is the most
+    // recently rendered frame's content, captured right after every
+    // `terminal.draw` — that's what a mouse-up's copy reads from, since
+    // it reflects exactly what the user was looking at when they released
+    // the button (`selection` extraction never re-renders anything).
+    let mut selection: Option<Selection> = None;
+    let mut last_buffer: Option<Buffer> = None;
+
+    // Manual init/restore (not `ratatui::run`) so mouse capture can be
+    // layered on: `ratatui::init()` still gives raw mode, the alternate
+    // screen, and a panic hook that restores both. Mouse capture is
+    // enabled separately, and the panic hook is re-wrapped to also
+    // disable it — the terminal must never come back to the user with
+    // mouse reporting stuck on, panic or not.
+    let mut terminal = ratatui::init();
+    let _ = execute!(stdout(), EnableMouseCapture);
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableMouseCapture);
+        previous_hook(info);
+    }));
+
+    let result = (|| -> anyhow::Result<()> {
         loop {
             let focused_before = state.focused_panel;
             let before = state.log.len();
@@ -159,33 +191,87 @@ fn shell_loop<H: CommandHandler + HasSession>(
                 focused_before,
             );
 
-            terminal.draw(|f| {
+            let completed = terminal.draw(|f| {
                 let status = handler.status_bar();
                 grid_viewport_height =
                     draw_session(f, f.area(), &state, handler.session(), &status);
+                if let Some(active) = &selection {
+                    f.render_widget(active, f.area());
+                }
             })?;
+            last_buffer = Some(completed.buffer.clone());
 
             if !event::poll(TICK)? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            let focused_before = state.focused_panel;
-            let before = state.log.len();
-            let should_quit = state.handle_key(key, &mut handler);
-            record_new_lines(&state, recorder, before);
-            sync_grid_scroll_to_focus(
-                &mut state,
-                handler.session(),
-                grid_viewport_height,
-                focused_before,
-            );
-            if should_quit {
-                return Ok(());
+            match event::read()? {
+                Event::Mouse(mouse) => {
+                    handle_mouse(mouse, &mut selection, last_buffer.as_ref());
+                }
+                Event::Key(key) => {
+                    // Any keypress dismisses a lingering post-copy
+                    // selection highlight — typing means you've moved on
+                    // from whatever you just selected.
+                    selection = None;
+                    let focused_before = state.focused_panel;
+                    let before = state.log.len();
+                    let should_quit = state.handle_key(key, &mut handler);
+                    record_new_lines(&state, recorder, before);
+                    sync_grid_scroll_to_focus(
+                        &mut state,
+                        handler.session(),
+                        grid_viewport_height,
+                        focused_before,
+                    );
+                    if should_quit {
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
-    })
+    })();
+
+    let _ = execute!(stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+/// One mouse event's effect on the in-progress/just-finished selection
+/// (`docs/specs/open.md` Section L). Left-button drag only — `Down`
+/// starts a fresh selection (replacing any previous one, same as a new
+/// click in a real terminal), `Drag` extends it, `Up` finalizes it:
+/// copies to the clipboard if it covers more than one cell, otherwise
+/// (a plain click) clears it. Every other mouse event (scroll, right/
+/// middle click, plain move) is a deliberate no-op for v1 — nothing
+/// else has a binding yet.
+fn handle_mouse(
+    mouse: event::MouseEvent,
+    selection: &mut Option<Selection>,
+    last_buffer: Option<&Buffer>,
+) {
+    let at = (mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            *selection = Some(Selection::new(at));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(active) = selection.as_mut() {
+                active.cursor = at;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(active) = selection else { return };
+            if active.is_empty() {
+                *selection = None;
+                return;
+            }
+            if let Some(text) = last_buffer.and_then(|buffer| active.extract_text(buffer)) {
+                let _ = selection::copy_to_clipboard(&text);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// After a `Tab`/`Shift+Tab` (or a `dash open` reload changing panel
@@ -279,6 +365,9 @@ impl CommandHandler for GrammarOnlyHandler {
             }
             ShellInput::SetRecording { on, path } => {
                 CommandResponse::result(lock_recorder(&self.recorder).set(on, path))
+            }
+            ShellInput::Shell(command) => {
+                CommandResponse::result(self.session.spawn_shell_command(&command))
             }
             ShellInput::NaturalLanguage(_) => CommandResponse::result(
                 "natural language requires --assist (or prefix a command with /, see /help)"
@@ -403,12 +492,26 @@ fn draw_session(
         &zoom_bar_model(state, &grids, grid_area, grid_scroll),
     );
 
-    // While the command box is capturing keystrokes, `i` types a literal
+    // While the command box is capturing keystrokes, Space types a literal
     // character instead of toggling detail (`shell.rs::handle_key`), so
     // no panel's hint should claim otherwise — border/focus color stays
     // as-is (`Tab` still moves it while editing), only the hint text is
     // gated on this.
     let editing = state.input.is_some();
+
+    // A panel's border only lights up as "focused" while `Main` actually
+    // has `Tab`-focus (`docs/specs/open.md` Section E) — only one thing
+    // on screen should ever look focused at a time, so Output/Log
+    // stealing focus dims whichever panel was highlighted, the same way
+    // it dims once you Tab away today. `usize::MAX` never matches a real
+    // panel index, so every panel draws unfocused without needing a
+    // second code path through `draw_dashboard`/`draw_layout`.
+    let main_focused = state.region == Region::Main;
+    let focused_panel = if main_focused {
+        state.focused_panel
+    } else {
+        usize::MAX
+    };
 
     match state.zoom {
         Zoom::Grid => draw_dashboard(
@@ -416,21 +519,20 @@ fn draw_session(
             grid_area,
             &grids,
             session,
-            state.focused_panel,
+            focused_panel,
             grid_scroll,
             editing,
         ),
-        Zoom::Layout => draw_layout(
-            frame,
-            grid_area,
-            &grids,
-            session,
-            state.focused_panel,
-            editing,
-        ),
+        Zoom::Layout => draw_layout(frame, grid_area, &grids, session, focused_panel, editing),
         Zoom::Focus => {
             if let Some(panel) = session.panels.get(state.focused_panel) {
-                draw_panel(frame, grid_area, panel, true, !editing);
+                draw_panel(
+                    frame,
+                    grid_area,
+                    panel,
+                    main_focused,
+                    main_focused && !editing,
+                );
             }
         }
     }
@@ -440,8 +542,25 @@ fn draw_session(
         dash9_tui::draw_panel_detail(frame, detail_area, detail.as_ref());
     }
 
-    draw_output(frame, output_area, &state.log);
+    // Same defensive clamp `grid_scroll` gets above — `state.output_scroll`
+    // is the user's last explicit paging request (`ShellState` has no
+    // notion of terminal size), this is the final clamp against the
+    // output pane's actual rendered height this frame.
+    let output_scroll = state.output_scroll.min(dash9_tui::max_output_scroll(
+        &state.log,
+        output_area.height.saturating_sub(2),
+    ));
+    let output_focused = state.region == Region::Output;
+    draw_output(
+        frame,
+        output_area,
+        &state.log,
+        output_scroll,
+        output_focused,
+        output_focused && !editing,
+    );
 
+    let log_focused = state.region == Region::Log;
     draw_command_bar(
         frame,
         bar_area,
@@ -449,10 +568,24 @@ fn draw_session(
         state.input.as_deref(),
         &command_bar_hint(state, status),
         state.log_scroll,
+        dash9_tui::LogFocus {
+            focused: log_focused,
+            show_hint: log_focused && !editing,
+        },
     );
 
     grid_area.height
 }
+
+/// Same one-line region hint the zoom bar always showed, generalized
+/// past just Main's zoom levels now that `Tab`-focus can land on Output
+/// or Log too (`docs/specs/open.md` Section E) — those two get their own
+/// short hint here since `zoom_hint` (`dash9-tui::shell`) only knows
+/// about `Zoom`, not the region model layered above it. `detail_open`'s
+/// `"+ detail"` suffix stays region-independent, same as before: which
+/// panel's detail is open is `state.focused_panel`, tracked separately
+/// from whichever region currently has `Tab`-focus.
+const OUTPUT_OR_LOG_HINT: &str = "PageUp/PageDown scroll";
 
 fn zoom_bar_model(
     state: &ShellState,
@@ -460,22 +593,29 @@ fn zoom_bar_model(
     grid_area: Rect,
     grid_scroll: u16,
 ) -> ZoomBarModel {
-    let zoom_name = match state.zoom {
-        Zoom::Layout => "Layout",
-        Zoom::Grid => "Grid",
-        Zoom::Focus => "Focus",
+    let (region_name, hint) = match state.region {
+        Region::Main => {
+            let zoom_name = match state.zoom {
+                Zoom::Layout => "Layout",
+                Zoom::Grid => "Grid",
+                Zoom::Focus => "Focus",
+            };
+            let mut hint = dash9_tui::zoom_hint(state.zoom).to_string();
+            if state.zoom == Zoom::Grid {
+                if let Some(suffix) = grid_paging_suffix(grids, grid_area, grid_scroll) {
+                    hint.push_str(&suffix);
+                }
+            }
+            (zoom_name.to_string(), hint)
+        }
+        Region::Output => ("Output".to_string(), OUTPUT_OR_LOG_HINT.to_string()),
+        Region::Log => ("Log".to_string(), OUTPUT_OR_LOG_HINT.to_string()),
     };
     let zoom_label = if state.detail_open {
-        format!("{zoom_name} + detail")
+        format!("{region_name} + detail")
     } else {
-        zoom_name.to_string()
+        region_name
     };
-    let mut hint = dash9_tui::zoom_hint(state.zoom).to_string();
-    if state.zoom == Zoom::Grid {
-        if let Some(suffix) = grid_paging_suffix(grids, grid_area, grid_scroll) {
-            hint.push_str(&suffix);
-        }
-    }
     ZoomBarModel { zoom_label, hint }
 }
 
