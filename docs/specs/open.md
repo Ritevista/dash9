@@ -185,8 +185,8 @@ dead-ending.
 | `1`-`9` | Only while `region == Main`: jump focus straight to that panel (1-indexed), instead of stepping through `Tab`'s cycle one at a time. Inert while `Output`/`Log` has focus — "which panel" has no meaning there, so a digit does nothing rather than silently pulling focus back to a panel you can't currently see highlighted. A digit past `panel_count()` (or on an empty dashboard) is a no-op. Works in every zoom level. While editing, a literal character. |
 | `↑` / `↓` | While editing: cycle command history, most recent first; `↓` past the newest clears back to an empty buffer. |
 | `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C, extended by Section F below): scrolls the log while editing, in or out of the command box; scrolls the log's own text when `region == Log`, or the output pane's when `region == Output`; otherwise pages the `Main` grid viewport vertically when zoomed to Grid (Section G); a no-op in Layout or Focus. Submitting a new command always resets the log scroll to the tail, and any new `Result` line always resets the output pane's scroll to its top (Section F); background poller/assistant results never reset the log, so reading old output there is never interrupted out from under you. |
-| `+` / `=` | Zoom in one level (Section G): Layout → Grid → Focus. No-op already at Focus. |
-| `-` / `_` | Zoom out one level: Focus → Grid → Layout. No-op already at Layout. |
+| `+` / `=` | While `region == Main`: zoom in one level (Section G): Layout → Grid → Focus. No-op already at Focus. While `region == Output`/`Log`: maximize that pane instead — takes over `Main`'s space (Section F). |
+| `-` / `_` | While `region == Main`: zoom out one level: Focus → Grid → Layout. No-op already at Layout. While `region == Output`/`Log`: restore the maximized pane to its normal size. |
 | `Space` | Outside the command box: toggles the focused panel's detail pane (Section G.1) open/closed. Independent of both zoom and `region` — works, and stays open, whichever of Layout/Grid/Focus is active and whichever region has `Tab`-focus, and pressing it never changes either. While editing, `Space` is a literal character (as it must be — most multi-arg commands need it, e.g. `ds add`). **Was `i`** until this section's region model landed; switched because a plain `i` collided with nothing functionally, but the previous design review flagged it as worth reconsidering once digit keys became region-gated — no other reason. |
 | `y` / `n` | Only while a proposal is pending (assist-only, `docs/specs/assist.md`): accept/execute or dismiss the oldest pending proposal. Inert with nothing pending. |
 | `a` | Toggle the assistant on/off (assist sessions only; unlike `/ai on`/`/ai off`, this always flips the current state rather than setting an explicit one). |
@@ -215,7 +215,10 @@ hard to read, so the two are rendered separately:
   bottom of the screen, above the input line): `Command` entries only —
   a compact, scrollable history of what was typed and when (`"> /range
   5m"`, `"* panel type gauge"` for an assistant-issued one). `Result`
-  entries never appear here.
+  entries never appear here. Dynamically sized to its content
+  (`command_bar::log_height`, clamped between `MIN_LOG_HEIGHT` and
+  `MAX_LOG_HEIGHT` terminal rows, never more than the space available) —
+  see below for why this cap exists at all.
 - **The output pane** (`Region::Output`, `dash9_tui::output::draw_output`,
   between the main area and the command log — see Section G/H): the
   most recent `Result`'s full text, dynamically sized to its content
@@ -229,30 +232,59 @@ Nothing about the underlying `LogLine`/`ShellState.log` model changed
 to support this — it is a rendering-only split, two filtered views onto
 the same append-only log.
 
+**The log's height cap is a fix, not just symmetry with output.** An
+earlier version gave the whole command bar (log + input line) an
+uncapped `Constraint::Min(0)` in `open::draw_session`'s outer layout —
+"whatever's left after everything else." On a short dashboard or a tall
+terminal, once the grid/detail/output all took only what their content
+actually needed, *all* of the difference piled into the log, since
+nothing else claimed it: confirmed live, 17 blank rows showing
+`"(empty)"` on a 50-row terminal — the least-used pane silently
+claiming the most screen space. `log_height` closes this the same way
+`output_height` already worked: every pane in `draw_session` is now an
+exact `Constraint::Length`, computed up front (`open::pane_heights`),
+and genuinely leftover space (everything already capped/sized and still
+not filling the terminal) becomes unlabeled blank space at the very
+bottom instead of being attributed to any one pane.
+
 **Both panes are focusable and scrollable** — each is a real `Tab`-ring
 stop (Section E), not a fixed, unreachable box. When focused, a pane's
 border brightens and shows a `"PageUp/PageDown scroll"` hint (the same
 shared pane chrome every bordered area uses, `pane::pane_block`,
 Section G.2), and `PageUp`/`PageDown` scroll its own text instead of
-paging the Grid. This exists because the output pane's height is
-deliberately capped (`MAX_OUTPUT_HEIGHT`) so it never crowds out the
-panel grid above it, and the log has always rendered into a fixed-height
-area — without scrolling, either one taller than its visible area (a
-long `!` command's output, a big `/help` listing, a long command
-history) had no way to be read past what fit on screen. Scroll
-direction differs between the two, deliberately: the output pane is
-top-anchored (`ShellState::output_scroll` — `PageDown` moves further
-into the content, `PageUp` back toward the top), since it shows one
-block of text meant to be read top-to-bottom; the log is tail-anchored
-(`ShellState::log_scroll`, unchanged from before regions existed —
-`PageUp` grows the offset, walking back from the newest entry), since
-it's a running history naturally read newest-first, the same whether
-you got there by `region == Log` or by editing (Section E). Both scroll
-fields self-clamp against whatever's actually rendered this frame
+paging the Grid. Scroll direction differs between the two, deliberately:
+the output pane is top-anchored (`ShellState::output_scroll` —
+`PageDown` moves further into the content, `PageUp` back toward the
+top), since it shows one block of text meant to be read top-to-bottom;
+the log is tail-anchored (`ShellState::log_scroll`, unchanged from
+before regions existed — `PageUp` grows the offset, walking back from
+the newest entry), since it's a running history naturally read
+newest-first, the same whether you got there by `region == Log` or by
+editing (Section E). Both scroll fields self-clamp against whatever's
+actually rendered this frame
 (`max_output_scroll`/`command_bar::visible_window`), and `output_scroll`
 additionally resets to `0` whenever a new `Result` line arrives
 (submitted or background), so a stale scroll position from the
 *previous* result is never carried into a new one.
+
+**Maximize/restore** (`ShellState::pane_maximized`): `+`/`=` and `-`/`_`
+(Section E) already zoom `Main` through Layout/Grid/Focus; the same two
+keys maximize/restore whichever of `Output`/`Log` currently has
+`Tab`-focus instead, since `Main` isn't reachable while `region` is
+`Output` or `Log` (they're mutually exclusive). `+` on either pane
+takes over the space `Main` normally gets — the direct parallel to
+`Zoom::Focus` doing that for a single panel — grid and detail both go
+to `0` while a pane is maximized (`Main` is fully hidden, not just
+shrunk), and the *other* of `Output`/`Log` keeps its own normal small
+size, so it stays visible rather than also disappearing. `-` restores
+the shared layout. The zoom bar (Section H) reflects this: the region
+label gets a `" (maximized)"` suffix and the hint swaps between `"+
+maximize"` and `"- restore"`. Tabbing away from a maximized pane
+restores it automatically (`shell::ShellState::advance_focus`) — a
+maximized pane you've since navigated away from would just be stuck
+oversized with nothing on screen explaining why, so any `Tab`/
+`Shift+Tab` press clears `pane_maximized` unconditionally, regardless
+of which direction or where it lands.
 
 ## G. Zoom levels: Layout, Grid, Focus
 

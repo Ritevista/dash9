@@ -25,6 +25,20 @@ const INPUT_HEIGHT: u16 = 3;
 /// the same reason: both panes share the same scroll mechanism.
 const LOG_HINT: &str = "PageUp/PageDown scroll";
 
+/// Lower/upper bound on the log's default (unmaximized) height, border
+/// rows included — same values `crate::output`'s `MIN_OUTPUT_HEIGHT`/
+/// `MAX_OUTPUT_HEIGHT` use, for the same reason: small enough that an
+/// empty or one-line log doesn't waste space, capped so it doesn't
+/// consume every leftover row a short dashboard or tall terminal leaves
+/// lying around (`docs/specs/open.md` Section F — the log used to get
+/// whatever was left via an uncapped `Constraint::Min(0)`, which meant
+/// the *least*-used pane silently claimed the *most* screen space on a
+/// short dashboard; confirmed live, 17 blank rows on a 50-row terminal).
+/// `Region::Log` maximize (`+`, Section F) is the escape hatch for
+/// actually wanting more than this.
+pub const MIN_LOG_HEIGHT: u16 = 3;
+pub const MAX_LOG_HEIGHT: u16 = 12;
+
 /// The log's own `Region::Log` chrome (`docs/specs/open.md` Section E) —
 /// bundled into one struct, not two more loose `bool` params on
 /// `draw_command_bar`, purely to stay under `clippy::too_many_arguments`;
@@ -66,6 +80,48 @@ pub fn draw_command_bar(
     draw_input(frame, input_area, input, hint);
 }
 
+/// `Command` entries only, each rendered as one `"> ..."`/`"* ..."` line
+/// (`format_command_line`) then split on embedded newlines — shared by
+/// `draw_log` and `log_height` so the two can never disagree about what
+/// counts as a line.
+fn command_lines(log: &[LogLine]) -> Vec<String> {
+    log.iter()
+        .filter_map(|line| match line {
+            LogLine::Command(entry) => Some(format_command_line(entry)),
+            LogLine::Result(_) => None,
+        })
+        .flat_map(|line| {
+            line.split('\n')
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into_iter()
+        })
+        .collect()
+}
+
+/// How tall the log's default (unmaximized) area should be this frame —
+/// big enough for its content, clamped to `[MIN_LOG_HEIGHT,
+/// MAX_LOG_HEIGHT]` and never more than `available`. Mirrors
+/// `crate::output::output_height` exactly, including the reasoning: a
+/// short/empty log shouldn't waste space, and an uncapped one
+/// shouldn't either, in the other direction — see `MAX_LOG_HEIGHT`'s
+/// docs for the concrete bug this fixes. Content rows only; add
+/// `INPUT_HEIGHT` (or call `command_bar_height`) for the full bar.
+pub fn log_height(log: &[LogLine], available: u16) -> u16 {
+    let content_lines = command_lines(log).len().max(1);
+    let needed = u16::try_from(content_lines.saturating_add(2)).unwrap_or(u16::MAX);
+    needed.clamp(MIN_LOG_HEIGHT, MAX_LOG_HEIGHT).min(available)
+}
+
+/// `log_height` plus the input line's own fixed height — the composition
+/// root's single up-front reservation for the whole command bar
+/// (mirrors `output_height`'s role for the output pane), used instead of
+/// the old unbounded `Constraint::Min(0)` that let the bar (and so the
+/// log) silently absorb every leftover row (`MAX_LOG_HEIGHT`'s docs).
+pub fn command_bar_height(log: &[LogLine], available: u16) -> u16 {
+    log_height(log, available.saturating_sub(INPUT_HEIGHT)) + INPUT_HEIGHT
+}
+
 fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize, log_focus: LogFocus) {
     let title = if scroll > 0 {
         "log (scrolled — PageDown to catch up)"
@@ -84,14 +140,8 @@ fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize, log_f
     // — same "don't undercount if something someday embeds a newline"
     // discipline `crate::output::draw_output`'s sibling doesn't need
     // (it shows one Result's full text, not a scrolling history).
-    let rendered: Vec<String> = log
-        .iter()
-        .filter_map(|line| match line {
-            LogLine::Command(entry) => Some(format_command_line(entry)),
-            LogLine::Result(_) => None,
-        })
-        .collect();
-    let lines: Vec<&str> = rendered.iter().flat_map(|line| line.split('\n')).collect();
+    let rendered = command_lines(log);
+    let lines: Vec<&str> = rendered.iter().map(String::as_str).collect();
     if lines.is_empty() {
         frame.render_widget(Paragraph::new("(empty)").block(block), area);
         return;
@@ -325,6 +375,43 @@ mod tests {
     #[test]
     fn visible_window_when_everything_fits_shows_all_of_it() {
         assert_eq!(visible_window(3, 10, 0), 0..3);
+    }
+
+    #[test]
+    fn log_height_before_any_command_is_the_minimum() {
+        assert_eq!(log_height(&[], 20), MIN_LOG_HEIGHT);
+    }
+
+    /// Regression test for the real bug: an unbounded log used to
+    /// silently absorb every leftover terminal row (`MAX_LOG_HEIGHT`'s
+    /// docs — 17 blank rows on a 50-row terminal, confirmed live). It
+    /// must stay capped regardless of how much `available` space there
+    /// is.
+    #[test]
+    fn log_height_never_exceeds_the_max_even_with_lots_of_available_space() {
+        let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
+        assert_eq!(log_height(&log, 200), MAX_LOG_HEIGHT);
+    }
+
+    #[test]
+    fn log_height_grows_with_content_up_to_the_max() {
+        let one_liner = vec![command_line("range 5m")];
+        assert_eq!(log_height(&one_liner, 20), MIN_LOG_HEIGHT);
+    }
+
+    #[test]
+    fn log_height_never_exceeds_available_space() {
+        let log: Vec<LogLine> = (0..50).map(|i| command_line(&format!("cmd {i}"))).collect();
+        assert_eq!(log_height(&log, 5), 5);
+    }
+
+    #[test]
+    fn command_bar_height_adds_the_input_line_to_log_height() {
+        assert_eq!(
+            command_bar_height(&[], 20),
+            MIN_LOG_HEIGHT + INPUT_HEIGHT,
+            "empty log: minimum content height plus the input line"
+        );
     }
 
     #[test]
