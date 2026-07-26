@@ -35,8 +35,8 @@ pub struct AssistConfig {
     pub stream: bool,
     /// Optional, purely a display/discoverability hint: model names
     /// the user knows their `base_url` endpoint serves, so a caller
-    /// (e.g. `dash9 open --assist`'s `:model` command) can list real
-    /// choices without querying a `/v1/models`-style endpoint — v1
+    /// (e.g. `dash9 open`'s `/model` command) can list real choices
+    /// without querying a `/v1/models`-style endpoint — v1
     /// has no such client method, and that endpoint's shape wasn't
     /// reliable enough across the gateways tried during development
     /// to build on. Never read or written by anything in this crate

@@ -16,13 +16,13 @@ unit or integration coverage
 `crates/dash9-tui/src/{detail_view,status_bar,command_bar,draw}.rs`,
 `crates/dash9/src/{open,live_session,log_recorder,selection}.rs`). Prerequisites:
 `SPEC.md` (grammar, error codes, dashboard schema), `docs/architecture/rendering.md`.
-This spec does not cover the `--assist` flag's AI behavior (context
+This spec does not cover the assistant's own AI behavior (context
 assembly, the contract loop, the LLM client) — that is
 [`docs/specs/assist.md`](assist.md); it does cover the parts of the
 interactive session every `dash9 open` invocation has regardless of
-`--assist` (Section H below is the one exception, since the `/ai`
-verbs and the assist status-bar segment only do anything when the
-session was built with assist wiring). Section E (keybindings) and
+whether assist wiring is available (Section H below is the one
+exception, since the `/ai` verbs and the assist status-bar segment
+only do anything when it is). Section E (keybindings) and
 Section G (zoom levels) reflect `docs/specs/session-layout.md`
 Sections A-D, which are implemented; that spec's Section E (`/save
 png`) is not — Section I below still accurately says so.
@@ -48,19 +48,32 @@ png`) is not — Section I below still accurately says so.
 ## A. Invocation
 
 ```
-dash9 open <path> [--assist]
+dash9 open <path>
 ```
 
 `<path>` is a dashboard TOML file (`SPEC.md` Section C); it is loaded
 and validated exactly as `dash9 test` loads one (`SPEC.md` C.3 step 1)
 — an invalid file is a startup error, not something the session
-recovers from interactively. `--assist` enables natural-language input
-alongside the command grammar, backed by an OpenAI-compatible endpoint
-configured at `~/.config/dash9/assist.toml` (`docs/specs/assist.md`
-Section D); it requires the `assist` Cargo feature (on by default). If
-`dash9` was built with `--no-default-features` (dropping `assist`),
-passing `--assist` at the CLI is a startup error naming the rebuild
-command needed, not a silent downgrade to grammar-only mode.
+recovers from interactively.
+
+**No `--assist` flag.** An earlier version required passing `--assist`
+at the CLI, on top of the `assist` Cargo feature (on by default), to
+get natural-language input alongside the command grammar — two
+separate on/off questions for the same capability, one at build time
+and one at process-start time. The CLI flag is gone: a build with the
+`assist` feature now always attempts to load
+`~/.config/dash9/assist.toml` (`docs/specs/assist.md` Section D) and
+wire up the assistant when `dash9 open` starts, exactly as `--assist`
+used to trigger — a missing or broken config degrades gracefully to
+"assist unavailable: \<reason\>" (logged once at startup) rather than
+failing the whole session, same as before. The one remaining on/off
+question is answered entirely at runtime, by `/ai on`/`/ai off`
+(Section D) or the `a` key (Section E) — there is no longer a separate
+"was it even requested" gate above that. Building with
+`--no-default-features` (dropping the `assist` Cargo feature) is still
+how you get a build with no AI code linked in at all; `/ai`/`/model`
+and natural-language input report they need that feature rather than
+doing anything, the same shape "assist unavailable" already had.
 
 ## B. Session model
 
@@ -97,9 +110,9 @@ line means, decided before anything else: its leading character —
 - A line with **no** leading `!` or `/` is always **natural language**,
   unconditionally — even if it happens to parse as valid grammar
   (`range 5m` with no `/` is sent as natural language, not executed).
-  It is handed to the assistant only when the session has `--assist`
-  and the assistant is currently on (Section D); otherwise it is
-  reported as unavailable.
+  It is handed to the assistant only when the session was built with
+  assist wiring available and the assistant is currently on
+  (Section D); otherwise it is reported as unavailable.
 
 This rule has no exceptions and no fallback direction — a line's
 routing is decided by its first character alone, never by whether
@@ -123,6 +136,8 @@ document, not treating it as a breaking grammar change.
 | `ai on` | — | `/ai on` | Turn the assistant on (explicit, idempotent — unlike the `a` key, which toggles). |
 | `ai off` | — | `/ai off` | Turn the assistant off. |
 | `ai model` | `<name>` | `/ai model gemini-flash` | Alias of `/model <name>`. |
+| `ai context` | — | `/ai context` | Show what the assistant currently knows: configured datasources, whether a dashboard TOML is available to send, the active time range, and how many messages are in the running conversation. |
+| `ai clear` | — | `/ai clear` | Clear the running conversation history without switching models. |
 | `save` | `<format> [path]` | `/save csv exports/out.csv` | Export the focused panel's data (`csv`, `md`, or `png`; see Section I). |
 | `record` | — | `/record` | Show whether continuous log recording is on, and where. |
 | `record on` | `[path]` | `/record on exports/session.jsonl` | Start recording every log line to a JSONL file (Section J). |
@@ -138,9 +153,12 @@ unmatched topic reports "unknown help topic" rather than showing
 nothing. `/?` is an alias for bare `/help`.
 
 `/ai`, `/model`, and their variants are meaningful only when the
-session was built with `--assist`; a plain `dash9 open` (no
-`--assist`) still recognizes them but reports the assistant as
-unavailable rather than treating them as unknown commands. Full
+session was built with assist wiring available (the `assist` Cargo
+feature, on by default — Section A) and its config loaded
+successfully; every build still recognizes them but reports the
+assistant as unavailable rather than treating them as unknown
+commands, whether that's because the feature wasn't compiled in or
+because `~/.config/dash9/assist.toml` is missing/broken. Full
 assistant behavior (context assembly, the contract loop, proposal
 classification) is `docs/specs/assist.md`.
 
@@ -412,8 +430,8 @@ A one-line bar above the panel grid: dashboard title, panel count, and
 a datasource health marker (`●` healthy, `▲` degraded, `○` unknown —
 derived from whether any panel's last result was an error, not a
 separate connectivity probe; panels already surface their own errors
-inline, this is a summary of that same signal). When built with
-`--assist`, it appends: assistant on/off, the active model name, a
+inline, this is a summary of that same signal). When assist wiring is
+available, it appends: assistant on/off, the active model name, a
 short connectivity label (`idle` / `waiting` / `error: ...`), and
 cumulative tokens sent/received for the session. The AI segment is
 omitted entirely (not shown "off") when the session has no assist

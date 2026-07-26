@@ -1,20 +1,31 @@
 //! `dash9 open`: the live, interactive multi-panel viewer with a
-//! command bar, status bar, and (with `--assist`) natural-language
-//! input. Loads a dashboard TOML, lays out its panels on the
-//! 12-column grid (SPEC.md C.1), polls each panel's datasource live,
-//! renders all four panel types, and runs the full command grammar
-//! (SPEC.md Section B) against a live, mutable session.
+//! command bar, status bar, and (when built with the `assist` feature,
+//! on by default) natural-language input. Loads a dashboard TOML, lays
+//! out its panels on the 12-column grid (SPEC.md C.1), polls each
+//! panel's datasource live, renders all four panel types, and runs the
+//! full command grammar (SPEC.md Section B) against a live, mutable
+//! session.
 //!
 //! The event loop and key-handling are `dash9_tui::shell`'s
 //! `ShellState`/`CommandHandler` — a pure state machine (no terminal/
 //! filesystem/network I/O, fully unit-tested there) calling into a
 //! `CommandHandler` implementation that does the real work. This
-//! module supplies two implementations: [`GrammarOnlyHandler`] (no
-//! assist awareness at all, used by `run_plain`) and
+//! module supplies two implementations: `GrammarOnlyHandler` (no
+//! assist awareness at all, used by `run_plain` — the only
+//! implementation compiled at all when the `assist` feature is off) and
 //! `assist_bridge::AssistHandler` (`#[cfg(feature = "assist")]`, used
 //! by `run_with_assist`). Both drive the same [`shell_loop`], so the
-//! render loop itself is written once — `run_plain`/`run_with_assist`
-//! are now thin constructors, not two parallel copies of the loop.
+//! render loop itself is written once. Which one `run` calls is a
+//! compile-time choice (`#[cfg(feature = "assist")]` on `run` itself)
+//! — there used to also be a runtime `--assist` flag gating this same
+//! choice within an assist-capable build, removed because it just
+//! added a second, redundant "is AI available" question on top of the
+//! one `/ai on`/`/ai off` already answers at runtime (`docs/specs/
+//! open.md` Section D): a build with the feature now always tries to
+//! load `~/.config/dash9/assist.toml` and wires up `AssistHandler`
+//! (gracefully degrading to "assist unavailable: ..." if that config
+//! is missing/broken, exactly as before), and `/ai on`/`/ai off`/the
+//! `a` key are the one on/off switch a user ever needs.
 //!
 //! `CommandHandler` (defined in `dash9-tui`) has no way to expose
 //! `LiveSession`-typed data — `dash9-tui` doesn't and can't depend on
@@ -31,14 +42,21 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
-use dash9_core::{load_path, validate, Command};
+use dash9_core::load_path;
+use dash9_core::validate;
+#[cfg(not(feature = "assist"))]
+use dash9_core::Command;
 use dash9_tui::chart::{ChartModel, ChartViewState};
-use dash9_tui::shell::{CommandHandler, CommandResponse, Region, ShellInput, ShellState, Zoom};
+#[cfg(not(feature = "assist"))]
+use dash9_tui::help_text;
+use dash9_tui::shell::{CommandHandler, Region, ShellState, Zoom};
+#[cfg(not(feature = "assist"))]
+use dash9_tui::shell::{CommandResponse, ShellInput};
 use dash9_tui::{
     detail_height, draw_chart, draw_command_bar, draw_gauge, draw_output, draw_panel_outline,
     draw_stat, draw_status_bar, draw_table, draw_zoom_bar, ensure_visible, grid_layout_fit,
-    grid_layout_scrolled, help_text, max_grid_scroll, output_height, panel_content_range,
-    series_as_table, StatusBarModel, ZoomBarModel,
+    grid_layout_scrolled, max_grid_scroll, output_height, panel_content_range, series_as_table,
+    StatusBarModel, ZoomBarModel,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -46,7 +64,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use tokio::sync::mpsc;
 
-use crate::live_session::{execute_command, LivePanel, LiveSession, SessionUpdate};
+#[cfg(not(feature = "assist"))]
+use crate::live_session::execute_command;
+use crate::live_session::{LivePanel, LiveSession, SessionUpdate};
 use crate::log_recorder::LogRecorder;
 use crate::selection::{self, Selection};
 
@@ -55,13 +75,17 @@ const CHANNEL_CAPACITY: usize = 64;
 const STATUS_BAR_HEIGHT: u16 = 1;
 const ZOOM_BAR_HEIGHT: u16 = 1;
 
-pub fn run(path: &Path, assist: bool) -> anyhow::Result<()> {
-    if assist {
-        return run_with_assist(path);
-    }
+#[cfg(feature = "assist")]
+pub fn run(path: &Path) -> anyhow::Result<()> {
+    run_with_assist(path)
+}
+
+#[cfg(not(feature = "assist"))]
+pub fn run(path: &Path) -> anyhow::Result<()> {
     run_plain(path)
 }
 
+#[cfg(not(feature = "assist"))]
 fn run_plain(path: &Path) -> anyhow::Result<()> {
     let dashboard = load_path(path)
         .and_then(|file| validate(&file))
@@ -77,13 +101,6 @@ fn run_plain(path: &Path) -> anyhow::Result<()> {
         recorder: Arc::clone(&recorder),
     };
     shell_loop(handler, ShellState::default(), &recorder)
-}
-
-#[cfg(not(feature = "assist"))]
-fn run_with_assist(_path: &Path) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "dash9 was built without the `assist` feature; rebuild with `cargo build --features assist`"
-    )
 }
 
 #[cfg(feature = "assist")]
@@ -122,7 +139,7 @@ pub(crate) trait HasSession {
 /// The shared render loop: identical for `run_plain` and
 /// `run_with_assist` now, generic over whichever `CommandHandler`
 /// implementation is driving it. `recorder` is the same handle the
-/// handler holds (see [`GrammarOnlyHandler`]/`AssistHandler`) — the
+/// handler holds (see `GrammarOnlyHandler`/`AssistHandler`) — the
 /// handler owns turning `/record on|off` into an open/closed file,
 /// this loop owns noticing every new `state.log` line and offering it
 /// to the recorder, since that's the one place that sees every line
@@ -317,24 +334,32 @@ fn lock_recorder(recorder: &Mutex<LogRecorder>) -> std::sync::MutexGuard<'_, Log
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The `run_plain` handler: no `dash9-assist` awareness at all. Every
-/// AI-only `ShellInput` variant reports the same "requires --assist"
+/// The `run_plain` handler, used only in builds without the `assist`
+/// feature (`run` itself is `#[cfg]`-gated per feature — see the
+/// module docs — so this is never constructed, and would otherwise be
+/// dead code, in a default build). No `dash9-assist` awareness at all:
+/// every AI-only `ShellInput` variant reports the same "unavailable"
 /// message; `NaturalLanguage` (any line with no leading `/`) reports
-/// that natural language itself needs `--assist`.
+/// that natural language itself needs the feature.
+#[cfg(not(feature = "assist"))]
 struct GrammarOnlyHandler {
     session: LiveSession,
     update_rx: mpsc::Receiver<SessionUpdate>,
     recorder: Arc<Mutex<LogRecorder>>,
 }
 
+#[cfg(not(feature = "assist"))]
 impl HasSession for GrammarOnlyHandler {
     fn session(&self) -> &LiveSession {
         &self.session
     }
 }
 
+#[cfg(not(feature = "assist"))]
 impl CommandHandler for GrammarOnlyHandler {
     fn execute(&mut self, input: ShellInput, focused_panel: usize) -> CommandResponse {
+        const REBUILD_HINT: &str =
+            "the \"assist\" feature — rebuild with `cargo build --features assist`";
         match input {
             ShellInput::Grammar(Command::Quit) => CommandResponse {
                 should_quit: true,
@@ -358,16 +383,17 @@ impl CommandHandler for GrammarOnlyHandler {
             ShellInput::Shell(command) => {
                 CommandResponse::result(self.session.spawn_shell_command(&command))
             }
-            ShellInput::NaturalLanguage(_) => CommandResponse::result(
-                "natural language requires --assist (or prefix a command with /, see /help)"
-                    .to_string(),
-            ),
+            ShellInput::NaturalLanguage(_) => CommandResponse::result(format!(
+                "natural language requires {REBUILD_HINT} (or prefix a command with /, see /help)"
+            )),
             ShellInput::ModelStatus
             | ShellInput::ModelSwitch(_)
             | ShellInput::ToggleAssist
             | ShellInput::AssistStatus
-            | ShellInput::SetAssist(_) => {
-                CommandResponse::result("AI features require --assist".to_string())
+            | ShellInput::SetAssist(_)
+            | ShellInput::AssistContext
+            | ShellInput::AssistClear => {
+                CommandResponse::result(format!("AI features require {REBUILD_HINT}"))
             }
         }
     }
