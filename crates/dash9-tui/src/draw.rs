@@ -36,27 +36,32 @@ pub const PANEL_HINT: &str = "space detail";
 /// points to plot at all. `focused` drives the shared pane chrome
 /// (`pane::pane_block`)'s border/name color — it stays true (and the
 /// panel keeps looking targeted) even while the command box is
-/// capturing keystrokes, since `Tab`/`Shift+Tab` still move it then
-/// (`shell.rs::cycle_focused_panel`). `show_hint` is the separate,
-/// stricter "would `i` actually do something right now" bit — `false`
-/// while editing, even on the focused panel, since `i` is a literal
-/// character in the command box, not the detail toggle, and a hint
-/// promising otherwise would be actively misleading.
+/// capturing keystrokes, since arrow keys/`Tab`/`Shift+Tab` still move
+/// it then (`shell.rs::cycle_focused_panel`); `editing` is what tells
+/// `pane_block` to render that continued focus via the calmer
+/// `theme::FOCUS_DIM` instead of full-bright `theme::FOCUS` while it
+/// isn't where keystrokes actually land (`pane_block`'s own docs).
+/// `show_hint` is the separate, stricter "would `i` actually do
+/// something right now" bit — `false` while editing, even on the
+/// focused panel, since `i` is a literal character in the command box,
+/// not the detail toggle, and a hint promising otherwise would be
+/// actively misleading.
 pub fn draw_chart(
     frame: &mut Frame,
     area: Rect,
     model: &ChartModel,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let has_points = model.series.iter().any(|s| !s.points.is_empty());
     if area.width < MIN_CHART_WIDTH || !has_points {
-        draw_text_fallback(frame, area, model, focused, show_hint);
+        draw_text_fallback(frame, area, model, focused, editing, show_hint);
         return;
     }
 
     let Some((x_min_ms, x_max_ms)) = x_bounds_ms(model) else {
-        draw_text_fallback(frame, area, model, focused, show_hint);
+        draw_text_fallback(frame, area, model, focused, editing, show_hint);
         return;
     };
     #[allow(clippy::cast_precision_loss)]
@@ -129,6 +134,7 @@ pub fn draw_chart(
     let block = pane_block(
         &model.title,
         focused,
+        editing,
         status_for(model),
         show_hint.then_some(PANEL_HINT),
     );
@@ -158,9 +164,16 @@ pub fn draw_panel_outline(
     area: Rect,
     title: &str,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
-    let block = pane_block(title, focused, None, show_hint.then_some(PANEL_HINT));
+    let block = pane_block(
+        title,
+        focused,
+        editing,
+        None,
+        show_hint.then_some(PANEL_HINT),
+    );
     frame.render_widget(block, area);
 }
 
@@ -169,11 +182,13 @@ fn draw_text_fallback(
     area: Rect,
     model: &ChartModel,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let block = pane_block(
         &model.title,
         focused,
+        editing,
         status_for(model),
         show_hint.then_some(PANEL_HINT),
     );
@@ -205,11 +220,13 @@ pub fn draw_stat(
     area: Rect,
     model: &ChartModel,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let block = pane_block(
         &model.title,
         focused,
+        editing,
         status_for(model),
         show_hint.then_some(PANEL_HINT),
     );
@@ -244,11 +261,13 @@ pub fn draw_gauge(
     area: Rect,
     model: &ChartModel,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let block = pane_block(
         &model.title,
         focused,
+        editing,
         status_for(model),
         show_hint.then_some(PANEL_HINT),
     );
@@ -334,26 +353,34 @@ pub fn series_as_table(frame: &dash9_core::Frame) -> Option<dash9_core::Table> {
 /// a `Table` frame with `ChartError::UnsupportedFrameKind`; SPEC.md
 /// A.2 defines `Table` as structurally different, column-oriented
 /// data).
-/// `focused` drives the shared pane chrome's border/name color, `show_hint`
+/// `focused` drives the shared pane chrome's border/name color, `editing`
+/// whether that focus renders dimmed (`pane_block`'s docs), `show_hint`
 /// whether the border also claims `i` will do something right now (`false`
 /// while the command box is editing — see `draw_chart`'s docs for why the
-/// two are separate). Pass `false, false` for the non-focus-ring uses
-/// (e.g. `detail_view.rs`'s inner "data" sub-pane, which is never itself a
-/// `Tab`-focusable target — it's already part of the focused panel's own
-/// detail pane).
+/// two are separate). Pass `false, false, false` for the non-focus-ring
+/// uses (e.g. `detail_view.rs`'s inner "data" sub-pane, which is never
+/// itself a `Tab`-focusable target — it's already part of the focused
+/// panel's own detail pane).
 pub fn draw_table(
     frame: &mut Frame,
     area: Rect,
     table: &dash9_core::Table,
     title: &str,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let status = (table.row_count > 0).then(|| {
         let plural = if table.row_count == 1 { "" } else { "s" };
         (format!("{} row{plural}", table.row_count), theme::TEXT)
     });
-    let block = pane_block(title, focused, status, show_hint.then_some(PANEL_HINT));
+    let block = pane_block(
+        title,
+        focused,
+        editing,
+        status,
+        show_hint.then_some(PANEL_HINT),
+    );
     if table.row_count == 0 {
         frame.render_widget(Paragraph::new("(no rows)").block(block), area);
         return;
@@ -484,10 +511,10 @@ mod tests {
         let backend = TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", true, true))
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", true, false, true))
             .unwrap();
         terminal
-            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", false, false))
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU Usage", false, false, false))
             .unwrap();
     }
 
@@ -496,7 +523,7 @@ mod tests {
         let backend = TestBackend::new(3, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_panel_outline(f, f.area(), "CPU", false, false))
+            .draw(|f| draw_panel_outline(f, f.area(), "CPU", false, false, false))
             .unwrap();
     }
 
@@ -508,7 +535,7 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_chart(f, f.area(), &model, true, true))
+            .draw(|f| draw_chart(f, f.area(), &model, true, false, true))
             .unwrap();
     }
 
@@ -520,7 +547,7 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_chart(f, f.area(), &model, false, false))
+            .draw(|f| draw_chart(f, f.area(), &model, false, false, false))
             .unwrap();
     }
 
@@ -532,7 +559,7 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_chart(f, f.area(), &model, false, false))
+            .draw(|f| draw_chart(f, f.area(), &model, false, false, false))
             .unwrap();
     }
 
@@ -550,14 +577,14 @@ mod tests {
         let backend = TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_stat(f, f.area(), &model, true, true))
+            .draw(|f| draw_stat(f, f.area(), &model, true, false, true))
             .unwrap();
 
         let empty = frame_with(vec![]);
         let empty_model =
             ChartModel::project("Load", &empty, &[], &ChartViewState::default(), 80).unwrap();
         terminal
-            .draw(|f| draw_stat(f, f.area(), &empty_model, false, false))
+            .draw(|f| draw_stat(f, f.area(), &empty_model, false, false, false))
             .unwrap();
     }
 
@@ -569,14 +596,14 @@ mod tests {
         let backend = TestBackend::new(30, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &model, true, true))
+            .draw(|f| draw_gauge(f, f.area(), &model, true, false, true))
             .unwrap();
 
         let empty = frame_with(vec![]);
         let empty_model =
             ChartModel::project("Disk", &empty, &[], &ChartViewState::default(), 80).unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &empty_model, false, false))
+            .draw(|f| draw_gauge(f, f.area(), &empty_model, false, false, false))
             .unwrap();
     }
 
@@ -604,7 +631,7 @@ mod tests {
         let backend = TestBackend::new(30, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_stat(f, f.area(), &stat_model, true, true))
+            .draw(|f| draw_stat(f, f.area(), &stat_model, true, false, true))
             .unwrap();
         let stat_content: String = terminal
             .backend()
@@ -622,7 +649,7 @@ mod tests {
             ChartModel::project("Disk", &frame, &thresholds, &ChartViewState::default(), 80)
                 .unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &gauge_model, true, true))
+            .draw(|f| draw_gauge(f, f.area(), &gauge_model, true, false, true))
             .unwrap();
         let gauge_content: String = terminal
             .backend()
@@ -724,7 +751,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_table(f, f.area(), &table, "Top Processes", true, true))
+            .draw(|f| draw_table(f, f.area(), &table, "Top Processes", true, false, true))
             .unwrap();
 
         let empty_table = Table {
@@ -732,7 +759,17 @@ mod tests {
             row_count: 0,
         };
         terminal
-            .draw(|f| draw_table(f, f.area(), &empty_table, "Top Processes", false, false))
+            .draw(|f| {
+                draw_table(
+                    f,
+                    f.area(),
+                    &empty_table,
+                    "Top Processes",
+                    false,
+                    false,
+                    false,
+                );
+            })
             .unwrap();
     }
 }

@@ -17,6 +17,16 @@ pub const DANGER: Color = Color::Red;
 pub const MUTED: Color = Color::DarkGray;
 pub const TEXT: Color = Color::Gray;
 pub const FOCUS: Color = Color::LightCyan;
+/// The focused panel's border/name while the command box is being
+/// edited (`pane::pane_block`'s `editing` param) — calmer than
+/// [`FOCUS`] (plain Cyan, not the "light"/bright variant, and no bold)
+/// but still a distinct, colored, non-muted state: the panel really is
+/// still focused (`Tab`/arrows still move it), it just isn't where
+/// keystrokes go *right now*, and the previous single bright-focus
+/// treatment for both made it genuinely hard to tell which pane was
+/// actually live — reported live ("command is selected, detail is
+/// selected, and also [the chart] is selected too").
+pub const FOCUS_DIM: Color = Color::Cyan;
 
 /// Stable chart-series palette. Order is part of the contract: series
 /// `i` always gets `series_color(i)`, so a legend and its line keep

@@ -131,6 +131,7 @@ fn draw_log(frame: &mut Frame, area: Rect, log: &[LogLine], scroll: usize, log_f
     let block = pane_block(
         title,
         log_focus.focused,
+        false,
         None,
         log_focus.show_hint.then_some(LOG_HINT),
     );
@@ -188,7 +189,7 @@ fn draw_input(frame: &mut Frame, area: Rect, input: Option<&str>, hint: &str) {
     // (`docs/specs/open.md` Section E) — no separate hint text here, the
     // input line's own contents already say what's happening (the `:
     // <buffer>` prompt while editing, the passed-in `hint` otherwise).
-    let block = pane_block("command", focused, None, None);
+    let block = pane_block("command", focused, false, None, None);
     frame.render_widget(Paragraph::new(text).style(style).block(block), area);
 }
 

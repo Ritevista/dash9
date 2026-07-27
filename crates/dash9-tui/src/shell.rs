@@ -269,14 +269,15 @@ fn help_overview() -> String {
     out.push_str(
         "Keys: Tab/Shift+Tab cycle Main (the panel grid), Output, Log, \
          and the command box, one Tab per region regardless of panel \
-         count · 1-9 select a panel, only while Main has focus · : jump \
-         to command box (Enter submits and stays put — Esc is what \
-         leaves it) · +/- zoom Layout/Grid/Focus (an enlarged single \
-         chart) · Space toggle the focused panel's detail pane below \
-         the main area · Esc closes detail, then goes home to Grid · \
-         PageUp/PageDown page panels (Main + Grid zoom), scroll Output \
-         or Log (whichever has focus), or scroll the log (editing) · \
-         y/n confirm proposal · a toggle AI · q or Ctrl+C quit\n",
+         count · arrow keys step focus one panel at a time, only while \
+         Main has focus · : jump to command box (Enter submits and \
+         stays put — Esc is what leaves it) · +/- zoom Layout/Grid/Focus \
+         (an enlarged single chart) · Space toggle the focused panel's \
+         detail pane below the main area · Esc closes detail, then goes \
+         home to Grid · PageUp/PageDown page panels (Main + Grid zoom), \
+         scroll Output or Log (whichever has focus), or scroll the log \
+         (editing) · y/n confirm proposal · a toggle AI · q or Ctrl+C \
+         quit\n",
     );
     out
 }
@@ -321,9 +322,9 @@ fn help_topic(topic: &str) -> String {
 /// every arm here would just be the same text twice on screen at once.
 pub fn zoom_hint(zoom: Zoom) -> &'static str {
     match zoom {
-        Zoom::Grid => "PageUp/PageDown page panels · 1-9 select · +/- zoom",
-        Zoom::Layout => "1-9 select · + back to grid",
-        Zoom::Focus => "1-9 select · Esc/- back to grid",
+        Zoom::Grid => "PageUp/PageDown page panels · arrows select · +/- zoom",
+        Zoom::Layout => "arrows select · + back to grid",
+        Zoom::Focus => "arrows select · Esc/- back to grid",
     }
 }
 
@@ -635,43 +636,8 @@ impl ShellState {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
-        // `PageUp`/`PageDown` are contextual to whichever region is active
-        // (`docs/specs/session-layout.md` Section C), checked before the
-        // editing/non-editing split below since "editing" is itself one of
-        // the regions in that table (it always scrolls the log, unchanged
-        // from before zoom levels existed — reading old output while
-        // composing a new command is a normal thing to want to do).
-        match key.code {
-            KeyCode::PageUp | KeyCode::PageDown if self.input.is_some() => {
-                self.scroll_log(key.code);
-                return false;
-            }
-            // `Output`/`Log` region focus (`advance_focus`'s ring, `Region`'s
-            // docs) outranks zoom-level paging the same way editing does
-            // above — each is its own region, independent of which zoom
-            // level the main area happens to be showing. `Log`'s scroll
-            // reuses `scroll_log` — same tail-anchored pane, same behavior
-            // whether you got there by editing or by `Tab`-focusing it.
-            KeyCode::PageUp | KeyCode::PageDown if self.region == Region::Output => {
-                self.scroll_output(key.code);
-                return false;
-            }
-            KeyCode::PageUp | KeyCode::PageDown if self.region == Region::Log => {
-                self.scroll_log(key.code);
-                return false;
-            }
-            KeyCode::PageUp | KeyCode::PageDown
-                if self.region == Region::Main && self.zoom == Zoom::Grid =>
-            {
-                self.scroll_grid(key.code);
-                return false;
-            }
-            // Layout: nothing to page, every panel is already visible.
-            // Focus: reserved for v1 (scrolling one panel's own long
-            // content) — not built now, deliberately a no-op rather than
-            // falling back to scrolling the log out from under Focus.
-            KeyCode::PageUp | KeyCode::PageDown => return false,
-            _ => {}
+        if self.handle_paging_key(key.code) {
+            return false;
         }
 
         if self.input.is_some() {
@@ -771,36 +737,18 @@ impl ShellState {
             KeyCode::Esc => self.zoom = self.zoom.zoom_home(),
             KeyCode::Tab => self.advance_focus(true),
             KeyCode::BackTab => self.advance_focus(false),
-            // Only meaningful within the Main region — "which panel" has
-            // no meaning while Output or Log has focus, so a digit is
-            // inert there instead of silently doing something to a panel
-            // you can't currently see highlighted anywhere.
-            KeyCode::Char(c @ '1'..='9') if self.region == Region::Main => {
-                self.focus_panel_by_number(c, handler);
+            // Step focus one panel at a time, same as Tab reaches
+            // while editing (`cycle_focused_panel`'s docs). Right/Down
+            // forward, Left/Up backward.
+            KeyCode::Right | KeyCode::Down | KeyCode::Left | KeyCode::Up
+                if self.region == Region::Main =>
+            {
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Down);
+                self.cycle_focused_panel(handler, forward);
             }
             _ => {}
         }
         false
-    }
-
-    /// `1`-`9`: jump focus straight to that panel (1-indexed, matching how
-    /// panels are announced/counted elsewhere — e.g. the zoom bar's
-    /// "panels X-Y of Z"), instead of stepping through `Tab`'s cycle one
-    /// panel at a time. A digit past `panel_count()` (including on an
-    /// empty dashboard) is a no-op rather than clamping to the last panel
-    /// — silently landing on the wrong panel would be more surprising
-    /// than nothing happening. Works in every zoom level, same as `Tab`
-    /// (`advance_focus` itself is never zoom-gated). Only reachable when
-    /// `region == Region::Main` already (the `handle_key` guard), so
-    /// there's nothing to reset here — `region` is already right.
-    fn focus_panel_by_number<H: CommandHandler>(&mut self, digit: char, handler: &H) {
-        let index = digit
-            .to_digit(10)
-            .expect("checked by the '1'..='9' pattern") as usize
-            - 1;
-        if index < handler.panel_count() {
-            self.focused_panel = index;
-        }
     }
 
     /// Moves focus one step around the fixed 4-stop ring: `Main`,
@@ -880,6 +828,36 @@ impl ShellState {
         if self.focused_panel >= handler.panel_count() {
             self.focused_panel = 0;
         }
+    }
+
+    /// `PageUp`/`PageDown` are contextual to whichever region is active
+    /// (`docs/specs/session-layout.md` Section C) — returns `true` (and
+    /// has already scrolled something) if `key` was one of those two,
+    /// so `handle_key` returns immediately; `false` for any other key,
+    /// so `handle_key` falls through to its own match. Editing outranks
+    /// region (checked first — it's itself one of the regions in that
+    /// table, always scrolling the log, unchanged from before zoom
+    /// levels existed: reading old output while composing a new command
+    /// is a normal thing to want to do); `Output`/`Log` region focus
+    /// outranks zoom-level paging next, each being its own region
+    /// independent of which zoom level the main area happens to be
+    /// showing. Layout has nothing to page (every panel already
+    /// visible); Focus is reserved for v1 (scrolling one panel's own
+    /// long content, not built now) — both are deliberate no-ops
+    /// (`true`, nothing scrolled) rather than falling back to scrolling
+    /// the log out from under them.
+    fn handle_paging_key(&mut self, key: KeyCode) -> bool {
+        if !matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+            return false;
+        }
+        if self.input.is_some() || self.region == Region::Log {
+            self.scroll_log(key);
+        } else if self.region == Region::Output {
+            self.scroll_output(key);
+        } else if self.region == Region::Main && self.zoom == Zoom::Grid {
+            self.scroll_grid(key);
+        }
+        true
     }
 
     fn scroll_log(&mut self, code: KeyCode) {
@@ -1251,65 +1229,102 @@ mod tests {
     }
 
     #[test]
-    fn number_keys_jump_focus_straight_to_that_panel() {
+    fn arrow_keys_step_focus_one_panel_at_a_time() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(5);
 
-        state.handle_key(char_key('3'), &mut handler);
-        assert_eq!(
-            state.focused_panel, 2,
-            "'3' jumps to the 3rd (index 2) panel"
-        );
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(state.focused_panel, 1);
+        state.handle_key(press(KeyCode::Down), &mut handler);
+        assert_eq!(state.focused_panel, 2, "Down steps forward too");
 
-        state.handle_key(char_key('1'), &mut handler);
-        assert_eq!(state.focused_panel, 0);
+        state.handle_key(press(KeyCode::Left), &mut handler);
+        assert_eq!(state.focused_panel, 1);
+        state.handle_key(press(KeyCode::Up), &mut handler);
+        assert_eq!(state.focused_panel, 0, "Up steps backward too");
     }
 
     #[test]
-    fn number_key_past_panel_count_is_a_no_op() {
+    fn arrow_keys_wrap_around_the_panel_list() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(3);
-        state.focused_panel = 1;
+        state.focused_panel = 2;
 
-        state.handle_key(char_key('9'), &mut handler);
-        assert_eq!(state.focused_panel, 1, "no 9th panel — focus stays put");
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(state.focused_panel, 0, "forward wraps past the last panel");
+
+        state.handle_key(press(KeyCode::Left), &mut handler);
+        assert_eq!(
+            state.focused_panel, 2,
+            "backward wraps past the first panel"
+        );
     }
 
     #[test]
-    fn number_key_on_an_empty_dashboard_is_a_no_op() {
+    fn arrow_keys_on_an_empty_dashboard_is_a_no_op() {
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(0);
-        state.handle_key(char_key('1'), &mut handler);
+        state.handle_key(press(KeyCode::Right), &mut handler);
         assert_eq!(state.focused_panel, 0);
     }
 
     #[test]
-    fn number_keys_work_in_every_zoom_level() {
+    fn arrow_keys_work_in_every_zoom_level() {
         for zoom in [Zoom::Layout, Zoom::Grid, Zoom::Focus] {
             let mut state = ShellState {
                 zoom,
                 ..ShellState::default()
             };
             let mut handler = MockHandler::new(4);
-            state.handle_key(char_key('4'), &mut handler);
+            state.handle_key(press(KeyCode::Right), &mut handler);
             assert_eq!(
-                state.focused_panel, 3,
-                "{zoom:?} should still honor 1-9 selection"
+                state.focused_panel, 1,
+                "{zoom:?} should still step panel focus"
             );
         }
     }
 
     #[test]
-    fn number_key_while_editing_is_a_literal_character_not_a_jump() {
+    fn arrow_keys_are_inert_outside_main_and_never_change_region() {
+        // "Which panel" has no meaning while Output or Log has focus — an
+        // arrow press there must do nothing at all, not fall back to
+        // stepping a panel and silently switching back to Main.
         let mut state = ShellState::default();
         let mut handler = MockHandler::new(5);
-        state.handle_key(char_key(':'), &mut handler);
-        state.handle_key(char_key('3'), &mut handler);
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Output);
+
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(
+            state.region,
+            Region::Output,
+            "arrow press must not implicitly return focus to Main"
+        );
         assert_eq!(
             state.focused_panel, 0,
-            "digits while editing must not move focus"
+            "and must not change which panel is remembered as focused"
         );
-        assert_eq!(state.input.as_deref(), Some("3"));
+
+        state.handle_key(press(KeyCode::Tab), &mut handler);
+        assert_eq!(state.region, Region::Log);
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(state.region, Region::Log, "same for Log");
+        assert_eq!(state.focused_panel, 0);
+    }
+
+    #[test]
+    fn arrow_keys_work_normally_once_back_on_main() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(5);
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
+        state.handle_key(press(KeyCode::Tab), &mut handler); // Log -> command box
+        state.handle_key(press(KeyCode::Esc), &mut handler); // cancel — ring continues to Main
+
+        assert_eq!(state.region, Region::Main);
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(state.focused_panel, 1, "arrows work again once on Main");
     }
 
     #[test]
@@ -1378,49 +1393,6 @@ mod tests {
 
         state.handle_key(press(KeyCode::Tab), &mut handler);
         assert!(state.input.is_some());
-    }
-
-    #[test]
-    fn digit_keys_are_inert_outside_main_and_never_change_region() {
-        // "Which panel" has no meaning while Output or Log has focus — a
-        // digit press there must do nothing at all, not fall back to
-        // jumping a panel and silently switching back to Main.
-        let mut state = ShellState::default();
-        let mut handler = MockHandler::new(5);
-
-        state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert_eq!(state.region, Region::Output);
-
-        state.handle_key(char_key('3'), &mut handler);
-        assert_eq!(
-            state.region,
-            Region::Output,
-            "digit press must not implicitly return focus to Main"
-        );
-        assert_eq!(
-            state.focused_panel, 0,
-            "and must not change which panel is remembered as focused"
-        );
-
-        state.handle_key(press(KeyCode::Tab), &mut handler);
-        assert_eq!(state.region, Region::Log);
-        state.handle_key(char_key('2'), &mut handler);
-        assert_eq!(state.region, Region::Log, "same for Log");
-        assert_eq!(state.focused_panel, 0);
-    }
-
-    #[test]
-    fn digit_key_works_normally_once_back_on_main() {
-        let mut state = ShellState::default();
-        let mut handler = MockHandler::new(5);
-        state.handle_key(press(KeyCode::Tab), &mut handler); // Main -> Output
-        state.handle_key(press(KeyCode::Tab), &mut handler); // Output -> Log
-        state.handle_key(press(KeyCode::Tab), &mut handler); // Log -> command box
-        state.handle_key(press(KeyCode::Esc), &mut handler); // cancel — ring continues to Main
-
-        assert_eq!(state.region, Region::Main);
-        state.handle_key(char_key('3'), &mut handler);
-        assert_eq!(state.focused_panel, 2, "digits work again once on Main");
     }
 
     #[test]

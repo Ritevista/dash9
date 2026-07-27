@@ -19,7 +19,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame as RatatuiFrame;
 
-use dash9_core::{CommandError, Duration, Frame, GridSpec, PanelType, ValidatedThreshold};
+use dash9_core::{CommandError, Duration, Frame, PanelType, ValidatedThreshold};
 
 use crate::draw::draw_table;
 use crate::export::table_for_export;
@@ -37,12 +37,23 @@ pub struct PanelDetail<'a> {
     pub query: &'a str,
     pub allow_empty: bool,
     pub latency_budget: Option<Duration>,
-    pub grid: GridSpec,
+    /// 1-indexed position among every panel on the dashboard (matches
+    /// the zoom bar's own "panels X-Y of Z" numbering, `open.md`
+    /// Section H) and the total panel count. Replaces showing the raw
+    /// `GridSpec` — its `row`/`col` are internal layout units, not
+    /// something a person can relate to anything else on screen (and
+    /// can run into the thousands after a Grafana import rebases
+    /// overlapping collapsed-row blocks apart, `docs/specs/
+    /// grafana-dashboards.md` Section H) — reported live as
+    /// "confusing." "Panel N of TOTAL" is the number a person actually
+    /// wants: which one, out of how many.
+    pub panel_number: usize,
+    pub panel_count: usize,
     pub thresholds: &'a [ValidatedThreshold],
     pub last_result: Option<&'a Result<Frame, CommandError>>,
 }
 
-/// 6 fixed lines (title/type/datasource/query/grid/allow-empty) plus
+/// 6 fixed lines (title/type/datasource/query/panel/allow-empty) plus
 /// either one "(none)" line, or a "Thresholds:" header *and* one line
 /// per threshold — the header is a separate line from the entries it
 /// introduces, not absorbed into the count of one of them. Plus the
@@ -98,10 +109,7 @@ fn draw_config(frame: &mut RatatuiFrame, area: Rect, detail: &PanelDetail) {
         format!("Type: {}", detail.panel_type),
         format!("Datasource: {}", detail.datasource_line),
         format!("Query: {}", detail.query),
-        format!(
-            "Grid: row {}, col {}, w {}, h {}",
-            detail.grid.row, detail.grid.col, detail.grid.w, detail.grid.h
-        ),
+        format!("Panel: {} of {}", detail.panel_number, detail.panel_count),
         format!(
             "Allow empty: {} · Latency budget: {}",
             detail.allow_empty,
@@ -122,8 +130,9 @@ fn draw_config(frame: &mut RatatuiFrame, area: Rect, detail: &PanelDetail) {
     let block = pane_block(
         &format!("detail: {}", detail.title),
         true,
+        false,
         None,
-        Some("Esc/i close"),
+        Some("Esc/space close"),
     );
     frame.render_widget(Paragraph::new(lines.join("\n")).block(block), area);
 }
@@ -141,7 +150,7 @@ fn draw_data(frame: &mut RatatuiFrame, area: Rect, detail: &PanelDetail) {
         return draw_data_placeholder(frame, area, "(no data)");
     }
     match table_for_export(core_frame) {
-        Some(table) => draw_table(frame, area, &table, "data", false, false),
+        Some(table) => draw_table(frame, area, &table, "data", false, false, false),
         None => draw_data_placeholder(frame, area, "(no table data)"),
     }
 }
@@ -179,12 +188,8 @@ mod tests {
                 magnitude: 5,
                 unit: DurationUnit::Seconds,
             }),
-            grid: GridSpec {
-                row: 0,
-                col: 0,
-                w: 6,
-                h: 4,
-            },
+            panel_number: 1,
+            panel_count: 4,
             thresholds: &[],
             last_result: None,
         }
@@ -304,6 +309,36 @@ mod tests {
             content.contains("crit"),
             "second threshold must not be clipped off the bottom of the box"
         );
+    }
+
+    /// Regression test: the config block used to show the panel's raw
+    /// `GridSpec` ("Grid: row 0, col 0, w 6, h 4") — internal layout
+    /// units that mean nothing to a person and can run into the
+    /// thousands after a Grafana import rebases collapsed-row blocks
+    /// apart, reported live as confusing. `Panel: N of TOTAL` replaces
+    /// it — the number a person actually wants: which panel, out of
+    /// how many.
+    #[test]
+    fn detail_shows_panel_number_not_raw_grid_coordinates() {
+        let mut detail = base_detail();
+        detail.panel_number = 47;
+        detail.panel_count = 124;
+        let mut terminal = backend(60, 20);
+        terminal
+            .draw(|f| draw_panel_detail(f, f.area(), Some(&detail)))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("Panel: 47 of 124"),
+            "expected panel number, not raw grid coordinates: {content}"
+        );
+        assert!(!content.contains("Grid: row"));
     }
 
     #[test]

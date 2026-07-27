@@ -86,7 +86,13 @@ pub fn draw_output(
     focused: bool,
     show_hint: bool,
 ) {
-    let block = pane_block("output", focused, None, show_hint.then_some(OUTPUT_HINT));
+    let block = pane_block(
+        "output",
+        focused,
+        false,
+        None,
+        show_hint.then_some(OUTPUT_HINT),
+    );
     match latest_result_text(log) {
         Some(text) => {
             frame.render_widget(
