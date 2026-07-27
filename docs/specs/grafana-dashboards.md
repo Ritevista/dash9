@@ -310,3 +310,16 @@ none of this exists on the export side, which isn't built yet.
   resolution Section B already proposes for a non-Prometheus panel
   (no new `PanelCheckResult` variant; still deferred as its own
   SPEC.md C.3 amendment, per Section B).
+- **`allow_empty` defaults to `true` for every imported panel** — the
+  opposite of a TOML panel's strict default (SPEC.md C.1). Grafana JSON
+  has no `allow_empty` field to map at all; this is a synthesized
+  default, not a mapping. A hand-authored TOML panel's empty result
+  usually signals something's actually wrong, so `false` is the right
+  strict default there. A general-purpose community dashboard (Node
+  Exporter Full, grounding this spec, is exactly this) covers many
+  *optional* exporter collectors no single environment enables all of
+  — e.g. `node_tcp_connection_states` needs node_exporter's `tcpstat`
+  collector, off by default upstream. Failing `dash9 test` over a
+  normal deployment difference, indistinguishable from a genuinely
+  broken query under the strict default, is worse than the (rare) case
+  of a real regression going unflagged.
