@@ -179,28 +179,25 @@ pub fn max_grid_scroll(panels: &[GridSpec], viewport_height: u16) -> u16 {
     content_height(panels).saturating_sub(viewport_height)
 }
 
-/// Every distinct row-top y-offset across `panels` (content-relative,
-/// same row-unit-scaled terminal rows [`grid_layout_scrolled`]'s
-/// `scroll` uses), ascending and deduplicated — the set of places
-/// [`next_grid_row_boundary`]/[`prev_grid_row_boundary`] can land
-/// `grid_scroll` on, so `PageUp`/`PageDown` in Grid zoom always show a
-/// complete row instead of clipping one mid-height.
-/// Real dashboards (unlike the hand-aligned `node-overview.toml`
-/// worked example) don't line every panel in a visual row up on
-/// exactly the same `row` value — small panels of different heights
-/// sharing a row commonly start a couple of row-units apart (seen
-/// live on a real 124-panel Grafana import: 58 distinct `row` values,
-/// not the ~16 a human looking at it would call "rows"). Treating
-/// every distinct `row` as its own boundary made `PageDown` creep by
-/// a couple of terminal rows at a time instead of jumping a whole
-/// visual row, indistinguishable from the fixed-step clipping this
-/// was built to fix. So panels are merged into bands by *vertical
-/// overlap* first (a standard interval-merge over each panel's
-/// `[top, bottom)` content range, sorted by `top`) — two panels
-/// belong to the same band iff their content ranges overlap, directly
-/// or transitively through a third panel — and only each band's own
-/// top becomes a boundary.
-fn row_boundaries(panels: &[GridSpec]) -> Vec<u16> {
+/// Merges `panels` into visual row bands by vertical overlap — a
+/// standard interval-merge over each panel's `[top, bottom)` content
+/// range (content-relative, same row-unit-scaled terminal rows
+/// [`grid_layout_scrolled`]'s `scroll` uses), sorted by `top`. Two
+/// panels belong to the same band iff their content ranges overlap,
+/// directly or transitively through a third panel. Real dashboards
+/// (unlike the hand-aligned `node-overview.toml` worked example) don't
+/// line every panel in a visual row up on exactly the same `row`
+/// value — small panels of different heights sharing a row commonly
+/// start a couple of row-units apart (seen live on a real 124-panel
+/// Grafana import: 58 distinct `row` values, merging into 47 real
+/// bands — not the ~16 a human looking at it would call "rows," since
+/// one Grafana row *section* commonly stacks more than one band of
+/// panels, but far fewer than 58). Feeds both
+/// [`next_grid_row_boundary`]/[`prev_grid_row_boundary`] (paging) and
+/// [`grid_viewport_height_for_whole_rows`] (render clipping) — the two
+/// need the same bands, just different projections of them (tops
+/// only, vs. full `[top, bottom)` ranges).
+fn row_bands(panels: &[GridSpec]) -> Vec<(u16, u16)> {
     let mut spans: Vec<(u16, u16)> = panels
         .iter()
         .map(|grid| {
@@ -217,18 +214,22 @@ fn row_boundaries(panels: &[GridSpec]) -> Vec<u16> {
         .collect();
     spans.sort_unstable();
 
-    let mut boundaries = Vec::new();
-    let mut band_end: Option<u16> = None;
+    let mut bands: Vec<(u16, u16)> = Vec::new();
     for (top, bottom) in spans {
-        match band_end {
-            Some(end) if top < end => band_end = Some(end.max(bottom)),
-            _ => {
-                boundaries.push(top);
-                band_end = Some(bottom);
-            }
+        match bands.last_mut() {
+            Some((_, end)) if top < *end => *end = (*end).max(bottom),
+            _ => bands.push((top, bottom)),
         }
     }
-    boundaries
+    bands
+}
+
+/// Every row band's own top (see [`row_bands`]) — the set of places
+/// [`next_grid_row_boundary`]/[`prev_grid_row_boundary`] can land
+/// `grid_scroll` on, so `PageUp`/`PageDown` in Grid zoom always show a
+/// complete row instead of clipping one mid-height.
+fn row_boundaries(panels: &[GridSpec]) -> Vec<u16> {
+    row_bands(panels).into_iter().map(|(top, _)| top).collect()
 }
 
 /// `PageDown`'s target in Grid zoom: the nearest row boundary strictly
@@ -253,6 +254,41 @@ pub fn prev_grid_row_boundary(panels: &[GridSpec], scroll: u16) -> u16 {
         .rev()
         .find(|&top| top < scroll)
         .unwrap_or(0)
+}
+
+/// Shrinks a Grid-zoom viewport that would otherwise clip a row band
+/// partway through at the bottom edge — the actual bug behind
+/// "stretches and contracts": even after paging lands `scroll` exactly
+/// on a band's top ([`next_grid_row_boundary`]), a raw
+/// terminal-space-driven `available` height (`open.rs`'s `pane_heights`)
+/// has no reason to be an exact multiple of the visible bands' heights,
+/// so the *next* band commonly pokes a few rows into the bottom of the
+/// viewport — just enough for a chart to try to render into a
+/// near-zero-height `Rect` and come out looking squashed/distorted,
+/// confirmed live. This returns the largest height `<= available` that
+/// never lets a *new* band (one whose top falls inside the window,
+/// i.e. not the band `scroll` is already inside) start without also
+/// fully fitting; the leftover space becomes blank, not another
+/// clipped chart. The band `scroll` is already inside is left alone —
+/// scrolling into the middle of an over-tall band and showing only
+/// what fits is the existing, correct, unrelated behavior
+/// ([`ensure_visible`]'s "pinned to top" case has the same shape).
+pub fn grid_viewport_height_for_whole_rows(
+    panels: &[GridSpec],
+    scroll: u16,
+    available: u16,
+) -> u16 {
+    let viewport_end = scroll.saturating_add(available);
+    let mut height = available;
+    for (top, bottom) in row_bands(panels) {
+        if top > scroll && top < viewport_end {
+            let relative_bottom = bottom.saturating_sub(scroll);
+            if relative_bottom > available {
+                height = height.min(top.saturating_sub(scroll));
+            }
+        }
+    }
+    height
 }
 
 /// The focused panel's content-relative row range (`(top, bottom)`, in the
@@ -678,6 +714,39 @@ mod tests {
     fn row_boundaries_of_an_empty_panel_list_never_move_scroll() {
         assert_eq!(next_grid_row_boundary(&[], 5), 5);
         assert_eq!(prev_grid_row_boundary(&[], 5), 0);
+    }
+
+    #[test]
+    fn grid_viewport_height_shrinks_to_hide_a_band_that_would_be_cut_at_the_bottom() {
+        // node_overview_grids: band 1 is [0,24) (row 0's three panels),
+        // band 2 is [24,48) (row 4's full-width panel). available=30
+        // lets band 2 start poking in at relative offset 24, but only
+        // 6 rows of it (24..30) would show -- exactly the squashed-
+        // chart bug reported live. The viewport must shrink to 24,
+        // hiding band 2 entirely rather than clipping it.
+        let grids = node_overview_grids();
+        assert_eq!(grid_viewport_height_for_whole_rows(&grids, 0, 30), 24);
+    }
+
+    #[test]
+    fn grid_viewport_height_is_unchanged_when_every_visible_band_fits_exactly() {
+        let grids = node_overview_grids();
+        assert_eq!(grid_viewport_height_for_whole_rows(&grids, 0, 48), 48);
+    }
+
+    #[test]
+    fn grid_viewport_height_leaves_the_band_scroll_is_already_inside_alone() {
+        // available=20 doesn't even fully fit band 1 (0..24) itself --
+        // that's the existing "scrolled into an over-tall band, show
+        // what fits" case (`ensure_visible`'s "pinned to top"), not a
+        // new band poking through the bottom, so no further shrinking.
+        let grids = node_overview_grids();
+        assert_eq!(grid_viewport_height_for_whole_rows(&grids, 0, 20), 20);
+    }
+
+    #[test]
+    fn grid_viewport_height_of_no_panels_is_unchanged() {
+        assert_eq!(grid_viewport_height_for_whole_rows(&[], 0, 20), 20);
     }
 
     #[test]

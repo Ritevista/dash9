@@ -526,8 +526,18 @@ fn pane_heights(
 
             let grid = match state.zoom {
                 Zoom::Focus => available_for_grid,
-                Zoom::Grid | Zoom::Layout => {
-                    dash9_tui::content_height(grids).min(available_for_grid)
+                Zoom::Layout => dash9_tui::content_height(grids).min(available_for_grid),
+                Zoom::Grid => {
+                    let capped = dash9_tui::content_height(grids).min(available_for_grid);
+                    // Never let a row band poke partway into the bottom
+                    // of the viewport — that's a chart squeezed into a
+                    // near-zero-height `Rect`, confirmed live as the
+                    // "stretches and contracts" artifact
+                    // (`layout::grid_viewport_height_for_whole_rows`
+                    // docs). Layout zoom doesn't need this: it never
+                    // clips or scrolls, `grid_layout_fit` scales every
+                    // panel to fit instead.
+                    dash9_tui::grid_viewport_height_for_whole_rows(grids, state.grid_scroll, capped)
                 }
             };
             (grid, detail, output, bar)
