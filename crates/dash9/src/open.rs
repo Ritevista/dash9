@@ -39,7 +39,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
+    MouseEventKind,
 };
 use crossterm::execute;
 #[cfg(not(feature = "assist"))]
@@ -216,9 +217,11 @@ fn shell_loop<H: CommandHandler + HasSession>(
                     // from whatever you just selected.
                     selection = None;
                     let focused_before = state.focused_panel;
+                    let grid_scroll_before = state.grid_scroll;
                     let before = state.log.len();
                     let should_quit = state.handle_key(key, &mut handler);
                     record_new_lines(&state, recorder, before);
+                    snap_grid_scroll_to_row(&mut state, handler.session(), key, grid_scroll_before);
                     sync_grid_scroll_to_focus(
                         &mut state,
                         handler.session(),
@@ -301,6 +304,34 @@ fn sync_grid_scroll_to_focus(
     };
     let max_scroll = max_grid_scroll(&grids, viewport_height);
     state.grid_scroll = ensure_visible(state.grid_scroll, range, viewport_height).min(max_scroll);
+}
+
+/// Overrides `ShellState::handle_key`'s own fixed-step `grid_scroll`
+/// update with a jump to the next/previous real row boundary
+/// (`layout::next_grid_row_boundary`/`prev_grid_row_boundary`) — the
+/// same "composition root refines a field using real panel data
+/// `ShellState` doesn't have" pattern [`sync_grid_scroll_to_focus`]
+/// already uses, just for paging instead of focus-follow. Only fires
+/// for exactly the key/state combination `ShellState::handle_key`
+/// itself treats as Grid-zoom paging (`shell.rs`'s `PageUp`/`PageDown`
+/// match arms) — anything else (editing, Output/Log region, Layout/
+/// Focus zoom) leaves `state.grid_scroll` as `handle_key` set it
+/// (unchanged there, since those cases never touch it).
+fn snap_grid_scroll_to_row(
+    state: &mut ShellState,
+    session: &LiveSession,
+    key: KeyEvent,
+    grid_scroll_before: u16,
+) {
+    if state.input.is_some() || state.region != Region::Main || state.zoom != Zoom::Grid {
+        return;
+    }
+    let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
+    state.grid_scroll = match key.code {
+        KeyCode::PageDown => dash9_tui::next_grid_row_boundary(&grids, grid_scroll_before),
+        KeyCode::PageUp => dash9_tui::prev_grid_row_boundary(&grids, grid_scroll_before),
+        _ => return,
+    };
 }
 
 /// Offers every log line added since `before` to the recorder — a

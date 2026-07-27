@@ -179,6 +179,82 @@ pub fn max_grid_scroll(panels: &[GridSpec], viewport_height: u16) -> u16 {
     content_height(panels).saturating_sub(viewport_height)
 }
 
+/// Every distinct row-top y-offset across `panels` (content-relative,
+/// same row-unit-scaled terminal rows [`grid_layout_scrolled`]'s
+/// `scroll` uses), ascending and deduplicated — the set of places
+/// [`next_grid_row_boundary`]/[`prev_grid_row_boundary`] can land
+/// `grid_scroll` on, so `PageUp`/`PageDown` in Grid zoom always show a
+/// complete row instead of clipping one mid-height.
+/// Real dashboards (unlike the hand-aligned `node-overview.toml`
+/// worked example) don't line every panel in a visual row up on
+/// exactly the same `row` value — small panels of different heights
+/// sharing a row commonly start a couple of row-units apart (seen
+/// live on a real 124-panel Grafana import: 58 distinct `row` values,
+/// not the ~16 a human looking at it would call "rows"). Treating
+/// every distinct `row` as its own boundary made `PageDown` creep by
+/// a couple of terminal rows at a time instead of jumping a whole
+/// visual row, indistinguishable from the fixed-step clipping this
+/// was built to fix. So panels are merged into bands by *vertical
+/// overlap* first (a standard interval-merge over each panel's
+/// `[top, bottom)` content range, sorted by `top`) — two panels
+/// belong to the same band iff their content ranges overlap, directly
+/// or transitively through a third panel — and only each band's own
+/// top becomes a boundary.
+fn row_boundaries(panels: &[GridSpec]) -> Vec<u16> {
+    let mut spans: Vec<(u16, u16)> = panels
+        .iter()
+        .map(|grid| {
+            let top = u16::try_from(grid.row)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(ROW_UNIT_HEIGHT);
+            let bottom = top.saturating_add(
+                u16::try_from(grid.h)
+                    .unwrap_or(u16::MAX)
+                    .saturating_mul(ROW_UNIT_HEIGHT),
+            );
+            (top, bottom)
+        })
+        .collect();
+    spans.sort_unstable();
+
+    let mut boundaries = Vec::new();
+    let mut band_end: Option<u16> = None;
+    for (top, bottom) in spans {
+        match band_end {
+            Some(end) if top < end => band_end = Some(end.max(bottom)),
+            _ => {
+                boundaries.push(top);
+                band_end = Some(bottom);
+            }
+        }
+    }
+    boundaries
+}
+
+/// `PageDown`'s target in Grid zoom: the nearest row boundary strictly
+/// past `scroll` — the top of the next full row of panels, not a
+/// fixed pixel step (`docs/specs/session-layout.md` Section A.2).
+/// `scroll` itself (a no-op) when already on or past the last row's
+/// top; the composition root separately clamps the result against
+/// [`max_grid_scroll`], same as every other `grid_scroll` write.
+pub fn next_grid_row_boundary(panels: &[GridSpec], scroll: u16) -> u16 {
+    row_boundaries(panels)
+        .into_iter()
+        .find(|&top| top > scroll)
+        .unwrap_or(scroll)
+}
+
+/// `PageUp`'s target in Grid zoom: the nearest row boundary strictly
+/// before `scroll` — `0` (the first row) if `scroll` is already at or
+/// before it. See [`next_grid_row_boundary`].
+pub fn prev_grid_row_boundary(panels: &[GridSpec], scroll: u16) -> u16 {
+    row_boundaries(panels)
+        .into_iter()
+        .rev()
+        .find(|&top| top < scroll)
+        .unwrap_or(0)
+}
+
 /// The focused panel's content-relative row range (`(top, bottom)`, in the
 /// same units [`grid_layout_scrolled`]'s `scroll` uses) — `None` when
 /// `index` is out of bounds (e.g. an empty dashboard). Feeds
@@ -557,6 +633,99 @@ mod tests {
     #[test]
     fn max_grid_scroll_is_the_overflow_when_content_does_not_fit() {
         assert_eq!(max_grid_scroll(&node_overview_grids(), 20), 28); // 48 - 20
+    }
+
+    #[test]
+    fn next_grid_row_boundary_finds_the_next_distinct_row_top() {
+        // node_overview_grids' rows are 0 and 4 (row-units) -> content
+        // y 0 and 24 (ROW_UNIT_HEIGHT 6). Three panels share row 0, so
+        // that duplicate must not produce a spurious extra boundary.
+        let grids = node_overview_grids();
+        assert_eq!(next_grid_row_boundary(&grids, 0), 24);
+        assert_eq!(
+            next_grid_row_boundary(&grids, 10),
+            24,
+            "skips past a mid-row scroll to the next full row"
+        );
+    }
+
+    #[test]
+    fn next_grid_row_boundary_is_a_no_op_past_the_last_row() {
+        let grids = node_overview_grids();
+        assert_eq!(next_grid_row_boundary(&grids, 24), 24);
+        assert_eq!(next_grid_row_boundary(&grids, 100), 100);
+    }
+
+    #[test]
+    fn prev_grid_row_boundary_finds_the_previous_distinct_row_top() {
+        let grids = node_overview_grids();
+        assert_eq!(prev_grid_row_boundary(&grids, 24), 0);
+        assert_eq!(
+            prev_grid_row_boundary(&grids, 30),
+            24,
+            "skips back past a mid-row scroll to that row's own top"
+        );
+    }
+
+    #[test]
+    fn prev_grid_row_boundary_floors_at_zero() {
+        let grids = node_overview_grids();
+        assert_eq!(prev_grid_row_boundary(&grids, 0), 0);
+        assert_eq!(prev_grid_row_boundary(&grids, 10), 0);
+    }
+
+    #[test]
+    fn row_boundaries_of_an_empty_panel_list_never_move_scroll() {
+        assert_eq!(next_grid_row_boundary(&[], 5), 5);
+        assert_eq!(prev_grid_row_boundary(&[], 5), 0);
+    }
+
+    #[test]
+    fn overlapping_panels_at_slightly_different_rows_merge_into_one_boundary() {
+        // Mirrors a real Grafana import: small panels sharing a
+        // visual row don't all start at the exact same `row` — they
+        // just overlap. All three of these belong to the same band
+        // (row-units: [1,9), [3,7), [6,10) all touch), so PageDown
+        // must jump straight past the whole band, not stop partway
+        // through it at row 3 or row 6.
+        let grids = vec![
+            GridSpec {
+                row: 1,
+                col: 0,
+                w: 8,
+                h: 8,
+            },
+            GridSpec {
+                row: 3,
+                col: 8,
+                w: 8,
+                h: 4,
+            },
+            GridSpec {
+                row: 6,
+                col: 16,
+                w: 8,
+                h: 4,
+            },
+            GridSpec {
+                row: 12,
+                col: 0,
+                w: 24,
+                h: 4,
+            }, // a clearly separate second band
+        ];
+        assert_eq!(
+            next_grid_row_boundary(&grids, 0),
+            6,
+            "from before the first band, the boundary is simply that band's own top"
+        );
+        assert_eq!(
+            next_grid_row_boundary(&grids, 6),
+            72,
+            "from inside the first band, jumps straight to the second band's top \
+             (row 12 * ROW_UNIT_HEIGHT 6) — not row 3 or row 6, which are still part of the first band"
+        );
+        assert_eq!(prev_grid_row_boundary(&grids, 72), 6, "row 1 * 6");
     }
 
     #[test]
