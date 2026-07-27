@@ -15,7 +15,7 @@ use dash9_core::{Frame, FrameKind, Point, ThresholdOp, ValidatedThreshold};
 /// ranked by latest value and the rest are dropped with the count
 /// surfaced in [`ChartModel::truncated_series_count`] rather than
 /// silently disappearing.
-const MAX_DISPLAYED_SERIES: usize = 8;
+pub(crate) const MAX_DISPLAYED_SERIES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChartError {
