@@ -15,11 +15,18 @@ dashboard import or export") for the phase this spec covers — that
 line was accurate for Phase 1 (v0.1) and remains an accurate
 description of what v0.1 shipped; it does not describe this phase.
 
-Status: **Proposed** — nothing below is implemented yet. Prerequisites:
-`SPEC.md` (the TOML schema and `Frame` model this maps onto),
-`docs/specs/open.md` (the session a Grafana-sourced dashboard runs
-inside once loaded), `docs/specs/assist.md` (how AI enhancement plugs
-in).
+Status: **Partially implemented** — the *import* path (Sections C/D's
+field mapping, Section F's grid migration and format detection) is
+built and grounded against a real dashboard (`crates/dash9-core/src/
+grafana.rs`: Grafana.com "Node Exporter Full", ID 1860, schemaVersion
+41). Losslessly preserving unmapped fields for re-export (Section A's
+round-trip guarantee, `dash9 dash save` writing Grafana JSON back out)
+is **not** built — this phase only ever reads Grafana JSON, never
+writes it. Prerequisites: `SPEC.md` (the TOML schema and `Frame` model
+this maps onto), `docs/specs/open.md` (the session a Grafana-sourced
+dashboard runs inside once loaded, including the `--prometheus-url`
+flag this phase added), `docs/specs/assist.md` (how AI enhancement
+plugs in).
 
 ## Contents
 
@@ -30,6 +37,7 @@ in).
 - [E. Template variables](#e-template-variables)
 - [F. Open design questions](#f-open-design-questions)
 - [G. Non-goals](#g-non-goals)
+- [H. Import implementation notes (what real dashboards needed)](#h-import-implementation-notes-what-real-dashboards-needed)
 
 ---
 
@@ -229,3 +237,76 @@ Grafana.
   format only — pushing a dashboard to a running Grafana instance
   over its HTTP API, or pulling one down live, is a distinct,
   unstarted capability, not assumed here.
+
+## H. Import implementation notes (what real dashboards needed)
+
+Grounded against a real, non-trivial dashboard rather than only the
+worked example in Section C — the public "Node Exporter Full"
+(Grafana.com ID 1860). That surfaced real structure this spec's
+earlier sections didn't anticipate; the decisions below are the
+implementation's answers, recorded here since nothing above covers
+them. Import-only (module docs, `crates/dash9-core/src/grafana.rs`) —
+none of this exists on the export side, which isn't built yet.
+
+- **Row panels.** Not mentioned anywhere above. An expanded row's
+  children are flat siblings in `panels[]`, positioned by their own
+  `gridPos`; a *collapsed* row's children are nested inside the row's
+  own `panels[]` instead. Both are flattened into a plain panel list;
+  the row entry itself carries no query and is dropped, not imported
+  as a panel of its own.
+- **The datasource `uid` can itself be a template variable**
+  (`"uid": "${ds_prometheus}"`), unaddressed by Section D's "resolved
+  by matching `uid`." Since dash9 only ever supports one datasource
+  *type* (Prometheus), the uid's literal value — variable or not — is
+  never actually matched; any panel with `datasource.type ==
+  "prometheus"` resolves to the one Prometheus datasource dash9 was
+  given at import.
+- **Where that one Prometheus datasource's URL comes from**: Section D
+  says dash9 "prompts for one on first import rather than guessing."
+  Implemented as `dash9 open`/`dash9 test --prometheus-url <url>`
+  (default `http://localhost:9090`, `docs/specs/open.md` Section A) —
+  an explicit CLI input, not an interactive in-TUI dialog. Revisit if
+  multi-datasource dashboards ever need more than one URL.
+- **Grafana built-in variables** (`$__rate_interval`, `$__interval`,
+  `$__range`, ...) never appear in `templating.list[]`, so Section E's
+  "substitute `current.value`" rule has nothing to substitute — and on
+  the dashboard this was grounded against, every single panel query
+  used `$__rate_interval`. dash9 fills in exactly that one, using
+  Grafana's own documented default (`max($__interval +
+  scrape_interval, 4 * scrape_interval)` at Grafana's documented
+  default `scrape_interval` of 15s → `1m`). Every other builtin is
+  left unresolved like any other variable with no value — not guessed.
+- **Variables exported with no saved value.** A dashboard shared on
+  grafana.com (rather than exported live from a running Grafana
+  instance) normally has `current: {}` for every variable — there is
+  nothing to substitute, and Section E's non-goal (no live
+  variable-runtime) means dash9 can't resolve one dynamically either.
+  A panel whose query still contains an unresolved `$name` after
+  substitution imports as **preserved but inert**
+  (`ValidatedPanel::executable = false`, with a human-readable
+  `inert_reason`) — visible, positioned, never queried. The same
+  treatment Section B already specifies for a non-Prometheus panel,
+  extended to this case. On the grounding dashboard, this is the
+  common case, not the exception: with no pinned variable values, all
+  124 panels import inert; pinning `job`/`node`/`nodename` to real
+  values (as a live Grafana session would have) brings 120 of them to
+  fully executable, live-querying panels — verified end to end against
+  a real Prometheus + node_exporter stack.
+- **`fieldConfig.defaults.thresholds`** has two shapes Section D's
+  worked example didn't show, both real here: a step with no `value`
+  key at all (not even `null`) is Grafana's "base" color for
+  everything below the first real threshold, skipped rather than
+  defaulted to `0`; and `mode: "percentage"` steps are relative to the
+  panel's configured min/max, not absolute metric values — mapping
+  those numbers straight across would produce a threshold that looks
+  valid but compares on the wrong scale, so a non-`"absolute"` mode
+  drops the panel's thresholds entirely rather than misapplying them.
+  Separately: a threshold's `color` is a free-form CSS color, not
+  always a named one (`rgba(245, 54, 54, 0.9)` is common) — only a
+  plain word is used as the threshold's display name, anything else
+  falls back to a generic `"threshold"`.
+- **`dash9 test`'s pass/fail verdict** treats an inert panel as `SKIP`
+  — reported, but excluded from the pass/fail verdict, the same
+  resolution Section B already proposes for a non-Prometheus panel
+  (no new `PanelCheckResult` variant; still deferred as its own
+  SPEC.md C.3 amendment, per Section B).

@@ -2,6 +2,7 @@
 
 #[cfg(feature = "assist")]
 mod assist_bridge;
+mod dashboard_loader;
 mod datasources;
 mod demo;
 mod live_session;
@@ -14,6 +15,13 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// SPEC.md C.2's own worked-example datasource URL — the default
+/// every Prometheus-typed panel in an imported Grafana dashboard
+/// resolves to when `--prometheus-url` isn't given (`docs/specs/
+/// grafana-dashboards.md` Section D). A TOML dashboard ignores this
+/// entirely; it declares its own `[[datasources]] url`.
+const DEFAULT_PROMETHEUS_URL: &str = "http://localhost:9090";
+
 #[derive(Parser)]
 #[command(name = "dash9", about = "A terminal UI for observability dashboards")]
 struct Cli {
@@ -23,15 +31,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Open a dashboard TOML file in the interactive TUI. Natural
-    /// language input (backed by an OpenAI-compatible endpoint
-    /// configured at `~/.config/dash9/assist.toml`) is available
-    /// whenever the binary was built with the `assist` feature (on by
-    /// default) — no separate flag needed; toggle it at runtime with
-    /// `/ai on`/`/ai off` (`docs/specs/open.md` Section D).
-    Open { path: PathBuf },
-    /// Validate a dashboard TOML file headlessly (SPEC.md Section C.3).
-    Test { path: PathBuf },
+    /// Open a dashboard file — TOML or Grafana JSON, detected from the
+    /// file itself (`docs/specs/grafana-dashboards.md` Section F) — in
+    /// the interactive TUI. Natural language input (backed by an
+    /// OpenAI-compatible endpoint configured at
+    /// `~/.config/dash9/assist.toml`) is available whenever the binary
+    /// was built with the `assist` feature (on by default) — no
+    /// separate flag needed; toggle it at runtime with `/ai on`/`/ai
+    /// off` (`docs/specs/open.md` Section D).
+    Open {
+        path: PathBuf,
+        /// Prometheus URL every Prometheus-typed panel resolves to
+        /// when opening a Grafana JSON dashboard (which carries only
+        /// an internal datasource uid, never a queryable URL).
+        /// Ignored for a TOML dashboard, which declares its own.
+        #[arg(long, default_value = DEFAULT_PROMETHEUS_URL)]
+        prometheus_url: String,
+    },
+    /// Validate a dashboard file headlessly (SPEC.md Section C.3) —
+    /// TOML or Grafana JSON, same detection as `open`.
+    Test {
+        path: PathBuf,
+        /// See `open --prometheus-url`.
+        #[arg(long, default_value = DEFAULT_PROMETHEUS_URL)]
+        prometheus_url: String,
+    },
     /// Run a self-contained demo panel against synthetic data.
     Demo {
         /// Also run a scripted assistant walkthrough against canned
@@ -46,9 +70,15 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Open { path } => open::run(&path),
-        Commands::Test { path } => {
-            let code = test_cmd::run(&path).await?;
+        Commands::Open {
+            path,
+            prometheus_url,
+        } => open::run(&path, &prometheus_url),
+        Commands::Test {
+            path,
+            prometheus_url,
+        } => {
+            let code = test_cmd::run(&path, &prometheus_url).await?;
             std::process::exit(code);
         }
         Commands::Demo { assist } => demo::run(assist),

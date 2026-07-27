@@ -48,13 +48,20 @@ png`) is not — Section I below still accurately says so.
 ## A. Invocation
 
 ```
-dash9 open <path>
+dash9 open <path> [--prometheus-url <url>]
 ```
 
-`<path>` is a dashboard TOML file (`SPEC.md` Section C); it is loaded
-and validated exactly as `dash9 test` loads one (`SPEC.md` C.3 step 1)
-— an invalid file is a startup error, not something the session
-recovers from interactively.
+`<path>` is a dashboard TOML file (`SPEC.md` Section C) or Grafana
+dashboard JSON (`docs/specs/grafana-dashboards.md`), detected from the
+file itself — `.json`/`.toml` extension, content-sniffed if ambiguous
+— never a separate flag. Either way it is loaded and validated exactly
+as `dash9 test` loads one (`SPEC.md` C.3 step 1) — an invalid file is a
+startup error, not something the session recovers from interactively.
+`--prometheus-url` (default `http://localhost:9090`) is where every
+Prometheus-typed panel in a Grafana JSON import resolves its
+datasource to — a Grafana export carries only an internal datasource
+`uid`, never a queryable URL; ignored for a TOML dashboard, which
+declares its own `[[datasources]] url`.
 
 **No `--assist` flag.** An earlier version required passing `--assist`
 at the CLI, on top of the `assist` Cargo feature (on by default), to

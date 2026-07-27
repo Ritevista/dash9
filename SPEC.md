@@ -537,11 +537,13 @@ comparison operators; the `panel threshold` command (Section B.3) sets
 same enum.
 
 **Grid layout** is a plain integer grid: `row`/`col` place a panel's
-top-left corner, `w`/`h` give its span, in grid units. v0.1 fixes the
-grid to 12 columns (`col + w <= 12` is a validation error); row count
-is unbounded. v0.1 does **not** validate that panels don't overlap —
-that is deliberately deferred, not an oversight (Section D lists it
-under things not implemented).
+top-left corner, `w`/`h` give its span, in grid units. The grid is
+fixed to 24 columns (`col + w <= 24` is a validation error), matching
+Grafana's own `gridPos` grid exactly so imported/exported Grafana JSON
+positions round-trip without scaling (`docs/specs/grafana-dashboards.md`
+Section F); row count is unbounded. v0.1 does **not** validate that
+panels don't overlap — that is deliberately deferred, not an oversight
+(Section D lists it under things not implemented).
 
 ### C.2 Worked example
 
@@ -562,7 +564,7 @@ title = "CPU Usage"
 type = "timeseries"
 datasource = "prom"
 query = "rate(node_cpu_seconds_total{mode=\"user\"}[5m])"
-grid = { row = 0, col = 0, w = 6, h = 4 }
+grid = { row = 0, col = 0, w = 12, h = 4 }
 
 [[panels.thresholds]]
 name = "warn"
@@ -579,14 +581,14 @@ title = "Load Average (1m)"
 type = "stat"
 datasource = "prom"
 query = "node_load1"
-grid = { row = 0, col = 6, w = 3, h = 4 }
+grid = { row = 0, col = 12, w = 6, h = 4 }
 
 [[panels]]
 title = "Disk Free %"
 type = "gauge"
 datasource = "prom"
 query = "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100"
-grid = { row = 0, col = 9, w = 3, h = 4 }
+grid = { row = 0, col = 18, w = 6, h = 4 }
 
 [[panels]]
 title = "Top Processes by CPU"
@@ -594,7 +596,7 @@ type = "table"
 datasource = "prom"
 query = "topk(5, rate(process_cpu_seconds_total[5m]))"
 allow_empty = true
-grid = { row = 4, col = 0, w = 12, h = 4 }
+grid = { row = 4, col = 0, w = 24, h = 4 }
 ```
 
 ### C.3 `dash9 test` semantics
@@ -602,7 +604,7 @@ grid = { row = 4, col = 0, w = 12, h = 4 }
 `dash9 test <dashboard.toml>` is headless and CI-usable. It:
 
 1. Loads and validates the TOML file itself. A structural/schema error
-   here (unknown field, wrong type, `col + w > 12`, duplicate
+   here (unknown field, wrong type, `col + w > 24`, duplicate
    datasource name, a panel's `datasource` referencing an undefined
    name, etc.) is reported with the same error codes as Section B.5
    where they overlap semantically (e.g. duplicate datasource name is

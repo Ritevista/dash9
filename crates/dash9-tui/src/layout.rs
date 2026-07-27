@@ -230,25 +230,25 @@ mod tests {
             GridSpec {
                 row: 0,
                 col: 0,
-                w: 6,
+                w: 12,
                 h: 4,
             }, // CPU Usage
             GridSpec {
                 row: 0,
-                col: 6,
-                w: 3,
+                col: 12,
+                w: 6,
                 h: 4,
             }, // Load Average
             GridSpec {
                 row: 0,
-                col: 9,
-                w: 3,
+                col: 18,
+                w: 6,
                 h: 4,
             }, // Disk Free %
             GridSpec {
                 row: 4,
                 col: 0,
-                w: 12,
+                w: 24,
                 h: 4,
             }, // Top Processes
         ]
@@ -304,10 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn full_width_panel_reaches_the_right_edge_even_when_width_does_not_divide_evenly_by_12() {
-        // 160 / 12 truncates to 13, so the old `col * (width /
-        // columns)` math gave a full-width panel only 156 columns —
-        // 4 short of the area's actual 160, visible live as the
+    fn full_width_panel_reaches_the_right_edge_even_when_width_does_not_divide_evenly_by_24() {
+        // 160 / 24 truncates to 6, so the old `col * (width /
+        // columns)` math gave a full-width panel only 144 columns —
+        // 16 short of the area's actual 160, visible live as the
         // panel's border falling short of the log/command bar below
         // it (which spans the full area, not a grid column count).
         let area = Rect {
@@ -319,7 +319,7 @@ mod tests {
         let grids = vec![GridSpec {
             row: 0,
             col: 0,
-            w: 12,
+            w: 24,
             h: 4,
         }];
         let rects = grid_layout(area, &grids);
@@ -337,7 +337,7 @@ mod tests {
         let grids = vec![GridSpec {
             row: 0,
             col: 0,
-            w: 12,
+            w: 24,
             h: 4,
         }];
         let rects = grid_layout(area, &grids);
@@ -365,7 +365,7 @@ mod tests {
         let grids = vec![GridSpec {
             row: 4,
             col: 0,
-            w: 12,
+            w: 24,
             h: 4,
         }];
         let rects = grid_layout(area, &grids);
@@ -405,7 +405,7 @@ mod tests {
         let grids = vec![GridSpec {
             row: 0,
             col: 0,
-            w: 6,
+            w: 12,
             h: 4,
         }];
         let rects = grid_layout(area, &grids);

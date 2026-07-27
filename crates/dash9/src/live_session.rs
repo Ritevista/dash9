@@ -84,11 +84,30 @@ pub struct LivePanel {
     pub latency_budget: Option<Duration>,
     pub grid: GridSpec,
     pub thresholds: Vec<ValidatedThreshold>,
+    /// `false` only for a panel imported from Grafana JSON that
+    /// couldn't be resolved to a runnable query
+    /// (`dash9_core::ValidatedPanel::executable` — `docs/specs/
+    /// grafana-dashboards.md` Section A/B). No poller is ever spawned
+    /// for one (`LiveSession::spawn_all_pollers`); `last_result` is
+    /// set once, at construction, to an `E108` carrying the reason
+    /// (`ValidatedPanel::inert_reason`), so it renders through the
+    /// same already-built error-display path as a real query failure
+    /// without needing a second copy of the reason on this struct.
+    pub executable: bool,
     pub last_result: Option<Result<Frame, CommandError>>,
 }
 
 impl From<&dash9_core::ValidatedPanel> for LivePanel {
     fn from(p: &dash9_core::ValidatedPanel) -> Self {
+        let last_result = (!p.executable).then(|| {
+            Err(CommandError::new(
+                ErrorCode::E108,
+                p.inert_reason
+                    .clone()
+                    .unwrap_or_else(|| "panel is not executable".to_string()),
+                None,
+            ))
+        });
         LivePanel {
             title: p.title.clone(),
             panel_type: p.panel_type,
@@ -98,7 +117,8 @@ impl From<&dash9_core::ValidatedPanel> for LivePanel {
             latency_budget: p.latency_budget,
             grid: p.grid,
             thresholds: p.thresholds.clone(),
-            last_result: None,
+            executable: p.executable,
+            last_result,
         }
     }
 }
@@ -199,6 +219,13 @@ impl LiveSession {
 
     fn spawn_all_pollers(&mut self) {
         for (index, panel) in self.panels.iter().enumerate() {
+            // A Grafana-imported panel that couldn't be resolved to a
+            // runnable query (`LivePanel::executable` docs) never gets
+            // a poller — its `last_result` was already set once, at
+            // construction, to the reason why.
+            if !panel.executable {
+                continue;
+            }
             // `validate()` guarantees every panel's `datasource`
             // matches a configured entry; still defensive here since
             // a background-task spawner should never panic.
@@ -915,6 +942,8 @@ mod tests {
                 h: 1,
             },
             thresholds: vec![],
+            executable: true,
+            inert_reason: None,
         }
     }
 

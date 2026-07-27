@@ -8,8 +8,12 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 
-/// v0.1 fixes the grid to this many columns (SPEC.md C.1).
-pub const GRID_COLUMNS: u32 = 12;
+/// The grid's column count (SPEC.md C.1). Matches Grafana's own
+/// 24-column `gridPos` grid exactly (`docs/specs/grafana-dashboards.md`
+/// Section F), so importing/exporting Grafana JSON never has to scale
+/// `x`/`w` and round — a dashboard imported and re-exported with zero
+/// edits round-trips its panel positions exactly.
+pub const GRID_COLUMNS: u32 = 24;
 
 /// Default `[dashboard].test_latency_budget` when unset (SPEC.md C.1).
 pub const DEFAULT_TEST_LATENCY_BUDGET: &str = "5s";
@@ -224,6 +228,18 @@ pub struct ValidatedPanel {
     pub latency_budget: Option<Duration>,
     pub grid: GridSpec,
     pub thresholds: Vec<ValidatedThreshold>,
+    /// `false` only for a panel imported from Grafana JSON
+    /// (`crate::grafana`) that couldn't be resolved to a runnable
+    /// query — an unmapped panel type, a non-Prometheus datasource, or
+    /// an unresolved template variable
+    /// (`docs/specs/grafana-dashboards.md` Section A/B). Always `true`
+    /// for a TOML-sourced dashboard. When `false`, `query`/`datasource`
+    /// are best-effort/display-only and must never reach a live
+    /// datasource call.
+    pub executable: bool,
+    /// `Some(reason)` iff `executable` is `false` — why this panel is
+    /// preserved but not queried, shown in place of a live result.
+    pub inert_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,7 +249,7 @@ pub struct ValidatedThreshold {
     pub value: f64,
 }
 
-fn e006(message: impl Into<String>) -> CommandError {
+pub(crate) fn e006(message: impl Into<String>) -> CommandError {
     CommandError::new(ErrorCode::E006, message, None)
 }
 
@@ -286,64 +302,7 @@ pub fn validate(file: &DashboardFile) -> Result<ValidatedDashboard, CommandError
 
     let mut panels = Vec::with_capacity(file.panels.len());
     for panel in &file.panels {
-        let panel_type = PanelType::parse(&panel.type_)
-            .ok_or_else(|| e006(format!("panels.{}: \"{}\" is not a valid panel type (expected: timeseries, gauge, table, stat)", panel.title, panel.type_)))?;
-
-        if !seen_names.contains(panel.datasource.as_str()) {
-            return Err(CommandError::new(
-                ErrorCode::E101,
-                format!(
-                    "panels.{}: unknown datasource \"{}\"",
-                    panel.title, panel.datasource
-                ),
-                None,
-            ));
-        }
-
-        if panel.grid.w == 0 || panel.grid.h == 0 {
-            return Err(e006(format!(
-                "panels.{}: grid.w and grid.h must be >= 1",
-                panel.title
-            )));
-        }
-        if panel.grid.col + panel.grid.w > GRID_COLUMNS {
-            return Err(e006(format!(
-                "panels.{}: grid.col ({}) + grid.w ({}) exceeds the {}-column grid",
-                panel.title, panel.grid.col, panel.grid.w, GRID_COLUMNS
-            )));
-        }
-
-        let latency_budget = panel
-            .latency_budget
-            .as_ref()
-            .map(|s| parse_duration_field(&format!("panels.{}.latency_budget", panel.title), s))
-            .transpose()?;
-
-        let mut thresholds = Vec::with_capacity(panel.thresholds.len());
-        for threshold in &panel.thresholds {
-            let op = ThresholdOp::parse(&threshold.op).ok_or_else(|| {
-                e006(format!(
-                    "panels.{}.thresholds.{}: \"{}\" is not a valid operator (expected: gt, gte, lt, lte)",
-                    panel.title, threshold.name, threshold.op
-                ))
-            })?;
-            thresholds.push(ValidatedThreshold {
-                name: threshold.name.clone(),
-                op,
-                value: threshold.value,
-            });
-        }
-
-        panels.push(ValidatedPanel {
-            title: panel.title.clone(),
-            panel_type,
-            datasource: panel.datasource.clone(),
-            query: panel.query.clone(),
-            allow_empty: panel.allow_empty,
-            latency_budget,
-            grid: panel.grid,
-            thresholds,
-        });
+        panels.push(validate_panel(panel, &seen_names)?);
     }
 
     Ok(ValidatedDashboard {
@@ -353,6 +312,72 @@ pub fn validate(file: &DashboardFile) -> Result<ValidatedDashboard, CommandError
         test_latency_budget,
         datasources,
         panels,
+    })
+}
+
+fn validate_panel(
+    panel: &PanelSpec,
+    seen_datasource_names: &HashSet<&str>,
+) -> Result<ValidatedPanel, CommandError> {
+    let panel_type = PanelType::parse(&panel.type_)
+        .ok_or_else(|| e006(format!("panels.{}: \"{}\" is not a valid panel type (expected: timeseries, gauge, table, stat)", panel.title, panel.type_)))?;
+
+    if !seen_datasource_names.contains(panel.datasource.as_str()) {
+        return Err(CommandError::new(
+            ErrorCode::E101,
+            format!(
+                "panels.{}: unknown datasource \"{}\"",
+                panel.title, panel.datasource
+            ),
+            None,
+        ));
+    }
+
+    if panel.grid.w == 0 || panel.grid.h == 0 {
+        return Err(e006(format!(
+            "panels.{}: grid.w and grid.h must be >= 1",
+            panel.title
+        )));
+    }
+    if panel.grid.col + panel.grid.w > GRID_COLUMNS {
+        return Err(e006(format!(
+            "panels.{}: grid.col ({}) + grid.w ({}) exceeds the {}-column grid",
+            panel.title, panel.grid.col, panel.grid.w, GRID_COLUMNS
+        )));
+    }
+
+    let latency_budget = panel
+        .latency_budget
+        .as_ref()
+        .map(|s| parse_duration_field(&format!("panels.{}.latency_budget", panel.title), s))
+        .transpose()?;
+
+    let mut thresholds = Vec::with_capacity(panel.thresholds.len());
+    for threshold in &panel.thresholds {
+        let op = ThresholdOp::parse(&threshold.op).ok_or_else(|| {
+            e006(format!(
+                "panels.{}.thresholds.{}: \"{}\" is not a valid operator (expected: gt, gte, lt, lte)",
+                panel.title, threshold.name, threshold.op
+            ))
+        })?;
+        thresholds.push(ValidatedThreshold {
+            name: threshold.name.clone(),
+            op,
+            value: threshold.value,
+        });
+    }
+
+    Ok(ValidatedPanel {
+        title: panel.title.clone(),
+        panel_type,
+        datasource: panel.datasource.clone(),
+        query: panel.query.clone(),
+        allow_empty: panel.allow_empty,
+        latency_budget,
+        grid: panel.grid,
+        thresholds,
+        executable: true,
+        inert_reason: None,
     })
 }
 
@@ -379,7 +404,7 @@ title = "CPU Usage"
 type = "timeseries"
 datasource = "prom"
 query = "rate(node_cpu_seconds_total{mode=\"user\"}[5m])"
-grid = { row = 0, col = 0, w = 6, h = 4 }
+grid = { row = 0, col = 0, w = 12, h = 4 }
 
 [[panels.thresholds]]
 name = "warn"
@@ -396,14 +421,14 @@ title = "Load Average (1m)"
 type = "stat"
 datasource = "prom"
 query = "node_load1"
-grid = { row = 0, col = 6, w = 3, h = 4 }
+grid = { row = 0, col = 12, w = 6, h = 4 }
 
 [[panels]]
 title = "Disk Free %"
 type = "gauge"
 datasource = "prom"
 query = "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100"
-grid = { row = 0, col = 9, w = 3, h = 4 }
+grid = { row = 0, col = 18, w = 6, h = 4 }
 
 [[panels]]
 title = "Top Processes by CPU"
@@ -411,7 +436,7 @@ type = "table"
 datasource = "prom"
 query = "topk(5, rate(process_cpu_seconds_total[5m]))"
 allow_empty = true
-grid = { row = 4, col = 0, w = 12, h = 4 }
+grid = { row = 4, col = 0, w = 24, h = 4 }
 "#;
 
     #[test]
@@ -520,7 +545,7 @@ title = "p"
 type = "stat"
 datasource = "prom"
 query = "up"
-grid = { row = 0, col = 10, w = 6, h = 1 }
+grid = { row = 0, col = 20, w = 6, h = 1 }
 "#;
         let file = load_str(toml).unwrap();
         let err = validate(&file).unwrap_err();
