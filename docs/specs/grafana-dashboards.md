@@ -254,6 +254,23 @@ none of this exists on the export side, which isn't built yet.
   own `panels[]` instead. Both are flattened into a plain panel list;
   the row entry itself carries no query and is dropped, not imported
   as a panel of its own.
+- **A collapsed row's nested panels are not in the dashboard's shared
+  coordinate space.** A worse surprise than the nesting itself: a
+  collapsed row's `gridPos.y` values reflect wherever that row's
+  panels sat the *last time it was expanded*, independent of every
+  other row — not a continuation of the running layout. Confirmed on
+  the real grounding dashboard: two unrelated collapsed rows both used
+  `y` ranges around 21..480 and 733..982, genuinely overlapping.
+  Importing every nested panel's raw `y` unchanged rendered multiple
+  unrelated rows on top of each other — doubled/garbled chart output,
+  confirmed live, initially misread as a rendering bug before tracing
+  it back to the import step. Fixed by rebasing: each collapsed row's
+  block is shifted down by just enough to start right after whatever
+  was already placed (tracking a running "next available row" through
+  the whole file in order), preserving every nested panel's position
+  *relative to its own block* while eliminating the cross-block
+  collision. A block that already lands past the running position (as
+  most in-order-authored dashboards do) gets no shift at all.
 - **The datasource `uid` can itself be a template variable**
   (`"uid": "${ds_prometheus}"`), unaddressed by Section D's "resolved
   by matching `uid`." Since dash9 only ever supports one datasource

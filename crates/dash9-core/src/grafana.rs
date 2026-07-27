@@ -138,7 +138,7 @@ pub fn parse_grafana_json(
         .unwrap_or_default();
     let panels: Vec<ValidatedPanel> = flatten_panels(&raw_panels)
         .into_iter()
-        .map(|raw| import_panel(raw, &vars))
+        .map(|(raw, row_offset)| import_panel(raw, row_offset, &vars))
         .collect();
 
     let datasources = vec![ValidatedDatasource {
@@ -253,34 +253,79 @@ fn current_value_as_string(current: Option<&Value>) -> Option<String> {
     }
 }
 
-/// Flattens Grafana's row structure into a plain panel list: an
-/// expanded row's children are already flat siblings (pushed via the
-/// `else` branch when their own turn comes); a *collapsed* row's
-/// children live nested inside the row's own `panels[]` and are
-/// spliced in here. Either way the row entry itself carries no query
-/// and is dropped, not imported as a panel (module docs).
-fn flatten_panels(raw_panels: &[Value]) -> Vec<&Value> {
+/// Flattens Grafana's row structure into a plain panel list, paired
+/// with each panel's row-unit offset (added to its own `gridPos.y` in
+/// [`import_panel`]). An expanded row's children are already flat
+/// siblings (pushed via the `else` branch when their own turn comes) —
+/// their own `y` is already correct and shared across the whole
+/// dashboard, so their offset is always `0`. A *collapsed* row's
+/// children live nested inside the row's own `panels[]` — and their
+/// stored `y` values are **not** in that same shared coordinate
+/// space: Grafana keeps a collapsed row's nested panels positioned
+/// however they were laid out the last time that row was expanded,
+/// independently of every other row. Confirmed on a real dashboard
+/// (`docs/specs/grafana-dashboards.md` Section H): two unrelated
+/// collapsed rows both used `y` ranges around 21..480 and 733..982,
+/// genuinely overlapping — importing every nested panel's raw `y`
+/// unchanged rendered multiple unrelated rows on top of each other
+/// (doubled/garbled chart output, confirmed live). Each collapsed
+/// row's block is rebased instead: `next_available_row` tracks the
+/// bottom of everything already placed (in the *rebased* space), and
+/// a block whose own minimum `y` would collide with that gets shifted
+/// down by just enough to start right after it — preserving every
+/// nested panel's position *relative to its own block* (that part of
+/// the stored layout is real and correct) while eliminating the
+/// cross-block collision. A block that already lands past
+/// `next_available_row` (as most in-order-authored dashboards do)
+/// gets no shift at all. Either way, the row entry itself carries no
+/// query and is dropped, not imported as a panel of its own.
+fn flatten_panels(raw_panels: &[Value]) -> Vec<(&Value, u32)> {
     let mut out = Vec::new();
+    let mut next_available_row: u32 = 0;
     for p in raw_panels {
         if p.get("type").and_then(Value::as_str) == Some("row") {
-            if let Some(nested) = p.get("panels").and_then(Value::as_array) {
-                out.extend(nested.iter());
+            let Some(nested) = p.get("panels").and_then(Value::as_array) else {
+                continue;
+            };
+            let block_min = nested.iter().filter_map(panel_row).min().unwrap_or(0);
+            let offset = next_available_row.saturating_sub(block_min);
+            for n in nested {
+                let bottom = panel_row(n).unwrap_or(0) + offset + panel_height(n).unwrap_or(0);
+                next_available_row = next_available_row.max(bottom);
+                out.push((n, offset));
             }
         } else {
-            out.push(p);
+            let bottom = panel_row(p).unwrap_or(0) + panel_height(p).unwrap_or(0);
+            next_available_row = next_available_row.max(bottom);
+            out.push((p, 0));
         }
     }
     out
 }
 
-fn import_panel(raw: &Value, vars: &HashMap<String, String>) -> ValidatedPanel {
+fn panel_row(raw: &Value) -> Option<u32> {
+    raw.get("gridPos")
+        .and_then(|g| g.get("y"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn panel_height(raw: &Value) -> Option<u32> {
+    raw.get("gridPos")
+        .and_then(|g| g.get("h"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn import_panel(raw: &Value, row_offset: u32, vars: &HashMap<String, String>) -> ValidatedPanel {
     let title = raw
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or("Untitled Panel")
         .to_string();
     let grafana_type = raw.get("type").and_then(Value::as_str).unwrap_or("");
-    let grid = parse_grid_pos(raw.get("gridPos"));
+    let mut grid = parse_grid_pos(raw.get("gridPos"));
+    grid.row = grid.row.saturating_add(row_offset);
     let thresholds = parse_thresholds(raw.get("fieldConfig"));
     let panel_type = PanelType::parse(grafana_type);
     let datasource_is_prometheus = panel_datasource_is_prometheus(raw);
@@ -739,6 +784,85 @@ mod tests {
         );
         assert_eq!(dashboard.panels[0].title, "CPU");
         assert_eq!(dashboard.panels[1].title, "Mem");
+    }
+
+    #[test]
+    fn two_collapsed_rows_with_independently_overlapping_raw_y_are_rebased_apart() {
+        // Mirrors the real bug, confirmed live: two unrelated collapsed
+        // rows on a real dashboard both used y ranges around 21..480
+        // and 733..982 — genuinely overlapping, since a collapsed
+        // row's nested panels keep whatever y they had the last time
+        // that row was expanded, independent of every other row. Here,
+        // "Storage" and "Network" both raw-overlap at y=[10,18).
+        let json = minimal_dashboard(
+            r#"{
+                "title": "Storage",
+                "type": "row",
+                "collapsed": true,
+                "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+                "panels": [
+                    {
+                        "title": "Disk",
+                        "type": "stat",
+                        "gridPos": {"x": 0, "y": 10, "w": 24, "h": 8},
+                        "datasource": {"type": "prometheus", "uid": "abc"},
+                        "targets": [{"expr": "up", "refId": "A"}]
+                    }
+                ]
+            },
+            {
+                "title": "Network",
+                "type": "row",
+                "collapsed": true,
+                "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+                "panels": [
+                    {
+                        "title": "Traffic",
+                        "type": "stat",
+                        "gridPos": {"x": 0, "y": 12, "w": 24, "h": 6},
+                        "datasource": {"type": "prometheus", "uid": "abc"},
+                        "targets": [{"expr": "up", "refId": "A"}]
+                    },
+                    {
+                        "title": "Errors",
+                        "type": "stat",
+                        "gridPos": {"x": 0, "y": 18, "w": 24, "h": 4},
+                        "datasource": {"type": "prometheus", "uid": "abc"},
+                        "targets": [{"expr": "up", "refId": "A"}]
+                    }
+                ]
+            }"#,
+        );
+        let dashboard = parse_grafana_json(&json, "http://localhost:9090").unwrap();
+        assert_eq!(dashboard.panels.len(), 3);
+
+        let disk = dashboard.panels.iter().find(|p| p.title == "Disk").unwrap();
+        assert_eq!(disk.grid.row, 10, "the first block placed needs no shift");
+
+        // "Network"'s own block spans raw y=[12,24) (Traffic h=6,
+        // Errors starting at 18+4=22 relative) and must be shifted to
+        // start right after Disk's bottom (10+8=18), not overlap it —
+        // preserving Errors' offset *within its own block* (6 rows
+        // after Traffic's own top, unchanged by the shift).
+        let traffic = dashboard
+            .panels
+            .iter()
+            .find(|p| p.title == "Traffic")
+            .unwrap();
+        let errors = dashboard
+            .panels
+            .iter()
+            .find(|p| p.title == "Errors")
+            .unwrap();
+        assert_eq!(
+            traffic.grid.row, 18,
+            "shifted to start right after Disk's bottom (10 + 8)"
+        );
+        assert_eq!(
+            errors.grid.row - traffic.grid.row,
+            6,
+            "relative offset within the Network block is preserved"
+        );
     }
 
     #[test]
