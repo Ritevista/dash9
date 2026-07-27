@@ -20,7 +20,7 @@ title = "CPU Usage"
 type = "timeseries"
 datasource = "prom"
 query = "rate(node_cpu_seconds_total{mode=\"user\"}[5m])"
-grid = { row = 0, col = 0, w = 6, h = 4 }
+grid = { row = 0, col = 0, w = 12, h = 4 }
 
 [[panels.thresholds]]
 name = "warn"
@@ -37,11 +37,11 @@ title = "Load Average (1m)"
 type = "stat"
 datasource = "prom"
 query = "node_load1"
-grid = { row = 0, col = 6, w = 3, h = 4 }
+grid = { row = 0, col = 12, w = 6, h = 4 }
 
 [[panels]]
 title = "Disk Free %"
 type = "gauge"
 datasource = "prom"
 query = "node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"} * 100"
-grid = { row = 0, col = 9, w = 3, h = 4 }
+grid = { row = 0, col = 18, w = 6, h = 4 }

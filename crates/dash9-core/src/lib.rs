@@ -11,6 +11,7 @@ mod datasource;
 mod duration;
 mod error;
 mod frame;
+mod grafana;
 mod path;
 mod session;
 
@@ -28,6 +29,9 @@ pub use error::{CommandError, ErrorCode};
 pub use frame::{
     ColumnKind, ColumnValues, Frame, FrameKind, FrameMeta, Labels, Point, Series, Table,
     TableColumn,
+};
+pub use grafana::{
+    detect_dashboard_format, load_grafana_path, parse_grafana_json, DashboardFormat,
 };
 pub use path::validate_workspace_relative_path;
 pub use session::{CommandSource, LogLine, SessionLogEntry};

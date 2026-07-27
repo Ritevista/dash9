@@ -37,6 +37,15 @@ pub enum ErrorCode {
     /// Added for `docs/specs/assist.md`; append-only per SPEC.md B.1/B.5
     /// — does not change any existing code's meaning.
     E107,
+    /// A panel imported from Grafana JSON that couldn't be resolved to
+    /// a runnable query (unmapped panel type, non-Prometheus
+    /// datasource, or an unresolved template variable) was polled
+    /// anyway — an internal invariant violation, since `executable ==
+    /// false` panels are never supposed to reach a live datasource
+    /// call (`docs/specs/grafana-dashboards.md` Section A/B). Doubles
+    /// as the placeholder shown in the panel's own pane instead of a
+    /// live result.
+    E108,
 }
 
 impl ErrorCode {
@@ -55,6 +64,7 @@ impl ErrorCode {
             ErrorCode::E105 => "E105",
             ErrorCode::E106 => "E106",
             ErrorCode::E107 => "E107",
+            ErrorCode::E108 => "E108",
         }
     }
 }

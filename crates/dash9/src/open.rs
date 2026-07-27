@@ -1,7 +1,7 @@
 //! `dash9 open`: the live, interactive multi-panel viewer with a
 //! command bar, status bar, and (when built with the `assist` feature,
 //! on by default) natural-language input. Loads a dashboard TOML, lays
-//! out its panels on the 12-column grid (SPEC.md C.1), polls each
+//! out its panels on the 24-column grid (SPEC.md C.1), polls each
 //! panel's datasource live, renders all four panel types, and runs the
 //! full command grammar (SPEC.md Section B) against a live, mutable
 //! session.
@@ -42,8 +42,6 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
-use dash9_core::load_path;
-use dash9_core::validate;
 #[cfg(not(feature = "assist"))]
 use dash9_core::Command;
 use dash9_tui::chart::{ChartModel, ChartViewState};
@@ -76,19 +74,18 @@ const STATUS_BAR_HEIGHT: u16 = 1;
 const ZOOM_BAR_HEIGHT: u16 = 1;
 
 #[cfg(feature = "assist")]
-pub fn run(path: &Path) -> anyhow::Result<()> {
-    run_with_assist(path)
+pub fn run(path: &Path, prometheus_url: &str) -> anyhow::Result<()> {
+    run_with_assist(path, prometheus_url)
 }
 
 #[cfg(not(feature = "assist"))]
-pub fn run(path: &Path) -> anyhow::Result<()> {
-    run_plain(path)
+pub fn run(path: &Path, prometheus_url: &str) -> anyhow::Result<()> {
+    run_plain(path, prometheus_url)
 }
 
 #[cfg(not(feature = "assist"))]
-fn run_plain(path: &Path) -> anyhow::Result<()> {
-    let dashboard = load_path(path)
-        .and_then(|file| validate(&file))
+fn run_plain(path: &Path, prometheus_url: &str) -> anyhow::Result<()> {
+    let dashboard = crate::dashboard_loader::load_dashboard(path, prometheus_url)
         .map_err(|err| anyhow::anyhow!("dashboard invalid: {err}"))?;
     let workspace_root = std::env::current_dir()?;
 
@@ -104,9 +101,8 @@ fn run_plain(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "assist")]
-fn run_with_assist(path: &Path) -> anyhow::Result<()> {
-    let dashboard = load_path(path)
-        .and_then(|file| validate(&file))
+fn run_with_assist(path: &Path, prometheus_url: &str) -> anyhow::Result<()> {
+    let dashboard = crate::dashboard_loader::load_dashboard(path, prometheus_url)
         .map_err(|err| anyhow::anyhow!("dashboard invalid: {err}"))?;
     let workspace_root = std::env::current_dir()?;
 

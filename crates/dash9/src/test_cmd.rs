@@ -10,16 +10,17 @@
 use std::path::Path;
 use std::time::Instant;
 
-use dash9_core::{check_panel, load_path, validate, PanelCheckResult, ValidatedPanel};
+use dash9_core::{check_panel, PanelCheckResult, ValidatedPanel};
 
+use crate::dashboard_loader::load_dashboard;
 use crate::datasources::{build_datasources, epoch_ms_now, execute_panel_query};
 
 /// Runs `dash9 test <path>` and returns the process exit code per
 /// SPEC.md C.3: `0` all panels passed, `1` the file was valid but a
 /// panel failed, `2` the dashboard file itself failed to load or
 /// validate (no panel is attempted in that case).
-pub async fn run(path: &Path) -> anyhow::Result<i32> {
-    let dashboard = match load_path(path).and_then(|file| validate(&file)) {
+pub async fn run(path: &Path, prometheus_url: &str) -> anyhow::Result<i32> {
+    let dashboard = match load_dashboard(path, prometheus_url) {
         Ok(dashboard) => dashboard,
         Err(err) => {
             println!("dashboard invalid: {err}");
@@ -31,11 +32,27 @@ pub async fn run(path: &Path) -> anyhow::Result<i32> {
     let mut all_passed = true;
 
     for panel in &dashboard.panels {
+        if !panel.executable {
+            // Preserved-but-inert Grafana import (unmapped panel type,
+            // unresolved variable, ...) — reported but excluded from
+            // the pass/fail verdict, the same treatment `docs/specs/
+            // grafana-dashboards.md` Section B already specifies for a
+            // non-Prometheus panel (no `SKIP` outcome exists in
+            // `PanelCheckResult`; that's its own SPEC.md C.3
+            // amendment, out of scope here).
+            println!(
+                "SKIP  {}: {}",
+                panel.title,
+                panel.inert_reason.as_deref().unwrap_or("not executable")
+            );
+            continue;
+        }
+
         let Some(datasource) = datasources.get(&panel.datasource) else {
-            // `validate()` already guarantees every panel's
-            // `datasource` matches a configured entry, so this is an
-            // internal invariant violation, not a user-facing
-            // dashboard error.
+            // `validate()`/the Grafana importer both guarantee every
+            // *executable* panel's `datasource` matches a configured
+            // entry, so this is an internal invariant violation, not a
+            // user-facing dashboard error.
             anyhow::bail!(
                 "internal error: panel \"{}\" references unconfigured datasource \"{}\"",
                 panel.title,

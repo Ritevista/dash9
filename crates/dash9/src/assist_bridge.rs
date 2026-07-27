@@ -571,6 +571,8 @@ mod tests {
                     h: 1,
                 },
                 thresholds: vec![],
+                executable: true,
+                inert_reason: None,
             }],
         };
         let workspace = tempfile::tempdir().unwrap();
