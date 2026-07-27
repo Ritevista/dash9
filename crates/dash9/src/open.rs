@@ -317,6 +317,17 @@ fn sync_grid_scroll_to_focus(
 /// match arms) — anything else (editing, Output/Log region, Layout/
 /// Focus zoom) leaves `state.grid_scroll` as `handle_key` set it
 /// (unchanged there, since those cases never touch it).
+///
+/// Also moves `focused_panel` to whatever is now topmost in the
+/// viewport (`layout::panel_at_scroll`) — without this, paging past
+/// the panel that was focused before the first `PageDown` leaves it
+/// focused-but-offscreen: no panel on screen shows the focus
+/// highlight, and the detail pane (`i`, `docs/specs/open.md` Section
+/// G.1) shows a completely different panel than whatever is actually
+/// visible, confirmed live. This is the reverse of what
+/// `sync_grid_scroll_to_focus` already does for `Tab`/`Shift+Tab`
+/// (move the viewport to match focus) — paging needed the same
+/// syncing in the other direction, just never had it.
 fn snap_grid_scroll_to_row(
     state: &mut ShellState,
     session: &LiveSession,
@@ -332,6 +343,9 @@ fn snap_grid_scroll_to_row(
         KeyCode::PageUp => dash9_tui::prev_grid_row_boundary(&grids, grid_scroll_before),
         _ => return,
     };
+    if let Some(index) = dash9_tui::panel_at_scroll(&grids, state.grid_scroll) {
+        state.focused_panel = index;
+    }
 }
 
 /// Offers every log line added since `before` to the recorder — a

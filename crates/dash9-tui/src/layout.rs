@@ -291,6 +291,26 @@ pub fn grid_viewport_height_for_whole_rows(
     height
 }
 
+/// The first panel (by index) not entirely scrolled above `scroll` —
+/// the topmost panel visible once the Grid viewport starts at
+/// `scroll`. `None` for an empty panel list. Used to move
+/// `focused_panel` to match the viewport after `PageUp`/`PageDown`
+/// (`open.rs`'s `snap_grid_scroll_to_row`) — the reverse of what
+/// [`ensure_visible`] already does for `Tab`/`Shift+Tab` (move the
+/// viewport to match focus). Without this, paging past the focused
+/// panel leaves it focused-but-offscreen: no panel on screen shows
+/// the focus highlight, and the detail pane (`i`) shows a completely
+/// different panel than whatever is actually visible — confirmed
+/// live.
+pub fn panel_at_scroll(panels: &[GridSpec], scroll: u16) -> Option<usize> {
+    panels.iter().enumerate().find_map(|(index, grid)| {
+        let bottom = u16::try_from(grid.row.saturating_add(grid.h))
+            .unwrap_or(u16::MAX)
+            .saturating_mul(ROW_UNIT_HEIGHT);
+        (bottom > scroll).then_some(index)
+    })
+}
+
 /// The focused panel's content-relative row range (`(top, bottom)`, in the
 /// same units [`grid_layout_scrolled`]'s `scroll` uses) — `None` when
 /// `index` is out of bounds (e.g. an empty dashboard). Feeds
@@ -795,6 +815,42 @@ mod tests {
              (row 12 * ROW_UNIT_HEIGHT 6) — not row 3 or row 6, which are still part of the first band"
         );
         assert_eq!(prev_grid_row_boundary(&grids, 72), 6, "row 1 * 6");
+    }
+
+    #[test]
+    fn panel_at_scroll_finds_the_topmost_visible_panel() {
+        // node_overview_grids: panels 0-2 are row 0 (content [0,24)),
+        // panel 3 is row 4 (content [24,48)).
+        let grids = node_overview_grids();
+        assert_eq!(
+            panel_at_scroll(&grids, 0),
+            Some(0),
+            "at the very top, the first panel"
+        );
+        assert_eq!(
+            panel_at_scroll(&grids, 24),
+            Some(3),
+            "scrolled to row 4's boundary, the row-4 panel is topmost"
+        );
+    }
+
+    #[test]
+    fn panel_at_scroll_skips_panels_fully_scrolled_past() {
+        let grids = node_overview_grids();
+        // Scrolled to 10 (mid row-0): row-0 panels (bottom=24) are
+        // still partially visible, so they're still "topmost."
+        assert_eq!(panel_at_scroll(&grids, 10), Some(0));
+    }
+
+    #[test]
+    fn panel_at_scroll_of_no_panels_is_none() {
+        assert_eq!(panel_at_scroll(&[], 0), None);
+    }
+
+    #[test]
+    fn panel_at_scroll_past_every_panel_is_none() {
+        let grids = node_overview_grids();
+        assert_eq!(panel_at_scroll(&grids, 1000), None);
     }
 
     #[test]
