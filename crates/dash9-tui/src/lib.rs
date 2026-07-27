@@ -30,7 +30,7 @@ pub use export::{table_for_export, table_to_csv, table_to_markdown, ExportFormat
 pub use layout::{
     content_height, ensure_visible, grid_layout, grid_layout_fit, grid_layout_scrolled,
     grid_viewport_height_for_whole_rows, max_grid_scroll, next_grid_row_boundary, panel_at_scroll,
-    panel_content_range, prev_grid_row_boundary,
+    panel_content_range, prev_grid_row_boundary, total_row_units,
 };
 pub use output::{
     draw_output, max_output_scroll, output_height, MAX_OUTPUT_HEIGHT, MIN_OUTPUT_HEIGHT,

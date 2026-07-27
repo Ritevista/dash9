@@ -323,7 +323,7 @@ fn help_topic(topic: &str) -> String {
 pub fn zoom_hint(zoom: Zoom) -> &'static str {
     match zoom {
         Zoom::Grid => "PageUp/PageDown page panels · arrows select · +/- zoom",
-        Zoom::Layout => "arrows select · + back to grid",
+        Zoom::Layout => "PageUp/PageDown page panels · arrows select · + back to grid",
         Zoom::Focus => "arrows select · Esc/- back to grid",
     }
 }
@@ -852,11 +852,15 @@ impl ShellState {
     /// is a normal thing to want to do); `Output`/`Log` region focus
     /// outranks zoom-level paging next, each being its own region
     /// independent of which zoom level the main area happens to be
-    /// showing. Layout has nothing to page (every panel already
-    /// visible); Focus is reserved for v1 (scrolling one panel's own
-    /// long content, not built now) — both are deliberate no-ops
-    /// (`true`, nothing scrolled) rather than falling back to scrolling
-    /// the log out from under them.
+    /// showing. Grid and Layout share the same `grid_scroll` paging
+    /// (`layout::grid_layout_fit`'s scrolled fallback — Layout only needs
+    /// this once its dashboard is too large to shrink-to-fit, but the key
+    /// handling doesn't need to know which case it's in, same as `Grid`
+    /// always accepting the keys even when nothing actually scrolls
+    /// because everything already fits). Focus is reserved for v1
+    /// (scrolling one panel's own long content, not built now) — a
+    /// deliberate no-op (`true`, nothing scrolled) rather than falling
+    /// back to scrolling the log out from under it.
     fn handle_paging_key(&mut self, key: KeyCode) -> bool {
         if !matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
             return false;
@@ -865,7 +869,7 @@ impl ShellState {
             self.scroll_log(key);
         } else if self.region == Region::Output {
             self.scroll_output(key);
-        } else if self.region == Region::Main && self.zoom == Zoom::Grid {
+        } else if self.region == Region::Main && matches!(self.zoom, Zoom::Grid | Zoom::Layout) {
             self.scroll_grid(key);
         }
         true
@@ -1567,20 +1571,31 @@ mod tests {
     }
 
     #[test]
-    fn page_up_and_page_down_are_a_no_op_in_layout_and_focus() {
-        for zoom in [Zoom::Layout, Zoom::Focus] {
-            let mut state = ShellState {
-                zoom,
-                ..ShellState::default()
-            };
-            let mut handler = MockHandler::new(1);
-            state.handle_key(press(KeyCode::PageDown), &mut handler);
-            assert_eq!(state.grid_scroll, 0, "{zoom:?} must not page the grid");
-            assert_eq!(
-                state.log_scroll, 0,
-                "{zoom:?} must not scroll the log either"
-            );
-        }
+    fn page_up_and_page_down_are_a_no_op_in_focus() {
+        let mut state = ShellState {
+            zoom: Zoom::Focus,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::PageDown), &mut handler);
+        assert_eq!(state.grid_scroll, 0, "Focus must not page the grid");
+        assert_eq!(state.log_scroll, 0, "Focus must not scroll the log either");
+    }
+
+    #[test]
+    fn page_up_and_page_down_in_layout_and_not_editing_adjust_grid_scroll_instead_of_log() {
+        // Layout shares Grid's paging (`layout::grid_layout_fit`'s scrolled
+        // fallback) — `handle_paging_key` accepts these keys the same way
+        // for both, regardless of whether Layout's dashboard is actually
+        // large enough to need the fallback right now.
+        let mut state = ShellState {
+            zoom: Zoom::Layout,
+            ..ShellState::default()
+        };
+        let mut handler = MockHandler::new(1);
+        state.handle_key(press(KeyCode::PageDown), &mut handler);
+        assert_eq!(state.grid_scroll, GRID_SCROLL_STEP);
+        assert_eq!(state.log_scroll, 0, "Layout paging must not scroll the log");
     }
 
     #[test]

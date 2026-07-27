@@ -328,13 +328,23 @@ fn sync_grid_scroll_to_focus(
 /// `sync_grid_scroll_to_focus` already does for `Tab`/`Shift+Tab`
 /// (move the viewport to match focus) — paging needed the same
 /// syncing in the other direction, just never had it.
+///
+/// Layout shares this with Grid (`ShellState::handle_paging_key` already
+/// accepts `PageUp`/`PageDown` for both) — row-boundary snapping is
+/// harmless even while Layout is shrink-to-fit rather than scrolled
+/// (`next_grid_row_boundary`/`prev_grid_row_boundary` operate on the same
+/// panel geometry regardless of which zoom is asking), and becomes load-
+/// bearing exactly when Layout falls back to scrolling.
 fn snap_grid_scroll_to_row(
     state: &mut ShellState,
     session: &LiveSession,
     key: KeyEvent,
     grid_scroll_before: u16,
 ) {
-    if state.input.is_some() || state.region != Region::Main || state.zoom != Zoom::Grid {
+    if state.input.is_some()
+        || state.region != Region::Main
+        || !matches!(state.zoom, Zoom::Grid | Zoom::Layout)
+    {
         return;
     }
     let grids: Vec<_> = session.panels.iter().map(|p| p.grid).collect();
@@ -540,7 +550,29 @@ fn pane_heights(
 
             let grid = match state.zoom {
                 Zoom::Focus => available_for_grid,
-                Zoom::Layout => dash9_tui::content_height(grids).min(available_for_grid),
+                // Layout either shrinks every panel to fit `available_for_grid`
+                // whole (no clipping, no scrolling — give it the full budget so
+                // it doesn't shrink further than it has to) or, once
+                // `total_row_units` alone overflows that budget, falls back to
+                // the exact same fixed-height scrolled rendering Grid uses
+                // (`layout::grid_layout_fit` docs). This mirrors
+                // `grid_layout_fit`'s own decision exactly — using
+                // `content_height` here instead (as Grid does) would disagree
+                // with it, since `content_height` bakes in the fixed
+                // `ROW_UNIT_HEIGHT` multiplier that only applies once Layout is
+                // *already* in its scrolled fallback.
+                Zoom::Layout => {
+                    if dash9_tui::total_row_units(grids) <= available_for_grid {
+                        available_for_grid
+                    } else {
+                        let capped = dash9_tui::content_height(grids).min(available_for_grid);
+                        dash9_tui::grid_viewport_height_for_whole_rows(
+                            grids,
+                            state.grid_scroll,
+                            capped,
+                        )
+                    }
+                }
                 Zoom::Grid => {
                     let capped = dash9_tui::content_height(grids).min(available_for_grid);
                     // Never let a row band poke partway into the bottom
@@ -548,9 +580,7 @@ fn pane_heights(
                     // near-zero-height `Rect`, confirmed live as the
                     // "stretches and contracts" artifact
                     // (`layout::grid_viewport_height_for_whole_rows`
-                    // docs). Layout zoom doesn't need this: it never
-                    // clips or scrolls, `grid_layout_fit` scales every
-                    // panel to fit instead.
+                    // docs).
                     dash9_tui::grid_viewport_height_for_whole_rows(grids, state.grid_scroll, capped)
                 }
             };
@@ -646,30 +676,16 @@ fn draw_session(
         usize::MAX
     };
 
-    match state.zoom {
-        Zoom::Grid => draw_dashboard(
-            frame,
-            grid_area,
-            &grids,
-            session,
-            focused_panel,
-            grid_scroll,
-            editing,
-        ),
-        Zoom::Layout => draw_layout(frame, grid_area, &grids, session, focused_panel, editing),
-        Zoom::Focus => {
-            if let Some(panel) = session.panels.get(state.focused_panel) {
-                draw_panel(
-                    frame,
-                    grid_area,
-                    panel,
-                    main_focused,
-                    editing,
-                    main_focused && !editing,
-                );
-            }
-        }
-    }
+    draw_main_area(
+        frame,
+        grid_area,
+        &grids,
+        session,
+        state,
+        focused_panel,
+        editing,
+        grid_scroll,
+    );
 
     if state.detail_open {
         let detail = panel_detail(session, state.focused_panel);
@@ -711,6 +727,55 @@ fn draw_session(
     grid_area.height
 }
 
+/// The zoom-dispatch step of [`draw_session`], split out purely to keep
+/// that function under the workspace's line-count lint — Grid/Layout/Focus
+/// each draw the same main area differently, but the branching itself
+/// carries no logic `draw_session`'s callers need inline.
+#[allow(clippy::too_many_arguments)]
+fn draw_main_area(
+    frame: &mut Frame,
+    grid_area: Rect,
+    grids: &[dash9_core::GridSpec],
+    session: &LiveSession,
+    state: &ShellState,
+    focused_panel: usize,
+    editing: bool,
+    grid_scroll: u16,
+) {
+    match state.zoom {
+        Zoom::Grid => draw_dashboard(
+            frame,
+            grid_area,
+            grids,
+            session,
+            focused_panel,
+            grid_scroll,
+            editing,
+        ),
+        Zoom::Layout => draw_layout(
+            frame,
+            grid_area,
+            grids,
+            session,
+            focused_panel,
+            editing,
+            grid_scroll,
+        ),
+        Zoom::Focus => {
+            if let Some(panel) = session.panels.get(state.focused_panel) {
+                draw_panel(
+                    frame,
+                    grid_area,
+                    panel,
+                    state.region == Region::Main,
+                    editing,
+                    state.region == Region::Main && !editing,
+                );
+            }
+        }
+    }
+}
+
 /// Same one-line region hint the zoom bar always showed, generalized
 /// past just Main's zoom levels now that `Tab`-focus can land on Output
 /// or Log too (`docs/specs/open.md` Section E) — those two get their own
@@ -749,7 +814,18 @@ fn zoom_bar_model(
             } else {
                 dash9_tui::zoom_hint(state.zoom).to_string()
             };
-            if state.zoom == Zoom::Grid && state.input.is_none() {
+            // `grid_paging_suffix` (below) reasons in `content_height`'s
+            // `ROW_UNIT_HEIGHT`-scaled terminal rows — valid for Grid
+            // unconditionally (it always renders via `grid_layout_scrolled`
+            // at that fixed scale), but for Layout only once it's actually
+            // in `grid_layout_fit`'s scrolled fallback (`total_row_units`
+            // check, matching `pane_heights`'/`grid_layout_fit`'s own
+            // decision exactly) — while Layout is still shrinking to fit,
+            // every panel is already visible and this scale doesn't apply
+            // to what's on screen at all.
+            let layout_is_scrolling =
+                state.zoom == Zoom::Layout && dash9_tui::total_row_units(grids) > grid_area.height;
+            if (state.zoom == Zoom::Grid || layout_is_scrolling) && state.input.is_none() {
                 if let Some(suffix) = grid_paging_suffix(grids, grid_area, grid_scroll) {
                     hint.push_str(&suffix);
                 }
@@ -905,11 +981,13 @@ fn draw_dashboard(
 
 /// The Layout zoom level (`docs/specs/session-layout.md` Section A.1):
 /// every panel, all at once, title-and-border only — `grid_layout_fit`
-/// scales panels down to fit `area` instead of paging/clipping, so unlike
-/// `draw_dashboard` there is no "positioned off-screen" case to skip; a
-/// zero-size rect only happens in the genuinely degenerate case of an
-/// area shorter than the dashboard's total grid-row count even at the
-/// minimum 1-row-unit height (`grid_layout_fit`'s own doc comment).
+/// scales panels down to fit `area` when that's possible, or pages via
+/// `scroll` (the same `state.grid_scroll` Grid uses — the two zoom
+/// levels are mutually exclusive, so sharing one field is safe) when a
+/// dashboard's content genuinely can't shrink into `area` (`grid_layout_
+/// fit`'s own doc comment). Skipping zero-size rects covers both the
+/// scrolled-past-the-viewport case (paging) and the pre-existing
+/// genuinely-too-short-even-at-the-1-row-unit-floor case.
 fn draw_layout(
     frame: &mut Frame,
     area: Rect,
@@ -917,8 +995,9 @@ fn draw_layout(
     session: &LiveSession,
     focused_panel: usize,
     editing: bool,
+    scroll: u16,
 ) {
-    let rects = grid_layout_fit(area, grids);
+    let rects = grid_layout_fit(area, grids, scroll);
 
     for (index, panel) in session.panels.iter().enumerate() {
         let rect = rects[index];
@@ -1203,8 +1282,9 @@ mod tests {
         let mut state = ShellState::default();
         state.zoom = Zoom::Focus;
         let (grid, _detail, output, bar) = pane_heights(&state, 0, &[], 50);
-        // Unlike Grid/Layout (capped to `content_height`), Focus claims
-        // everything left after output/bar, regardless of panel content.
+        // Unlike Grid (capped to `content_height`) or Layout (capped only
+        // once it can't shrink-to-fit), Focus claims everything left after
+        // output/bar, regardless of panel content.
         assert_eq!(grid, 50 - output - bar);
     }
 
@@ -1244,6 +1324,188 @@ mod tests {
         assert!(
             grid < 200 - output - bar,
             "there must be real leftover space this doesn't claim"
+        );
+    }
+
+    #[test]
+    fn pane_heights_layout_zoom_that_fits_gets_the_whole_available_budget() {
+        // A dashboard whose raw row-units already fit `available_for_grid`
+        // must get the *full* budget, not `content_height` (which uses a
+        // fixed, much larger multiplier) — `grid_layout_fit` will shrink
+        // everything down to whatever height it's actually given, so
+        // handing it less than available would shrink Layout tighter than
+        // it needs to be.
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 4,
+        }];
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Layout;
+        let (grid, _detail, output, bar) = pane_heights(&state, 0, &grids, 200);
+        let available_for_grid = 200 - output - bar;
+        assert_eq!(
+            grid, available_for_grid,
+            "a fitting Layout dashboard must get the whole grid budget, not content_height"
+        );
+        assert!(
+            grid > dash9_tui::content_height(&grids),
+            "sanity check: content_height would have under-sized this"
+        );
+    }
+
+    #[test]
+    fn pane_heights_layout_zoom_that_does_not_fit_falls_back_to_whole_row_clamping() {
+        // total_row_units (row 0 + h 1000 = 1000) vastly exceeds any
+        // reasonable terminal height, so Layout must fall back to the
+        // same whole-row viewport clamp Grid uses instead of handing
+        // `grid_layout_fit` a height it'll immediately have to scroll
+        // within anyway.
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 1000,
+        }];
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Layout;
+        let (grid, _detail, output, bar) = pane_heights(&state, 0, &grids, 30);
+        let available_for_grid = 30 - output - bar;
+        let capped = dash9_tui::content_height(&grids).min(available_for_grid);
+        let expected = dash9_tui::grid_viewport_height_for_whole_rows(&grids, 0, capped);
+        assert_eq!(grid, expected);
+        assert!(
+            grid <= available_for_grid,
+            "must never exceed the real budget"
+        );
+    }
+
+    #[test]
+    fn pane_heights_layout_and_grid_zoom_agree_once_layout_is_scrolling() {
+        // Once Layout has fallen back to scrolling, it renders via the
+        // exact same `grid_layout_scrolled` Grid uses — so it must get the
+        // identical viewport height Grid would for the same content/scroll,
+        // not just something merely "close."
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 1000,
+        }];
+        let mut layout_state = ShellState::default();
+        layout_state.zoom = Zoom::Layout;
+        let mut grid_state = ShellState::default();
+        grid_state.zoom = Zoom::Grid;
+        assert_eq!(
+            pane_heights(&layout_state, 0, &grids, 30),
+            pane_heights(&grid_state, 0, &grids, 30),
+        );
+    }
+
+    #[test]
+    fn zoom_bar_grid_paging_suffix_is_absent_for_a_layout_dashboard_that_fits() {
+        // Layout shrinking every panel to fit means nothing is scrolled —
+        // the "panels X-Y of Z — PageDown for more" suffix would be
+        // actively misleading (nothing more to page to) if shown here.
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 4,
+        }];
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Layout;
+        let area = Rect::new(0, 0, 40, 200);
+        let model = zoom_bar_model(&state, &grids, area, 0);
+        assert!(
+            !model.hint.contains("of") && !model.hint.contains("more"),
+            "a fitting Layout dashboard has nothing to page, so no \
+             'panels X-Y of Z — PageDown for more' suffix should be appended: {}",
+            model.hint
+        );
+    }
+
+    #[test]
+    fn zoom_bar_grid_paging_suffix_appears_once_a_layout_dashboard_is_scrolling() {
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 6,
+            h: 1000,
+        }];
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Layout;
+        let area = Rect::new(0, 0, 40, 20);
+        let model = zoom_bar_model(&state, &grids, area, 0);
+        assert!(
+            model.hint.contains("panels"),
+            "a too-large Layout dashboard must show the same paging affordance Grid does: {}",
+            model.hint
+        );
+    }
+
+    #[tokio::test]
+    async fn snap_grid_scroll_to_row_also_snaps_for_layout_zoom() {
+        use crossterm::event::KeyModifiers;
+        use dash9_core::{
+            DatasourceType, Duration, DurationUnit, PanelType, RefreshInterval, ValidatedDashboard,
+            ValidatedDatasource, ValidatedPanel,
+        };
+
+        let panel = |row: u32| ValidatedPanel {
+            title: "p".to_string(),
+            panel_type: PanelType::Timeseries,
+            datasource: "prom".to_string(),
+            query: "up".to_string(),
+            allow_empty: true,
+            latency_budget: None,
+            grid: GridSpec {
+                row,
+                col: 0,
+                w: 6,
+                h: 4,
+            },
+            thresholds: vec![],
+            executable: true,
+            inert_reason: None,
+        };
+        let dashboard = ValidatedDashboard {
+            title: "t".to_string(),
+            refresh: RefreshInterval::Duration(Duration {
+                magnitude: 30,
+                unit: DurationUnit::Seconds,
+            }),
+            default_range: Duration {
+                magnitude: 1,
+                unit: DurationUnit::Hours,
+            },
+            test_latency_budget: Duration {
+                magnitude: 5,
+                unit: DurationUnit::Seconds,
+            },
+            datasources: vec![ValidatedDatasource {
+                name: "prom".to_string(),
+                datasource_type: DatasourceType::Prometheus,
+                url: "http://127.0.0.1:1".to_string(),
+            }],
+            panels: vec![panel(0), panel(4)],
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let session = LiveSession::new(&dashboard, workspace.path().to_path_buf(), tx);
+
+        let mut state = ShellState::default();
+        state.zoom = Zoom::Layout;
+        let key = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        snap_grid_scroll_to_row(&mut state, &session, key, 0);
+        assert_eq!(
+            state.grid_scroll, 24,
+            "Layout must snap to the next real row boundary, same as Grid"
+        );
+        assert_eq!(
+            state.focused_panel, 1,
+            "focus follows the new topmost panel"
         );
     }
 }
