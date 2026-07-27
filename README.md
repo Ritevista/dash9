@@ -35,6 +35,30 @@ cargo run -p dash9 -- open examples/node-overview.toml
 just down    # or: docker compose down
 ```
 
+`dash9 open`/`dash9 test` also read real Grafana dashboard JSON —
+detected from the file itself (`.json` vs `.toml`), no separate verb.
+`examples/node-exporter-full.json` is the real, unmodified "Node
+Exporter Full" dashboard from Grafana.com (ID 1860), with just its
+`job`/`node`/`nodename` template variables pinned to the values
+`docker-compose.yml`'s `node_exporter` actually reports — everything
+else about the file, including the panels dash9 has no renderer for
+(`bargauge`), is untouched:
+
+```console
+cargo run -p dash9 -- test examples/node-exporter-full.json --prometheus-url http://localhost:9091
+cargo run -p dash9 -- open examples/node-exporter-full.json --prometheus-url http://localhost:9091
+```
+
+`--prometheus-url` is only needed for a JSON import — a Grafana export
+carries an internal datasource `uid`, never a queryable URL, unlike a
+TOML dashboard's own `[[datasources]] url`. See
+[`docs/specs/grafana-dashboards.md`](docs/specs/grafana-dashboards.md)
+Section H for what real Grafana dashboards need that the import path
+handles: row panels, unresolved template variables (imported
+preserved-but-inert rather than guessed), and Grafana's built-in
+`$__rate_interval`. Export — `dash9 dash save` writing Grafana JSON
+back out — isn't built yet; this is an import-only path.
+
 `open` is the interactive session: a live panel grid, a scrollable
 command log, and a command bar running the same grammar. Press `:` to
 type a command (e.g. `/range 1h`), `Tab`/`Shift+Tab` to cycle panel
