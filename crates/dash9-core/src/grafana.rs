@@ -340,7 +340,20 @@ fn import_panel(raw: &Value, vars: &HashMap<String, String>) -> ValidatedPanel {
         panel_type: panel_type.unwrap_or(PanelType::Stat),
         datasource,
         query,
-        allow_empty: false,
+        // Unlike a hand-authored TOML panel (where empty data usually
+        // signals something's actually wrong, so `false` is the right
+        // strict default), a general-purpose community dashboard like
+        // Grafana's own "Node Exporter Full" covers many *optional*
+        // exporter collectors no single environment enables all of —
+        // e.g. `node_tcp_connection_states` needs node_exporter's
+        // tcpstat collector, off by default. Treating that as a hard
+        // `dash9 test` failure would flag a completely normal
+        // deployment difference the same way as a genuinely broken
+        // query. `true` here only changes the pass/fail verdict for
+        // *imported* panels; TOML dashboards keep their strict default
+        // (`dashboard.rs`'s `PanelSpec::allow_empty` still defaults to
+        // `false`).
+        allow_empty: true,
         latency_budget: None,
         grid,
         thresholds,
@@ -568,6 +581,10 @@ mod tests {
         assert!(panel.executable);
         assert_eq!(panel.query, "node_load1");
         assert_eq!(panel.datasource, "prom");
+        assert!(
+            panel.allow_empty,
+            "imported panels default to allow_empty=true — a community dashboard covers optional collectors no single environment enables all of"
+        );
         assert_eq!(
             panel.grid,
             GridSpec {
