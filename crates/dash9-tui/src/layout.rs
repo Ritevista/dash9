@@ -50,20 +50,38 @@ pub fn grid_layout_scrolled(area: Rect, panels: &[GridSpec], scroll: u16) -> Vec
 }
 
 /// The Layout zoom level's variant (`docs/specs/session-layout.md` Section
-/// A.1): every panel is always visible, all at once — instead of the
-/// fixed `ROW_UNIT_HEIGHT`, the row-unit height is computed dynamically so
-/// the tallest stack of panels fits exactly within `area.height`, trading
+/// A.1): every panel visible at once, all scaled to fit `area` — instead of
+/// the fixed `ROW_UNIT_HEIGHT`, the row-unit height is computed dynamically
+/// so the tallest stack of panels fits exactly within `area.height`, trading
 /// data legibility (individual panels may end up too short for even a
-/// chart's text fallback) for completeness (nothing is ever clipped or
-/// paged here).
-pub fn grid_layout_fit(area: Rect, panels: &[GridSpec]) -> Vec<Rect> {
+/// chart's text fallback) for completeness — *when that's actually
+/// possible*. The row-unit height can shrink all the way down to `1`
+/// (still positioning every panel), so the real limit isn't legibility at
+/// all: once `total_row_units` itself exceeds `area.height`, no row-unit
+/// height (not even `1`) makes everything fit — every panel's *absolute*
+/// position still overflows the terminal, so panels past whatever fits
+/// clip to nothing with no way to page to them. Real, confirmed case: a
+/// 124-panel Grafana import spanning thousands of row-units (`docs/specs/
+/// grafana-dashboards.md` Section H's collapsed-row rebasing) — "every
+/// panel is already visible" silently stops being true, reported live as
+/// arrow-key navigation "getting lost." Past that point this falls back to
+/// the exact same fixed-height, `scroll`-driven clipping
+/// [`grid_layout_scrolled`] already uses for Grid (reusing all of Grid's
+/// paging: `next_grid_row_boundary`/`prev_grid_row_boundary`/
+/// `grid_viewport_height_for_whole_rows`), rather than degrading into a
+/// division that still doesn't fit. [`total_row_units`] is exposed so a
+/// caller sizing the viewport ahead of time (`open.rs`'s `pane_heights`)
+/// can make this identical fit-or-scroll decision itself — the two scales
+/// (raw row-units here vs. `content_height`'s `ROW_UNIT_HEIGHT`-multiplied
+/// terminal rows) don't correspond, so a caller that used `content_height`
+/// to decide would disagree with this function about which path a given
+/// frame takes.
+pub fn grid_layout_fit(area: Rect, panels: &[GridSpec], scroll: u16) -> Vec<Rect> {
     let columns = grid_columns();
-    let total_row_units = panels
-        .iter()
-        .map(|g| u16::try_from(g.row.saturating_add(g.h)).unwrap_or(u16::MAX))
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let total_row_units = total_row_units(panels);
+    if total_row_units > area.height {
+        return grid_layout_scrolled(area, panels, scroll);
+    }
     let row_unit_height = (area.height / total_row_units).max(1);
     panels
         .iter()
@@ -82,6 +100,23 @@ pub fn grid_layout_fit(area: Rect, panels: &[GridSpec]) -> Vec<Rect> {
 
 fn grid_columns() -> u16 {
     u16::try_from(GRID_COLUMNS).unwrap_or(12).max(1)
+}
+
+/// The tallest stack of panels, in raw row-units — not yet scaled by any
+/// row-unit height. This is the exact number [`grid_layout_fit`] compares
+/// against `area.height` to decide whether it can shrink everything down to
+/// fit (down to its row-unit-height floor of `1`) or must fall back to
+/// scrolling. Exposed so callers that need to size a viewport *before*
+/// calling `grid_layout_fit` (`open.rs`'s `pane_heights`) can make the
+/// identical fit-or-scroll decision, rather than the two silently
+/// disagreeing about which rendering path a given frame will actually take.
+pub fn total_row_units(panels: &[GridSpec]) -> u16 {
+    panels
+        .iter()
+        .map(|g| u16::try_from(g.row.saturating_add(g.h)).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// A column boundary's offset from the left edge of a `width`-wide area,
@@ -625,7 +660,7 @@ mod tests {
             height: 16,
         };
         let grids = node_overview_grids(); // tallest stack: row 4 + h 4 = 8 units
-        let rects = grid_layout_fit(area, &grids);
+        let rects = grid_layout_fit(area, &grids, 0);
         // 16 / 8 = row-unit height 2, so row 4's panel (row=4,h=4) sits at
         // y=8, height=8 — reaching exactly the bottom of the area, nothing
         // clipped, unlike grid_layout at the same area.
@@ -637,21 +672,21 @@ mod tests {
     }
 
     #[test]
-    fn grid_layout_fit_never_divides_by_a_zero_row_unit_height() {
-        // area.height(2) / total_row_units(8) truncates to 0 — without a
-        // `.max(1)` floor every panel's height/y would collapse to a
-        // degenerate zero-height division. With the floor, a 1-row-unit
-        // height still positions every panel (even if some end up clipped
-        // by the area being genuinely too short for 8 row-units, an
-        // unavoidable v1 limit distinct from the bug this test guards).
+    fn grid_layout_fit_falls_back_to_scrolling_instead_of_a_degenerate_shrink() {
+        // total_row_units(8) > area.height(2) — even the row-unit-height
+        // floor of 1 can't make this fit (needs 8 rows, has 2), so this
+        // must take the grid_layout_scrolled fallback (same fixed
+        // ROW_UNIT_HEIGHT Grid uses) rather than attempt a division that
+        // still wouldn't fit.
         let area = Rect {
             x: 0,
             y: 0,
             width: 120,
             height: 2,
         };
-        let rects = grid_layout_fit(area, &node_overview_grids());
-        assert_eq!(rects.len(), 4, "still produces one rect per panel");
+        let grids = node_overview_grids();
+        let rects = grid_layout_fit(area, &grids, 0);
+        assert_eq!(rects, grid_layout_scrolled(area, &grids, 0));
     }
 
     #[test]
@@ -662,11 +697,34 @@ mod tests {
             width: 120,
             height: 8, // exactly node_overview_grids' 8 total row-units
         };
-        let rects = grid_layout_fit(area, &node_overview_grids());
+        let rects = grid_layout_fit(area, &node_overview_grids(), 0);
         assert!(
             rects.iter().all(|r| r.height > 0),
             "row-unit height floors at 1, so an area matching the unit count fits everything"
         );
+    }
+
+    #[test]
+    fn grid_layout_fit_falls_back_to_scrolling_when_total_row_units_exceed_area_height() {
+        // A real, confirmed case: a dashboard whose content genuinely
+        // can't be shrunk into the given area (grafana-dashboards.md
+        // Section H's collapsed-row rebasing can push row values into
+        // the thousands) must page instead of clipping everything past
+        // the first few panels with no way to reach the rest.
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 24,
+            h: 1000,
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let rects = grid_layout_fit(area, &grids, 0);
+        assert_eq!(rects, grid_layout_scrolled(area, &grids, 0));
     }
 
     #[test]
@@ -677,7 +735,7 @@ mod tests {
             width: 120,
             height: 40,
         };
-        assert!(grid_layout_fit(area, &[]).is_empty());
+        assert!(grid_layout_fit(area, &[], 0).is_empty());
     }
 
     #[test]
