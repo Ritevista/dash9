@@ -21,7 +21,27 @@ pub const FOCUS: Color = Color::LightCyan;
 /// Stable chart-series palette. Order is part of the contract: series
 /// `i` always gets `series_color(i)`, so a legend and its line keep
 /// the same color across redraws as long as series order is stable.
-const SERIES: [Color; 6] = [PRIMARY, SECONDARY, SUCCESS, WARNING, Color::Blue, DANGER];
+/// Sized to match `chart::MAX_DISPLAYED_SERIES` exactly — a chart
+/// legitimately showing its full cap of series must never wrap back
+/// onto a color already in use on screen (confirmed live: an
+/// 8-per-cpu-core panel hit both the old 6-color palette's wrap point
+/// at once, indistinguishable by color alone). The last two
+/// (`LightRed`, `LightBlue`) are the standard ANSI "bright" variants
+/// of colors already in the first six — every other base hue
+/// (cyan/magenta/green/yellow/blue/red) is already spoken for, so
+/// distinguishing the last two slots by intensity rather than
+/// introducing an RGB color (which not every terminal renders
+/// consistently) keeps the palette portable.
+const SERIES: [Color; 8] = [
+    PRIMARY,
+    SECONDARY,
+    SUCCESS,
+    WARNING,
+    Color::Blue,
+    DANGER,
+    Color::LightRed,
+    Color::LightBlue,
+];
 
 pub fn series_color(index: usize) -> Color {
     SERIES[index % SERIES.len()]
@@ -47,7 +67,23 @@ mod tests {
     fn series_palette_is_stable_and_cycles() {
         assert_eq!(series_color(0), PRIMARY);
         assert_eq!(series_color(1), SECONDARY);
-        assert_eq!(series_color(6), PRIMARY);
+        assert_eq!(series_color(8), PRIMARY);
+    }
+
+    #[test]
+    fn series_palette_covers_every_chart_can_legitimately_show_without_a_collision() {
+        // MAX_DISPLAYED_SERIES (chart.rs) is the most a chart ever
+        // draws at once -- every one of those slots must get its own
+        // color, or two genuinely-different series become
+        // indistinguishable on screen (confirmed live).
+        let colors: std::collections::HashSet<Color> = (0..crate::chart::MAX_DISPLAYED_SERIES)
+            .map(series_color)
+            .collect();
+        assert_eq!(
+            colors.len(),
+            crate::chart::MAX_DISPLAYED_SERIES,
+            "every series a chart can display at once needs a distinct color"
+        );
     }
 
     #[test]
