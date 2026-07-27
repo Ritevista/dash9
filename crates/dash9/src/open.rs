@@ -559,6 +559,21 @@ fn pane_heights(
     }
 }
 
+/// Temporary diagnostic instrumentation (`status_bar.rs`'s own
+/// `draw_status_bar` docs) — tracking down exactly which internal
+/// state a reported navigation bug happens in, live, rather than
+/// guessing from a description after the fact.
+fn debug_focus_line(state: &ShellState, session: &LiveSession) -> String {
+    format!(
+        "region={:?} zoom={:?} editing={} focus={}/{}",
+        state.region,
+        state.zoom,
+        state.input.is_some(),
+        state.focused_panel + 1,
+        session.panels.len(),
+    )
+}
+
 fn draw_session(
     frame: &mut Frame,
     area: Rect,
@@ -609,7 +624,8 @@ fn draw_session(
         ])
         .areas(area);
 
-    draw_status_bar(frame, status_area, status);
+    let debug = debug_focus_line(state, session);
+    draw_status_bar(frame, status_area, status, Some(&debug));
 
     // `state.grid_scroll` is already the right value going into this
     // frame — `PageUp`/`PageDown` set it directly (`shell.rs`), and
@@ -734,8 +750,22 @@ fn zoom_bar_model(
                 Zoom::Grid => "Grid",
                 Zoom::Focus => "Focus",
             };
-            let mut hint = dash9_tui::zoom_hint(state.zoom).to_string();
-            if state.zoom == Zoom::Grid {
+            // While editing, PageUp/PageDown always scroll the log
+            // instead (`ShellState::handle_paging_key`'s own docs —
+            // "reading old output while composing a new command"), and
+            // +/- are typed as literal characters instead of zooming
+            // (editing's own `KeyCode::Char(c)` branch). `zoom_hint`'s
+            // per-zoom text claims both regardless, which is actively
+            // wrong while editing — confirmed live ("pagedown is not
+            // working" was this, not a real paging bug). Only "arrows
+            // select" (and Tab/Shift+Tab, restated here since Tab's own
+            // hint lives on the command box, not here) stays true.
+            let mut hint = if state.input.is_some() {
+                "arrows/Tab select panel · PageUp/PageDown scroll log · Esc cancel".to_string()
+            } else {
+                dash9_tui::zoom_hint(state.zoom).to_string()
+            };
+            if state.zoom == Zoom::Grid && state.input.is_none() {
                 if let Some(suffix) = grid_paging_suffix(grids, grid_area, grid_scroll) {
                     hint.push_str(&suffix);
                 }
@@ -1024,6 +1054,49 @@ fn draw_placeholder(
 mod tests {
     use super::*;
     use dash9_core::GridSpec;
+
+    /// Regression test, confirmed live: while editing, `PageUp`/
+    /// `PageDown` always scroll the log (`ShellState::handle_paging_
+    /// key`'s own docs) and `+`/`-` are typed as literal characters
+    /// instead of zooming — but the Grid-zoom hint kept claiming both
+    /// ("PageUp/PageDown page panels · ... · +/- zoom") regardless,
+    /// misread as "pagedown is not working." The hint must go
+    /// editing-specific instead of repeating the always-Grid text, and
+    /// must not append the "panels X-Y of Z — `PageDown` for more"
+    /// paging suffix either, since `PageDown` won't do that while editing.
+    #[test]
+    fn zoom_bar_hint_is_editing_specific_and_not_grids_normal_paging_text() {
+        let mut state = ShellState::default();
+        state.input = Some(String::new());
+        let grids = [GridSpec {
+            row: 0,
+            col: 0,
+            w: 1,
+            h: 1,
+        }];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let model = zoom_bar_model(&state, &grids, area, 0);
+        assert!(
+            model.hint.contains("scroll log"),
+            "must say what PageUp/PageDown actually do while editing: {}",
+            model.hint
+        );
+        assert!(
+            !model.hint.contains("page panels"),
+            "must not repeat the non-editing Grid hint: {}",
+            model.hint
+        );
+        assert!(
+            !model.hint.contains("+/- zoom"),
+            "+/- don't zoom while editing either: {}",
+            model.hint
+        );
+    }
 
     /// Regression test for the real bug this session's changes fixed: an
     /// earlier version gave the whole command bar an uncapped
