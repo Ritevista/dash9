@@ -664,6 +664,7 @@ fn draw_session(
                     grid_area,
                     panel,
                     main_focused,
+                    editing,
                     main_focused && !editing,
                 );
             }
@@ -822,7 +823,8 @@ fn panel_detail(session: &LiveSession, focused_panel: usize) -> Option<dash9_tui
         query: &panel.query,
         allow_empty: panel.allow_empty,
         latency_budget: panel.latency_budget,
-        grid: panel.grid,
+        panel_number: focused_panel + 1,
+        panel_count: session.panels.len(),
         thresholds: &panel.thresholds,
         last_result: panel.last_result.as_ref(),
     })
@@ -870,7 +872,7 @@ fn draw_dashboard(
             continue; // Scrolled or positioned entirely out of view.
         }
         let focused = index == focused_panel;
-        draw_panel(frame, rect, panel, focused, focused && !editing);
+        draw_panel(frame, rect, panel, focused, editing, focused && !editing);
     }
 }
 
@@ -897,31 +899,53 @@ fn draw_layout(
             continue;
         }
         let focused = index == focused_panel;
-        draw_panel_outline(frame, rect, &panel.title, focused, focused && !editing);
+        draw_panel_outline(
+            frame,
+            rect,
+            &panel.title,
+            focused,
+            editing,
+            focused && !editing,
+        );
     }
 }
 
-fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel, focused: bool, show_hint: bool) {
+fn draw_panel(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &LivePanel,
+    focused: bool,
+    editing: bool,
+    show_hint: bool,
+) {
+    // Doesn't capture `frame` itself (each call site passes its own),
+    // only the values every placeholder call shares — shrinks each of
+    // this function's several "nothing to draw yet" branches to one line.
+    let draw_ph = |frame: &mut Frame, message: &str| {
+        draw_placeholder(
+            frame,
+            area,
+            &panel.title,
+            message,
+            focused,
+            editing,
+            show_hint,
+        );
+    };
+
     let Some(result) = panel.last_result.as_ref() else {
-        draw_placeholder(frame, area, &panel.title, "(loading…)", focused, show_hint);
+        draw_ph(frame, "(loading…)");
         return;
     };
     let core_frame = match result {
         Err(err) => {
-            draw_placeholder(
-                frame,
-                area,
-                &panel.title,
-                &err.to_string(),
-                focused,
-                show_hint,
-            );
+            draw_ph(frame, &err.to_string());
             return;
         }
         Ok(core_frame) => core_frame,
     };
     if core_frame.is_empty() {
-        draw_placeholder(frame, area, &panel.title, "(no data)", focused, show_hint);
+        draw_ph(frame, "(no data)");
         return;
     }
 
@@ -938,26 +962,17 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel, focused: bool, s
             ) {
                 Ok(model) => match panel.panel_type {
                     dash9_core::PanelType::Timeseries => {
-                        draw_chart(frame, area, &model, focused, show_hint);
+                        draw_chart(frame, area, &model, focused, editing, show_hint);
                     }
                     dash9_core::PanelType::Gauge => {
-                        draw_gauge(frame, area, &model, focused, show_hint);
+                        draw_gauge(frame, area, &model, focused, editing, show_hint);
                     }
                     dash9_core::PanelType::Stat => {
-                        draw_stat(frame, area, &model, focused, show_hint);
+                        draw_stat(frame, area, &model, focused, editing, show_hint);
                     }
                     dash9_core::PanelType::Table => unreachable!("handled in the outer match arm"),
                 },
-                Err(err) => {
-                    draw_placeholder(
-                        frame,
-                        area,
-                        &panel.title,
-                        &err.to_string(),
-                        focused,
-                        show_hint,
-                    );
-                }
+                Err(err) => draw_ph(frame, &err.to_string()),
             }
         }
         dash9_core::PanelType::Table => {
@@ -971,17 +986,16 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &LivePanel, focused: bool, s
                 .clone()
                 .or_else(|| series_as_table(core_frame))
             {
-                Some(table) => draw_table(frame, area, &table, &panel.title, focused, show_hint),
-                None => {
-                    draw_placeholder(
-                        frame,
-                        area,
-                        &panel.title,
-                        "(no table data)",
-                        focused,
-                        show_hint,
-                    );
-                }
+                Some(table) => draw_table(
+                    frame,
+                    area,
+                    &table,
+                    &panel.title,
+                    focused,
+                    editing,
+                    show_hint,
+                ),
+                None => draw_ph(frame, "(no table data)"),
             }
         }
     }
@@ -993,11 +1007,13 @@ fn draw_placeholder(
     title: &str,
     message: &str,
     focused: bool,
+    editing: bool,
     show_hint: bool,
 ) {
     let block = dash9_tui::pane_block(
         title,
         focused,
+        editing,
         None,
         show_hint.then_some(dash9_tui::PANEL_HINT),
     );

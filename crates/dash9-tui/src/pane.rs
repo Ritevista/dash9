@@ -25,19 +25,36 @@ use crate::theme;
 /// on the fly), and an optional `hint` (bottom-left, muted — callers only
 /// pass one when it's actually actionable right now, e.g. a hint for an
 /// unfocused panel would describe keys that don't do anything).
+///
+/// `editing`: `true` only for the focused *panel chart* while the
+/// command box is capturing keystrokes elsewhere — every other caller
+/// (the command box's own border, `Output`/`Log`, the detail pane)
+/// passes `false` unconditionally, since their own `focused` already
+/// says whether *they* are the live target. `focused && editing`
+/// renders [`theme::FOCUS_DIM`] instead of the full bright
+/// [`theme::FOCUS`] (and drops the bold) — the panel is still
+/// genuinely focused (`Tab`/arrow keys still move it, `Space` still
+/// toggles its detail), it just isn't receiving keystrokes right now,
+/// and showing it exactly as bright as the pane that *is* made it
+/// impossible to tell which one actually was — reported live.
 pub fn pane_block(
     name: &str,
     focused: bool,
+    editing: bool,
     status: Option<(String, Color)>,
     hint: Option<&str>,
 ) -> Block<'static> {
-    let border_color = if focused { theme::FOCUS } else { theme::MUTED };
-    let name_style = if focused {
-        Style::default()
+    let border_color = match (focused, editing) {
+        (true, true) => theme::FOCUS_DIM,
+        (true, false) => theme::FOCUS,
+        (false, _) => theme::MUTED,
+    };
+    let name_style = match (focused, editing) {
+        (true, true) => Style::default().fg(theme::FOCUS_DIM),
+        (true, false) => Style::default()
             .fg(theme::FOCUS)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT)
+            .add_modifier(Modifier::BOLD),
+        (false, _) => Style::default().fg(theme::TEXT),
     };
 
     let mut block = Block::default()
@@ -79,7 +96,7 @@ mod tests {
 
     #[test]
     fn name_only_draws_without_panicking() {
-        let block = pane_block("CPU Usage", false, None, None);
+        let block = pane_block("CPU Usage", false, false, None, None);
         let content = render(block, 30, 5);
         assert!(content.contains("CPU Usage"));
     }
@@ -89,6 +106,7 @@ mod tests {
         let block = pane_block(
             "CPU Usage",
             true,
+            false,
             Some(("● ok".to_string(), theme::SUCCESS)),
             Some("space detail"),
         );
@@ -100,7 +118,7 @@ mod tests {
 
     #[test]
     fn no_hint_when_none_is_passed() {
-        let block = pane_block("CPU Usage", false, None, None);
+        let block = pane_block("CPU Usage", false, false, None, None);
         let content = render(block, 40, 5);
         assert!(!content.contains("detail"));
     }
@@ -113,10 +131,10 @@ mod tests {
     /// separately from focus (`draw.rs`'s `show_hint` — `focused &&
     /// !editing`), so a focused-but-not-hinted pane (the state while
     /// editing) is a real, supported combination this module must render
-    /// correctly: bright/focused chrome, no hint claiming otherwise.
+    /// correctly: focused chrome, no hint claiming otherwise.
     #[test]
     fn focused_pane_with_no_hint_still_shows_focused_chrome_but_no_hint_text() {
-        let block = pane_block("CPU Usage", true, None, None);
+        let block = pane_block("CPU Usage", true, false, None, None);
         let content = render(block, 40, 5);
         assert!(content.contains("CPU Usage"));
         assert!(
@@ -125,11 +143,30 @@ mod tests {
         );
     }
 
+    /// Regression test: a focused panel and the command box being
+    /// actively edited used to render with the exact same bright
+    /// [`theme::FOCUS`] chrome, making it impossible to tell which pane
+    /// keystrokes actually reached — reported live ("command is
+    /// selected, detail is selected, and also [the chart] is selected
+    /// too"). `editing: true` must still render as focused (the name
+    /// text, not muted) but via the calmer `FOCUS_DIM` color, not
+    /// `FOCUS` — this only checks the block builds and still shows the
+    /// name; the actual color distinction is `theme.rs`'s own contract,
+    /// not re-verified here via rendered glyphs (`Cell::symbol` carries
+    /// no color information).
+    #[test]
+    fn editing_focused_pane_still_shows_its_name() {
+        let block = pane_block("CPU Usage", true, true, None, None);
+        let content = render(block, 40, 5);
+        assert!(content.contains("CPU Usage"));
+    }
+
     #[test]
     fn degenerate_tiny_area_draws_without_panicking() {
         let block = pane_block(
             "CPU",
             true,
+            false,
             Some(("x".to_string(), theme::SUCCESS)),
             Some("i"),
         );

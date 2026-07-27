@@ -52,7 +52,7 @@ fn run_plain() -> anyhow::Result<()> {
                 &ChartViewState::default(),
                 usize::from(width),
             )?;
-            terminal.draw(|f| draw_chart(f, f.area(), &model, true, true))?;
+            terminal.draw(|f| draw_chart(f, f.area(), &model, true, false, true))?;
 
             if event::poll(TICK)? {
                 if let Event::Key(key) = event::read()? {
@@ -145,7 +145,7 @@ fn run_assist_walkthrough() -> anyhow::Result<()> {
                         ratatui::layout::Constraint::Percentage(35),
                     ])
                     .split(f.area());
-                draw_chart(f, chunks[0], &model, true, true);
+                draw_chart(f, chunks[0], &model, true, false, true);
                 draw_log_panel(f, chunks[1], &log, &session.status());
             })?;
 
