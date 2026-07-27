@@ -679,8 +679,19 @@ impl ShellState {
                 // which makes no sense when we're already in it — this is
                 // a plain `panel_count()`-stop ring over panels only, and
                 // never touches `self.input`, so it can never discard it.
-                KeyCode::Tab => self.cycle_focused_panel(handler, true),
-                KeyCode::BackTab => self.cycle_focused_panel(handler, false),
+                // `Left`/`Right` reach the same stepping as `Tab`/
+                // `BackTab` — `Up`/`Down` stay history-only (bound just
+                // above), but `Left`/`Right` had no meaning while
+                // editing, so they're free to double as this. Real gap
+                // this closes: a submitted command reopens a fresh
+                // buffer right away (`Enter`'s own comment above),
+                // silently leaving `input.is_some()` true — Grid's
+                // non-editing arrow-key stepping (`handle_key`'s later
+                // match) then never reactivates until `Esc`, so
+                // arrow-key navigation would otherwise go dead after
+                // every single command, confirmed live.
+                KeyCode::Tab | KeyCode::Right => self.cycle_focused_panel(handler, true),
+                KeyCode::BackTab | KeyCode::Left => self.cycle_focused_panel(handler, false),
                 KeyCode::Char(c) => {
                     if let Some(buffer) = self.input.as_mut() {
                         buffer.push(c);
@@ -1365,6 +1376,40 @@ mod tests {
         state.handle_key(press(KeyCode::BackTab), &mut handler);
         assert_eq!(state.focused_panel, 2, "BackTab wraps the other way");
         assert_eq!(state.input.as_deref(), Some("x"));
+    }
+
+    /// Regression test, confirmed live: after submitting any command,
+    /// `Enter`'s own handler immediately reopens a fresh empty buffer
+    /// (`input = Some(String::new())`, its own doc comment) so a
+    /// follow-up command doesn't need `:` again — but that silently
+    /// leaves `input.is_some()` true, so Grid's non-editing arrow-key
+    /// panel-stepping (a different match arm, gated on `self.input.is_
+    /// some()` being false) goes dead until `Esc`. Arrows worked once,
+    /// then stopped working after the very next command — exactly
+    /// what was reported. `Left`/`Right` (unlike `Up`/`Down`, which
+    /// stay history-only) now also reach `cycle_focused_panel` from
+    /// inside the editing branch, so they keep working through this.
+    #[test]
+    fn left_and_right_keep_stepping_panel_focus_after_a_command_reopens_the_buffer() {
+        let mut state = ShellState::default();
+        let mut handler = MockHandler::new(3);
+
+        state.handle_key(char_key(':'), &mut handler);
+        state.handle_key(char_key('a'), &mut handler);
+        state.handle_key(press(KeyCode::Enter), &mut handler);
+        assert_eq!(
+            state.input.as_deref(),
+            Some(""),
+            "Enter reopens a fresh, empty, still-editing buffer"
+        );
+
+        state.handle_key(press(KeyCode::Right), &mut handler);
+        assert_eq!(
+            state.focused_panel, 1,
+            "Right must still step focus even though input.is_some()"
+        );
+        state.handle_key(press(KeyCode::Left), &mut handler);
+        assert_eq!(state.focused_panel, 0);
     }
 
     #[test]
