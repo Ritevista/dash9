@@ -53,17 +53,7 @@ pub struct StatusBarModel {
     pub assist: Option<AssistStatusLine>,
 }
 
-/// `debug`: a live `region`/`zoom`/`editing`/`focus` readout appended
-/// to the end of the line — temporary diagnostic instrumentation for
-/// tracking down exactly which internal state a reported navigation
-/// bug happens in, not a permanent feature (`docs/specs/open.md`
-/// doesn't document it). `None` renders the bar exactly as before.
-/// Lives here instead of a new field on `StatusBarModel` because that
-/// struct is built by `CommandHandler::status_bar()`, which has no
-/// access to `ShellState` at all (`open.rs`'s `HasSession`/
-/// `CommandHandler` split) — the debug text is computed by the
-/// composition root, which does, and passed straight through.
-pub fn draw_status_bar(frame: &mut Frame, area: Rect, model: &StatusBarModel, debug: Option<&str>) {
+pub fn draw_status_bar(frame: &mut Frame, area: Rect, model: &StatusBarModel) {
     if area.height == 0 {
         return;
     }
@@ -90,9 +80,6 @@ pub fn draw_status_bar(frame: &mut Frame, area: Rect, model: &StatusBarModel, de
             sent = assist.tokens_sent,
             received = assist.tokens_received,
         );
-    }
-    if let Some(debug) = debug {
-        let _ = write!(line, "│ DBG: {debug} ");
     }
 
     // The marker glyph alone carries the health meaning (Mechanism 4);
@@ -158,7 +145,7 @@ mod tests {
     fn draws_without_assist_line_without_panicking() {
         let mut terminal = backend(120, 3);
         terminal
-            .draw(|f| draw_status_bar(f, f.area(), &base_model(), None))
+            .draw(|f| draw_status_bar(f, f.area(), &base_model()))
             .unwrap();
     }
 
@@ -174,7 +161,7 @@ mod tests {
         });
         let mut terminal = backend(160, 3);
         terminal
-            .draw(|f| draw_status_bar(f, f.area(), &model, None))
+            .draw(|f| draw_status_bar(f, f.area(), &model))
             .unwrap();
     }
 
@@ -185,7 +172,7 @@ mod tests {
             let mut model = base_model();
             model.health = health;
             terminal
-                .draw(|f| draw_status_bar(f, f.area(), &model, None))
+                .draw(|f| draw_status_bar(f, f.area(), &model))
                 .unwrap();
         }
     }
@@ -194,32 +181,8 @@ mod tests {
     fn zero_height_area_draws_without_panicking() {
         let mut terminal = backend(120, 3);
         terminal
-            .draw(|f| draw_status_bar(f, Rect::new(0, 0, 120, 0), &base_model(), None))
+            .draw(|f| draw_status_bar(f, Rect::new(0, 0, 120, 0), &base_model()))
             .unwrap();
-    }
-
-    #[test]
-    fn debug_text_is_appended_when_present() {
-        let mut terminal = backend(160, 3);
-        terminal
-            .draw(|f| {
-                draw_status_bar(
-                    f,
-                    f.area(),
-                    &base_model(),
-                    Some("region=Main zoom=Grid editing=false focus=4/124"),
-                );
-            })
-            .unwrap();
-        let content: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        assert!(content.contains("DBG:"));
-        assert!(content.contains("focus=4/124"));
     }
 
     #[test]

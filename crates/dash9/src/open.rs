@@ -559,21 +559,6 @@ fn pane_heights(
     }
 }
 
-/// Temporary diagnostic instrumentation (`status_bar.rs`'s own
-/// `draw_status_bar` docs) — tracking down exactly which internal
-/// state a reported navigation bug happens in, live, rather than
-/// guessing from a description after the fact.
-fn debug_focus_line(state: &ShellState, session: &LiveSession) -> String {
-    format!(
-        "region={:?} zoom={:?} editing={} focus={}/{}",
-        state.region,
-        state.zoom,
-        state.input.is_some(),
-        state.focused_panel + 1,
-        session.panels.len(),
-    )
-}
-
 fn draw_session(
     frame: &mut Frame,
     area: Rect,
@@ -624,8 +609,7 @@ fn draw_session(
         ])
         .areas(area);
 
-    let debug = debug_focus_line(state, session);
-    draw_status_bar(frame, status_area, status, Some(&debug));
+    draw_status_bar(frame, status_area, status);
 
     // `state.grid_scroll` is already the right value going into this
     // frame — `PageUp`/`PageDown` set it directly (`shell.rs`), and
@@ -791,11 +775,24 @@ fn zoom_bar_model(
             (name, hint)
         }
     };
-    let zoom_label = if state.detail_open {
-        format!("{region_name} + detail")
-    } else {
-        region_name
-    };
+    // Editing changes what several keys do (this function's own
+    // `Region::Main` branch above) but was otherwise only visible as a
+    // small `:` in the command box — easy to enter (`Tab`-cycling, or
+    // automatically reopening after any command, `ShellState::handle_
+    // key`'s `Enter` docs) and easy to miss, so "why isn't PageDown
+    // paging/Up moving focus" kept getting reported as if each were a
+    // separate bug, when the real, repeated cause was just not
+    // noticing editing was active. Named right in the bracket label —
+    // the first thing on the line — rather than only in the hint text
+    // further along, which needing to be *read* rather than *seen* was
+    // exactly what made it easy to miss in the first place.
+    let mut zoom_label = region_name;
+    if state.detail_open {
+        zoom_label = format!("{zoom_label} + detail");
+    }
+    if state.input.is_some() {
+        zoom_label = format!("{zoom_label} + editing");
+    }
     ZoomBarModel { zoom_label, hint }
 }
 
@@ -1095,6 +1092,31 @@ mod tests {
             !model.hint.contains("+/- zoom"),
             "+/- don't zoom while editing either: {}",
             model.hint
+        );
+        assert!(
+            model.zoom_label.contains("editing"),
+            "editing must be named in the bracket label itself, not just the \
+             hint text further along — that's what kept getting missed, \
+             reported live as several unrelated-seeming bugs: {}",
+            model.zoom_label
+        );
+    }
+
+    #[test]
+    fn zoom_label_says_editing_even_outside_main_and_combines_with_detail() {
+        let mut state = ShellState::default();
+        state.detail_open = true;
+        state.input = Some(String::new());
+        let model = zoom_bar_model(&state, &[], Rect::new(0, 0, 40, 2), 0);
+        assert_eq!(model.zoom_label, "Grid + detail + editing");
+
+        let mut output_state = ShellState::default();
+        output_state.region = Region::Output;
+        output_state.input = Some(String::new());
+        let model = zoom_bar_model(&output_state, &[], Rect::new(0, 0, 40, 2), 0);
+        assert_eq!(
+            model.zoom_label, "Output + editing",
+            "`:` doesn't touch region, so editing can be entered from Output/Log too"
         );
     }
 
