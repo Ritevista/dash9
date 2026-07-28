@@ -1071,7 +1071,18 @@ fn draw_panel(
                         draw_chart(frame, area, &model, focused, editing, show_hint);
                     }
                     dash9_core::PanelType::Gauge => {
-                        draw_gauge(frame, area, &model, focused, editing, show_hint);
+                        draw_gauge(
+                            frame,
+                            area,
+                            &model,
+                            dash9_tui::GaugeRange {
+                                min: panel.gauge_min,
+                                max: panel.gauge_max,
+                            },
+                            focused,
+                            editing,
+                            show_hint,
+                        );
                     }
                     dash9_core::PanelType::Stat => {
                         draw_stat(frame, area, &model, focused, editing, show_hint);
@@ -1469,6 +1480,8 @@ mod tests {
             thresholds: vec![],
             executable: true,
             inert_reason: None,
+            gauge_min: 0.0,
+            gauge_max: Some(100.0),
         };
         let dashboard = ValidatedDashboard {
             title: "t".to_string(),

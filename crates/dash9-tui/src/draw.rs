@@ -244,22 +244,42 @@ pub fn draw_stat(
     frame.render_widget(paragraph, area);
 }
 
-/// Draws a single-value "gauge" panel as a percentage bar. SPEC.md
-/// Section C.1 does not define a gauge min/max, so this assumes the
-/// query result is already a 0-100 value — the only worked example
-/// (`SPEC.md` C.2, "Disk Free %") is one. A documented v1
-/// simplification, not a silent assumption; a future schema field
-/// (e.g. `panels.gauge.max`) could relax this without breaking the
-/// append-only grammar (SPEC.md B.1). The border status corner (see
-/// `draw_stat`'s docs on why it's shown despite the bar being uniform
-/// chrome) is the *only* place a gauge shows its severity marker/label
-/// at all — the bar itself only carries severity as color, which isn't
-/// monochrome-safe on its own (Mechanism 4); the border status fixes
-/// that gap rather than just adding uniform styling.
+/// A gauge panel's value range (`dash9_core::ValidatedPanel::gauge_min`/
+/// `gauge_max`, unpacked into their own struct purely to keep
+/// [`draw_gauge`]'s argument count down — same reasoning as
+/// `command_bar::LogFocus`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GaugeRange {
+    pub min: f64,
+    pub max: Option<f64>,
+}
+
+/// Draws a single-value "gauge" panel as a bar filled to `(value -
+/// range.min) / (range.max - range.min)`. `range` comes from
+/// `dash9_core::ValidatedPanel::gauge_min`/`gauge_max` — every
+/// TOML-authored panel means a fixed `0..100` (`SPEC.md` C.1 has no
+/// min/max field in v0.1 grammar, so `0..100` for a hand-authored panel
+/// is a documented default, not a silent assumption), while a
+/// Grafana-imported panel carries its real `fieldConfig.defaults`. When
+/// `range.max` is `None` ("auto" — a Grafana export with no fixed
+/// ceiling, e.g. per-interface network speed/MTU with no inherent
+/// bound), the ceiling is `model.max_across_series` instead: the highest
+/// value across every series this panel's query currently returns,
+/// recomputed every refresh, matching Grafana's own auto-scale behavior
+/// rather than a fixed dash9-side guess. The `%` suffix on the bar's
+/// label is only shown for a genuine `0..100` scale — appending it to a
+/// raw byte/MTU/auto-scaled value would misrepresent it as a percentage
+/// it isn't. The border status corner (see `draw_stat`'s docs on why
+/// it's shown despite the bar being uniform chrome) is the *only* place
+/// a gauge shows its severity marker/label at all — the bar itself only
+/// carries severity as color, which isn't monochrome-safe on its own
+/// (Mechanism 4); the border status fixes that gap rather than just
+/// adding uniform styling.
 pub fn draw_gauge(
     frame: &mut Frame,
     area: Rect,
     model: &ChartModel,
+    range: GaugeRange,
     focused: bool,
     editing: bool,
     show_hint: bool,
@@ -275,7 +295,23 @@ pub fn draw_gauge(
         frame.render_widget(Paragraph::new("(no data)").block(block), area);
         return;
     };
-    let ratio = (value / 100.0).clamp(0.0, 1.0);
+    let effective_max = range.max.or(model.max_across_series).unwrap_or(range.min);
+    let span = effective_max - range.min;
+    let ratio = if span > 0.0 {
+        ((value - range.min) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // `range` always comes from a fixed sentinel (`0.0`/`Some(100.0)` for
+    // every TOML-authored or true-percent Grafana panel), never a computed
+    // float, so an exact comparison is intentional here, not a rounding hazard.
+    #[allow(clippy::float_cmp)]
+    let is_percent_range = range.min == 0.0 && range.max == Some(100.0);
+    let label = if is_percent_range {
+        format!("{value:.1}%")
+    } else {
+        format!("{value:.1}")
+    };
     let color = model
         .current_severity
         .as_ref()
@@ -284,7 +320,7 @@ pub fn draw_gauge(
         .block(block)
         .gauge_style(Style::default().fg(color))
         .ratio(ratio)
-        .label(format!("{value:.1}%"));
+        .label(label);
     frame.render_widget(gauge, area);
 }
 
@@ -595,15 +631,100 @@ mod tests {
             ChartModel::project("Disk", &with_data, &[], &ChartViewState::default(), 80).unwrap();
         let backend = TestBackend::new(30, 5);
         let mut terminal = Terminal::new(backend).unwrap();
+        let percent_range = GaugeRange {
+            min: 0.0,
+            max: Some(100.0),
+        };
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &model, true, false, true))
+            .draw(|f| draw_gauge(f, f.area(), &model, percent_range, true, false, true))
             .unwrap();
 
         let empty = frame_with(vec![]);
         let empty_model =
             ChartModel::project("Disk", &empty, &[], &ChartViewState::default(), 80).unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &empty_model, false, false, false))
+            .draw(|f| {
+                draw_gauge(
+                    f,
+                    f.area(),
+                    &empty_model,
+                    percent_range,
+                    false,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+    }
+
+    /// `gauge_max: None` ("auto") must fill the bar relative to the
+    /// highest current value across every series the query returned, not
+    /// hardcode `/100.0` — real dash9 case: per-interface network speed,
+    /// no inherent ceiling (`docs/specs/grafana-dashboards.md` Section H).
+    #[test]
+    fn gauge_with_auto_max_scales_against_the_highest_sibling_series() {
+        let frame = CoreFrame {
+            kind: FrameKind::InstantVector,
+            series: vec![
+                labeled_series("eth0", vec![(0, 25.0)]),
+                labeled_series("eth1", vec![(0, 100.0)]),
+            ],
+            table: None,
+            meta: FrameMeta {
+                query: "node_network_speed_bytes".into(),
+                datasource: "prom".into(),
+                executed_at_ms: 0,
+                warnings: vec![],
+            },
+        };
+        let model =
+            ChartModel::project("Speed", &frame, &[], &ChartViewState::default(), 80).unwrap();
+        assert_eq!(
+            model.current_value,
+            Some(25.0),
+            "primary is the first series"
+        );
+        assert_eq!(model.max_across_series, Some(100.0));
+
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let auto_range = GaugeRange {
+            min: 0.0,
+            max: None,
+        };
+        terminal
+            .draw(|f| draw_gauge(f, f.area(), &model, auto_range, true, false, true))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            content.contains("25.0") && !content.contains('%'),
+            "auto-scaled gauge must show the raw value, never a fabricated percent: {content}"
+        );
+    }
+
+    /// `span <= 0` (a degenerate `gauge_max <= gauge_min`, or `None`/
+    /// `None` for both the fixed and auto max) must never panic — Ratatui's
+    /// `Gauge::ratio` asserts its input is within `0.0..=1.0`, so a NaN
+    /// from dividing by zero would crash the whole render loop.
+    #[test]
+    fn gauge_with_a_degenerate_zero_span_does_not_panic() {
+        let with_data = frame_with(vec![(0, 5.0)]);
+        let model =
+            ChartModel::project("Flat", &with_data, &[], &ChartViewState::default(), 80).unwrap();
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let degenerate_range = GaugeRange {
+            min: 5.0,
+            max: Some(5.0),
+        };
+        terminal
+            .draw(|f| draw_gauge(f, f.area(), &model, degenerate_range, true, false, true))
             .unwrap();
     }
 
@@ -649,7 +770,20 @@ mod tests {
             ChartModel::project("Disk", &frame, &thresholds, &ChartViewState::default(), 80)
                 .unwrap();
         terminal
-            .draw(|f| draw_gauge(f, f.area(), &gauge_model, true, false, true))
+            .draw(|f| {
+                draw_gauge(
+                    f,
+                    f.area(),
+                    &gauge_model,
+                    GaugeRange {
+                        min: 0.0,
+                        max: Some(100.0),
+                    },
+                    true,
+                    false,
+                    true,
+                );
+            })
             .unwrap();
         let gauge_content: String = terminal
             .backend()

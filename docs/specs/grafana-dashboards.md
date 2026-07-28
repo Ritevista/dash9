@@ -340,3 +340,26 @@ none of this exists on the export side, which isn't built yet.
   normal deployment difference, indistinguishable from a genuinely
   broken query under the strict default, is worse than the (rare) case
   of a real regression going unflagged.
+- **`bargauge` is aliased to the same `PanelType::Gauge` as native
+  `"gauge"`.** Grafana's radial-vs-linear distinction between the two is
+  purely visual — meaningless in a terminal, where dash9 already renders
+  every gauge as a Ratatui bar — so treating `bargauge` as a genuinely
+  unmapped type (as it was before this note) needlessly skipped every
+  panel using it. `ValidatedPanel` grew `gauge_min: f64` and
+  `gauge_max: Option<f64>` to carry each panel's real
+  `fieldConfig.defaults.min`/`max` (every TOML-authored panel still
+  means a fixed `0..100`, matching the original v1 simplification —
+  SPEC.md C.1 has no min/max field). `gauge_max: None` means "auto": on
+  the grounding dashboard, `node_network_speed_bytes` and
+  `node_network_mtu_bytes` are reported per-network-interface with no
+  configured `max` at all — Grafana itself auto-scales these against
+  whichever interface currently has the highest value, not a fixed
+  ceiling, and dash9's renderer reproduces exactly that (the highest
+  current value across every series the panel's query returns,
+  recomputed every refresh — real live data, never a fabricated bound).
+  Grafana's `"bool"` unit is the one exception treated as a known,
+  fixed `0..1` range even with no explicit `max` — a documented Grafana
+  convention (same category as `RATE_INTERVAL_DEFAULT`), not a guess.
+  The bar's `%` label suffix is only shown for a genuine fixed `0..100`
+  scale; a raw byte/MTU/auto-scaled value shows unsuffixed, since
+  appending `%` to it would misrepresent what it actually is.
