@@ -41,8 +41,8 @@ detected from the file itself (`.json` vs `.toml`), no separate verb.
 Exporter Full" dashboard from Grafana.com (ID 1860), with just its
 `job`/`node`/`nodename` template variables pinned to the values
 `docker-compose.yml`'s `node_exporter` actually reports — everything
-else about the file, including the panels dash9 has no renderer for
-(`bargauge`), is untouched:
+else about the file is untouched. Every one of its 124 panels imports
+as executable and passes `dash9 test`:
 
 ```console
 cargo run -p dash9 -- test examples/node-exporter-full.json --prometheus-url http://localhost:9091
