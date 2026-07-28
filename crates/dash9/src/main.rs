@@ -32,13 +32,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Open a dashboard file — TOML or Grafana JSON, detected from the
-    /// file itself (`docs/specs/grafana-dashboards.md` Section F) — in
-    /// the interactive TUI. Natural language input (backed by an
-    /// OpenAI-compatible endpoint configured at
-    /// `~/.config/dash9/assist.toml`) is available whenever the binary
-    /// was built with the `assist` feature (on by default) — no
-    /// separate flag needed; toggle it at runtime with `/ai on`/`/ai
-    /// off` (`docs/specs/open.md` Section D).
+    /// file itself — in the interactive TUI.
+    ///
+    /// Format detection: `docs/specs/grafana-dashboards.md` Section F.
+    /// Natural language input (backed by an OpenAI-compatible endpoint
+    /// configured at `~/.config/dash9/assist.toml`) is available
+    /// whenever the binary was built with the `assist` feature (on by
+    /// default) — no separate flag needed; toggle it at runtime with
+    /// `/ai on`/`/ai off` (`docs/specs/open.md` Section D).
     Open {
         /// Dashboard file to open — TOML or Grafana JSON, detected from
         /// the file itself. Required: dash9 has no "start empty" mode
