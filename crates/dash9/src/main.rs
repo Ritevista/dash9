@@ -40,6 +40,15 @@ enum Commands {
     /// separate flag needed; toggle it at runtime with `/ai on`/`/ai
     /// off` (`docs/specs/open.md` Section D).
     Open {
+        /// Dashboard file to open — TOML or Grafana JSON, detected from
+        /// the file itself. Required: dash9 has no "start empty" mode
+        /// yet, so a session always begins from a real file on disk. To
+        /// build a dashboard up from nothing, hand-write a minimal TOML
+        /// file first (a `[dashboard]` header with an empty
+        /// `panels = []` is enough), open that, then add datasources
+        /// live with `/ds add` — adding new *panels* from inside the
+        /// TUI isn't supported yet; edit the file and `/dash open` it
+        /// again.
         path: PathBuf,
         /// Prometheus URL every Prometheus-typed panel resolves to
         /// when opening a Grafana JSON dashboard (which carries only
@@ -51,6 +60,8 @@ enum Commands {
     /// Validate a dashboard file headlessly (SPEC.md Section C.3) —
     /// TOML or Grafana JSON, same detection as `open`.
     Test {
+        /// Dashboard file to validate. See `open`'s PATH for format
+        /// detection; always required, same as `open`.
         path: PathBuf,
         /// See `open --prometheus-url`.
         #[arg(long, default_value = DEFAULT_PROMETHEUS_URL)]
