@@ -180,8 +180,8 @@ panel count** — `Main` is *one* stop, not one per panel. This is a
 deliberate simplification over an earlier design where `Tab` walked
 every panel individually before ever reaching Output/the command box —
 on a large, real-world (e.g. imported Grafana) dashboard that meant
-dozens of `Tab` presses just to leave the grid. Digit keys (`1`-`9`)
-still select a specific panel, but only mean anything once you're
+dozens of `Tab` presses just to leave the grid. The arrow keys still
+step focus one panel at a time, but only mean anything once you're
 *on* `Main` — see the table below.
 
 Reaching the command box via `:` doesn't cost you anywhere you were:
@@ -207,9 +207,9 @@ dead-ending.
 | `Esc` | While editing: cancel input, discard the buffer, leave the command box — `region` returns to wherever it was if you got here via `:`, or advances to `Main` if you got here via `Tab` (see above). Else, layered: if the detail pane (Section G.1) is open, close it; only once it's closed does Esc fall through to zoom "home" — one hop to Grid from Layout or Focus (Section G); no-op once at Grid with detail closed. One press always does at most one thing. **Never quits**, regardless of how many times pressed. |
 | `Enter` | While editing: submits the buffer, then **immediately reopens an empty one** — the command box never loses focus on its own, so a second (or third...) command can be typed right away without re-pressing `:` or `Tab`-ing back around the ring. An empty/whitespace-only line submits nothing (no log entry, no handler call) but still reopens the same way. `Tab`/`Shift+Tab` (deliberate navigation) or `Esc` (deliberate cancel) are the only ways to actually leave. |
 | `Tab` / `Shift+Tab` | Outside the command box: cycle forward/backward through `Main` → `Output` → `Log` → the command box, wrapping — one `Tab` per region, independent of panel count (see above); in `Main` + Grid zoom, also scrolls the viewport to keep the focused panel visible. While editing: **never leaves the command box** — only `Esc`/`Enter` do that — but still cycles which panel is focused underneath (a plain `panel_count()`-stop ring, unrelated to the region ring above), so you can glance at another panel's chart mid-command without losing what you've typed. |
-| `1`-`9` | Only while `region == Main`: jump focus straight to that panel (1-indexed), instead of stepping through `Tab`'s cycle one at a time. Inert while `Output`/`Log` has focus — "which panel" has no meaning there, so a digit does nothing rather than silently pulling focus back to a panel you can't currently see highlighted. A digit past `panel_count()` (or on an empty dashboard) is a no-op. Works in every zoom level. While editing, a literal character. |
+| `→`/`↓`, `←`/`↑` (not editing) | Only while `region == Main`: step focus one panel forward/backward (`↓`/`↑` are flat aliases for `→`/`←` — index-stepping, not 2D spatial navigation), wrapping, in any zoom level, independent of `Tab`'s Main→Output→Log ring. **Replaces the original `1`-`9` direct-select design** (Section G's design review): confirmed live as not actually useful — a 2-digit-plus panel count makes single-digit jump-to unreachable for most panels anyway, and arrow-key stepping plus the zoom bar's paging affordance covers the same need without a second, redundant selection mechanism. |
 | `↑` / `↓` | While editing: cycle command history, most recent first; `↓` past the newest clears back to an empty buffer. |
-| `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C, extended by Section F below): scrolls the log while editing, in or out of the command box; scrolls the log's own text when `region == Log`, or the output pane's when `region == Output`; otherwise pages the `Main` grid viewport vertically when zoomed to Grid (Section G); a no-op in Layout or Focus. Submitting a new command always resets the log scroll to the tail, and any new `Result` line always resets the output pane's scroll to its top (Section F); background poller/assistant results never reset the log, so reading old output there is never interrupted out from under you. |
+| `PageUp` / `PageDown` | Contextual to the active region (`docs/specs/session-layout.md` Section C, extended by Section F below): scrolls the log while editing, in or out of the command box; scrolls the log's own text when `region == Log`, or the output pane's when `region == Output`; otherwise pages the `Main` grid viewport vertically when zoomed to Grid or Layout (Section G) — Layout only actually moves anything once its dashboard can't shrink to fit, a no-op otherwise, same as it always was for a dashboard small enough to fit either level; a no-op in Focus. Submitting a new command always resets the log scroll to the tail, and any new `Result` line always resets the output pane's scroll to its top (Section F); background poller/assistant results never reset the log, so reading old output there is never interrupted out from under you. |
 | `+` / `=` | While `region == Main`: zoom in one level (Section G): Layout → Grid → Focus. No-op already at Focus. While `region == Output`/`Log`: maximize that pane instead — takes over `Main`'s space (Section F). |
 | `-` / `_` | While `region == Main`: zoom out one level: Focus → Grid → Layout. No-op already at Layout. While `region == Output`/`Log`: restore the maximized pane to its normal size. |
 | `Space` | Outside the command box: toggles the focused panel's detail pane (Section G.1) open/closed. Independent of both zoom and `region` — works, and stays open, whichever of Layout/Grid/Focus is active and whichever region has `Tab`-focus, and pressing it never changes either. While editing, `Space` is a literal character (as it must be — most multi-arg commands need it, e.g. `ds add`). **Was `i`** until this section's region model landed; switched because a plain `i` collided with nothing functionally, but the previous design review flagged it as worth reconsidering once digit keys became region-gated — no other reason. |
@@ -322,8 +322,14 @@ jumps straight to Grid ("home") from either end, once the detail pane
 1. **Layout** (`-` from Grid) — every panel, all at once, title-and-
    border only (`dash9_tui::draw_panel_outline`), positioned by
    `dash9_tui::layout::grid_layout_fit` which scales the row-unit
-   height down so nothing is ever clipped or paged — the point is
-   confirming the dashboard's *arrangement*, not reading data.
+   height down so nothing is clipped or paged — the point is
+   confirming the dashboard's *arrangement*, not reading data. Once
+   even the row-unit-height floor can't make everything fit (a large
+   Grafana import, `docs/specs/grafana-dashboards.md` Section H),
+   Layout falls back to the exact same `PageUp`/`PageDown`-driven
+   scrolling as Grid (`docs/specs/session-layout.md` Section A.1's
+   "Revised after shipping" note) — the "nothing is ever paged"
+   property holds only while the dashboard actually fits.
 2. **Grid** (the fixed "home" level, `open.md`'s original and still
    default behavior) — real charts at readable size. When the
    dashboard has more panel-rows than the terminal has height for, the
@@ -355,9 +361,14 @@ back to the chart" friction confirmed it was the wrong shape.)
 The pane has two parts:
 
 1. **Config** — title, panel type, datasource (name and connection),
-   query text, grid position (`SPEC.md` C.1), `allow_empty` and
-   effective latency budget, and every configured threshold
-   (`SPEC.md` C.1's `[[panels.thresholds]]`, name/op/value).
+   query text, `"Panel: N of TOTAL"` (1-indexed position among every
+   panel, not raw `SPEC.md` C.1 grid coordinates — an earlier version
+   showed `"Grid: row X, col Y, w W, h H"` directly, confirmed live as
+   confusing once collapsed-row rebasing on a Grafana import
+   (`docs/specs/grafana-dashboards.md` Section H) pushed some panels'
+   `row` into the thousands), `allow_empty` and effective latency
+   budget, and every configured threshold (`SPEC.md` C.1's
+   `[[panels.thresholds]]`, name/op/value).
 2. **Data** — every row the panel's last query actually returned,
    rendered as a table through the same `table_for_export` path
    `/save` (Section I) uses, so what you see here and what a
@@ -365,8 +376,9 @@ The pane has two parts:
    for "no result yet," an error message for a failed query, or "no
    data" for an empty-but-successful result — never a blank pane.
 
-It has no separate "which panel" state: Tab-ing, or a `1`-`9` jump, to
-a different panel while it's open just follows the newly focused one,
+It has no separate "which panel" state: `Tab`-ing, or stepping focus
+with the arrow keys, to a different panel while it's open just follows
+the newly focused one,
 and a command that affects the focused panel (e.g. `/panel threshold
 crit gte 95`) shows its effect immediately, since it redraws from live
 session state every frame like everything else.
@@ -409,7 +421,7 @@ the title.
   highlighted, since only one thing on screen should ever look focused
   at a time. The one genuinely panel-specific action is `Space`
   (`"space detail"`, `dash9_tui::draw::PANEL_HINT`) — broader navigation
-  (`Tab`/`1`-`9`, `PageUp`/`PageDown`, `+`/`-`) is region-level, not a
+  (`Tab`/arrows, `PageUp`/`PageDown`, `+`/`-`) is region-level, not a
   property of any one panel, so it stays in the zoom bar (Section H)
   instead of being repeated on every panel's border; the zoom bar's own
   hint text deliberately excludes `Space` for the same reason, in
@@ -426,6 +438,17 @@ the title.
   recolor a border, never add the status/hint content this section
   adds — which needed real parameters on `draw_chart`/`draw_stat`/
   `draw_gauge`/`draw_table`/`draw_panel_outline`, not a buffer patch).
+  A third color, `theme::FOCUS_DIM` (plain `Cyan`, not bold), was added
+  later for the focused panel while the command box is capturing
+  keystrokes: the panel really is still focused (arrows/`Tab` still
+  move it), just not where keystrokes land *right now*, and the
+  original two-color split made every "hot" pane look identical —
+  command box, detail pane, and the focused chart were all bright
+  `theme::FOCUS` at once, confirmed live as genuinely confusing ("command
+  is selected, detail is selected, and also the chart is selected
+  too"). The zoom bar's `" + editing"` label suffix (Section H) is the
+  companion fix for the same confusion, named where it's actually read
+  rather than only shown as a border color.
 
 Phase 2 (deferred, Section M): a temporary per-pane pop-up showing a
 pane's *full* reference on demand, building on this section's hint
@@ -454,14 +477,27 @@ dashboard/AI state). While `region == Main`, it shows `Main`'s active
 zoom level (Layout/Grid/Focus, Section G) instead of the literal word
 "Main" — zoom is Main-specific state, so naming the zoom level is more
 useful there than a region name that's true of three different views —
-and, in Grid, appends the `"panels X-Y of Z — PageDown/PageUp for
-more"` paging indicator whenever the dashboard doesn't fully fit the
-viewport. While `region == Output` or `Log`, it shows that region's
+and, in Grid or Layout, appends the `"panels X-Y of Z — PageDown/PageUp
+for more"` paging indicator whenever the dashboard doesn't fully fit the
+viewport — for Layout, only once it's actually fallen back to scrolling
+(Section G's revision); a dashboard small enough to shrink-to-fit shows
+no suffix, same as it always showed none for Grid when everything
+already fit. While `region == Output` or `Log`, it shows that region's
 name and its own `"PageUp/PageDown scroll"` hint instead (Section F).
 The label itself appends `" + detail"` (e.g. `"[Grid + detail]"`,
 `"[Output + detail]"`) whenever the detail pane (Section G.1) is open,
-since that's independent of both zoom and region and worth surfacing
-alongside whichever of the two is currently shown.
+and `" + editing"` (e.g. `"[Grid + editing]"`, `"[Grid + detail +
+editing]"`) whenever the command box is capturing keystrokes — **added
+after live confirmation that editing state was easy to miss**: several
+separate-seeming bug reports ("`PageDown` isn't working," "arrows are
+flipping panels," "`Up`/`Down` are captured by the command box") all
+traced back to the same real cause — editing changes what several keys
+do (Section E's `PageUp`/`PageDown` row, and `Tab`/arrows' own rows
+above), but was previously visible only as a small `:` in the command
+box, easy to enter (`Tab`-cycling, or a submitted command silently
+reopening an empty buffer, Section E's `Enter` row) and easy not to
+notice. Naming it right in the bracket label — the first thing on the
+line — fixed the discoverability gap the hint text alone didn't.
 
 ## I. Panel export (`/save`)
 
