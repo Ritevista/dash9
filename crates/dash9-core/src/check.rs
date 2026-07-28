@@ -117,6 +117,8 @@ mod tests {
             thresholds: vec![],
             executable: true,
             inert_reason: None,
+            gauge_min: 0.0,
+            gauge_max: Some(100.0),
         }
     }
 

@@ -240,6 +240,25 @@ pub struct ValidatedPanel {
     /// `Some(reason)` iff `executable` is `false` — why this panel is
     /// preserved but not queried, shown in place of a live result.
     pub inert_reason: Option<String>,
+    /// The floor of `PanelType::Gauge`'s bar-fill ratio — ignored by every
+    /// other `PanelType`. `SPEC.md` C.1's TOML grammar has no min/max
+    /// field in v0.1, so a TOML-authored dashboard always gets `0.0` here
+    /// (matching the fixed 0-100% scale dash9's gauge widget has always
+    /// used); a Grafana-imported panel carries its real
+    /// `fieldConfig.defaults.min` (`crate::grafana`).
+    pub gauge_min: f64,
+    /// The ceiling of `PanelType::Gauge`'s bar-fill ratio. `Some(max)` for
+    /// a fixed scale (every TOML-authored panel: `Some(100.0)`; a
+    /// Grafana-imported panel with an explicit `fieldConfig.defaults.max`,
+    /// or the well-known implicit `0..1` range of Grafana's `bool` unit).
+    /// `None` means "auto" — Grafana's own behavior for a gauge/bargauge
+    /// panel whose `max` is left unset: the ceiling is the highest value
+    /// across every series the panel's query currently returns, recomputed
+    /// on every refresh rather than fixed at import time (real dash9
+    /// example: `node_network_speed_bytes`/`node_network_mtu_bytes`,
+    /// reported per-interface with no inherent upper bound —
+    /// `docs/specs/grafana-dashboards.md` Section H).
+    pub gauge_max: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -378,6 +397,8 @@ fn validate_panel(
         thresholds,
         executable: true,
         inert_reason: None,
+        gauge_min: 0.0,
+        gauge_max: Some(100.0),
     })
 }
 

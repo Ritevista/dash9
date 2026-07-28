@@ -24,7 +24,8 @@ pub use command_bar::{
 };
 pub use detail_view::{detail_height, draw_panel_detail, PanelDetail};
 pub use draw::{
-    draw_chart, draw_gauge, draw_panel_outline, draw_stat, draw_table, series_as_table, PANEL_HINT,
+    draw_chart, draw_gauge, draw_panel_outline, draw_stat, draw_table, series_as_table, GaugeRange,
+    PANEL_HINT,
 };
 pub use export::{table_for_export, table_to_csv, table_to_markdown, ExportFormat};
 pub use layout::{

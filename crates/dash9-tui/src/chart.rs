@@ -166,6 +166,16 @@ pub struct ChartModel {
     /// How many series beyond the chart's display cap were ranked out
     /// of the projection. Zero when nothing was dropped.
     pub truncated_series_count: usize,
+    /// The highest latest-value across *every* series the query returned
+    /// — computed before the display cap (`MAX_DISPLAYED_SERIES`) drops
+    /// any, so it reflects the real query result, not just what's drawn.
+    /// `None` when there are no series at all. Used by
+    /// `draw_gauge`/`dash9_core::ValidatedPanel::gauge_max`'s `None`
+    /// ("auto") case — a bargauge/gauge panel with no fixed ceiling in
+    /// its Grafana export auto-scales against whichever of its own
+    /// series currently has the highest value, matching real Grafana
+    /// behavior (`docs/specs/grafana-dashboards.md` Section H).
+    pub max_across_series: Option<f64>,
 }
 
 impl ChartModel {
@@ -222,6 +232,15 @@ impl ChartModel {
 
         let (y_min, y_max) = axis_bounds(&series, &bands);
 
+        let max_across_series = {
+            let max = zoomed
+                .iter()
+                .filter_map(|points| last_point(points))
+                .map(|p| p.value)
+                .fold(f64::NEG_INFINITY, f64::max);
+            max.is_finite().then_some(max)
+        };
+
         Ok(ChartModel {
             title: title.into(),
             series,
@@ -231,6 +250,7 @@ impl ChartModel {
             current_value,
             current_severity,
             truncated_series_count,
+            max_across_series,
         })
     }
 

@@ -327,7 +327,18 @@ fn import_panel(raw: &Value, row_offset: u32, vars: &HashMap<String, String>) ->
     let mut grid = parse_grid_pos(raw.get("gridPos"));
     grid.row = grid.row.saturating_add(row_offset);
     let thresholds = parse_thresholds(raw.get("fieldConfig"));
-    let panel_type = PanelType::parse(grafana_type);
+    // Grafana's "gauge" (radial) and "bargauge" (linear bar) are only a
+    // visual-style distinction — meaningless in a terminal, where dash9
+    // already renders every gauge as a Ratatui bar. Aliased to the same
+    // `PanelType::Gauge` rather than kept as a separately-unsupported
+    // type; `grafana_type` (unnormalized) is still what any inert-reason
+    // message below names, so this alias is invisible in diagnostics.
+    let panel_type = PanelType::parse(if grafana_type == "bargauge" {
+        "gauge"
+    } else {
+        grafana_type
+    });
+    let (gauge_min, gauge_max) = parse_gauge_range(raw.get("fieldConfig"));
     let datasource_is_prometheus = panel_datasource_is_prometheus(raw);
     // Only the first target executes; a multi-target panel's
     // remaining queries have no home in dash9's one-query-per-panel
@@ -404,7 +415,45 @@ fn import_panel(raw: &Value, row_offset: u32, vars: &HashMap<String, String>) ->
         thresholds,
         executable,
         inert_reason,
+        gauge_min,
+        gauge_max,
     }
+}
+
+/// `fieldConfig.defaults.min`/`max`/`unit` → [`ValidatedPanel::gauge_min`]/
+/// [`ValidatedPanel::gauge_max`]. Ignored by every panel type but
+/// `PanelType::Gauge` (native Grafana `"gauge"` or `"bargauge"`, aliased
+/// above); harmless to compute unconditionally.
+///
+/// `min` always resolves to a concrete number — Grafana's own default is
+/// `0`, and every gauge/bargauge panel seen in practice either says so
+/// explicitly or means it implicitly. `max` is `None` ("auto": the
+/// highest current value across the panel's own series, recomputed on
+/// every refresh — dash9's TUI layer computes this from live data, not
+/// this import step) unless the export gives an explicit number, or the
+/// field's `unit` is Grafana's `"bool"` — a well-known, always-`0..1`
+/// unit, the same category of documented-Grafana-convention handling as
+/// [`RATE_INTERVAL_DEFAULT`], not a guess. Real case grounding this:
+/// `node_network_speed_bytes`/`node_network_mtu_bytes` are reported
+/// per-network-interface with no inherent upper bound at all — Grafana's
+/// own bargauge auto-scales each interface's bar against whichever
+/// interface currently has the highest value, exactly what `None` here
+/// asks the renderer to reproduce (`docs/specs/grafana-dashboards.md`
+/// Section H).
+fn parse_gauge_range(field_config: Option<&Value>) -> (f64, Option<f64>) {
+    let defaults = field_config.and_then(|f| f.get("defaults"));
+    let min = defaults
+        .and_then(|d| d.get("min"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let explicit_max = defaults.and_then(|d| d.get("max")).and_then(Value::as_f64);
+    let unit = defaults.and_then(|d| d.get("unit")).and_then(Value::as_str);
+    let max = explicit_max.or(if unit == Some("bool") {
+        Some(1.0)
+    } else {
+        None
+    });
+    (min, max)
 }
 
 fn panel_datasource_is_prometheus(raw: &Value) -> bool {
@@ -720,8 +769,8 @@ mod tests {
     fn an_unmapped_panel_type_is_preserved_but_inert() {
         let json = minimal_dashboard(
             r#"{
-                "title": "Pressure",
-                "type": "bargauge",
+                "title": "Notes",
+                "type": "text",
                 "gridPos": {"x": 0, "y": 0, "w": 3, "h": 4},
                 "datasource": {"type": "prometheus", "uid": "abc"},
                 "targets": [{"expr": "up", "refId": "A"}]
@@ -730,7 +779,79 @@ mod tests {
         let dashboard = parse_grafana_json(&json, "http://localhost:9090").unwrap();
         let panel = &dashboard.panels[0];
         assert!(!panel.executable);
-        assert!(panel.inert_reason.as_deref().unwrap().contains("bargauge"));
+        assert!(panel.inert_reason.as_deref().unwrap().contains("text"));
+    }
+
+    /// `bargauge` and `gauge` are only a visual-style distinction in
+    /// Grafana (radial vs. linear bar) — meaningless in a terminal, where
+    /// dash9 already renders every gauge as a bar. `bargauge` must map to
+    /// the exact same `PanelType::Gauge`, not stay unsupported.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact literal 0/1 from JSON, no arithmetic
+    fn bargauge_is_aliased_to_the_same_gauge_panel_type() {
+        let json = minimal_dashboard(
+            r#"{
+                "title": "Pressure",
+                "type": "bargauge",
+                "gridPos": {"x": 0, "y": 0, "w": 3, "h": 4},
+                "datasource": {"type": "prometheus", "uid": "abc"},
+                "targets": [{"expr": "up", "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+            }"#,
+        );
+        let dashboard = parse_grafana_json(&json, "http://localhost:9090").unwrap();
+        let panel = &dashboard.panels[0];
+        assert!(panel.executable);
+        assert_eq!(panel.panel_type, PanelType::Gauge);
+        assert_eq!(panel.gauge_min, 0.0);
+        assert_eq!(panel.gauge_max, Some(1.0));
+    }
+
+    /// A bargauge/gauge panel with no explicit `max` in its `fieldConfig`
+    /// (Grafana's own "auto-scale from the live data" case — real
+    /// examples: per-interface network speed/MTU, no inherent ceiling)
+    /// must import as `gauge_max: None`, not a fabricated number.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact literal 0.0 default, no arithmetic
+    fn gauge_with_no_explicit_max_imports_as_auto() {
+        let json = minimal_dashboard(
+            r#"{
+                "title": "Speed",
+                "type": "bargauge",
+                "gridPos": {"x": 0, "y": 0, "w": 3, "h": 4},
+                "datasource": {"type": "prometheus", "uid": "abc"},
+                "targets": [{"expr": "up", "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "bps", "min": 0}}
+            }"#,
+        );
+        let dashboard = parse_grafana_json(&json, "http://localhost:9090").unwrap();
+        let panel = &dashboard.panels[0];
+        assert!(panel.executable);
+        assert_eq!(panel.gauge_min, 0.0);
+        assert_eq!(panel.gauge_max, None);
+    }
+
+    /// Grafana's `"bool"` unit has a well-known, always-`0..1` range even
+    /// with no `fieldConfig.defaults.max` at all — a documented Grafana
+    /// convention dash9 fills in (same category as `RATE_INTERVAL_DEFAULT`),
+    /// not an auto-scale case and not a guess.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact literal 0/1 from a well-known unit default
+    fn gauge_with_bool_unit_and_no_explicit_max_implies_zero_to_one() {
+        let json = minimal_dashboard(
+            r#"{
+                "title": "Node Exporter Scrape",
+                "type": "bargauge",
+                "gridPos": {"x": 0, "y": 0, "w": 3, "h": 4},
+                "datasource": {"type": "prometheus", "uid": "abc"},
+                "targets": [{"expr": "up", "refId": "A"}],
+                "fieldConfig": {"defaults": {"unit": "bool"}}
+            }"#,
+        );
+        let dashboard = parse_grafana_json(&json, "http://localhost:9090").unwrap();
+        let panel = &dashboard.panels[0];
+        assert_eq!(panel.gauge_min, 0.0);
+        assert_eq!(panel.gauge_max, Some(1.0));
     }
 
     #[test]

@@ -95,6 +95,10 @@ pub struct LivePanel {
     /// without needing a second copy of the reason on this struct.
     pub executable: bool,
     pub last_result: Option<Result<Frame, CommandError>>,
+    /// See `dash9_core::ValidatedPanel::gauge_min`/`gauge_max` — carried
+    /// through unchanged, only meaningful for `PanelType::Gauge`.
+    pub gauge_min: f64,
+    pub gauge_max: Option<f64>,
 }
 
 impl From<&dash9_core::ValidatedPanel> for LivePanel {
@@ -119,6 +123,8 @@ impl From<&dash9_core::ValidatedPanel> for LivePanel {
             thresholds: p.thresholds.clone(),
             executable: p.executable,
             last_result,
+            gauge_min: p.gauge_min,
+            gauge_max: p.gauge_max,
         }
     }
 }
@@ -944,6 +950,8 @@ mod tests {
             thresholds: vec![],
             executable: true,
             inert_reason: None,
+            gauge_min: 0.0,
+            gauge_max: Some(100.0),
         }
     }
 
