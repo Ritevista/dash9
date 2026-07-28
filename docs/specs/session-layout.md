@@ -19,8 +19,13 @@ after shipping — see that section's "Revised after shipping" note and
 `open.md` Section G.1 — direct user feedback on the live build found
 that replacing the whole main area to show detail hid every chart with
 no direct way back; detail is now a separate, always-below pane,
-decoupled from zoom entirely. Section E below (`/save png`, phased)
-remains **Proposed** — deliberately deferred, since it needs a new
+decoupled from zoom entirely. Section A.1's "no panel is ever hidden in
+Layout" guarantee was also revised after shipping, once a 124-panel
+Grafana import showed it doesn't hold once a dashboard can't shrink to
+fit — see that section's "Revised after shipping" note and Section C's
+updated table; Layout now shares Grid's `PageUp`/`PageDown` scrolling
+past that point. Section E below (`/save png`, phased) remains
+**Proposed** — deliberately deferred, since it needs a new
 image/font-rasterization dependency this codebase doesn't have yet and
 is a separable follow-up, not a prerequisite for the zoom-level work.
 
@@ -39,14 +44,28 @@ is a separable follow-up, not a prerequisite for the zoom-level work.
 The main area (everything `open.md` Section G called "the panel grid
 or the detail view") is really three distinct zoom levels, not two:
 
-1. **Layout** — every panel in the dashboard, all at once, structure
-   only. Trades data legibility for completeness: a panel too small to
-   even hit the existing narrow-width text fallback (`chart.rs`'s
-   deterministic degradation, `docs/architecture/rendering.md`) drops
-   to title-and-border-only rather than clipping or overflowing. The
-   point of this level is confirming the *arrangement* is right, not
-   reading any panel's data. No panel is ever hidden here — that's
-   what distinguishes it from Grid.
+1. **Layout** — every panel in the dashboard, all at once, shrunk to
+   fit, structure only. Trades data legibility for completeness: a
+   panel too small to even hit the existing narrow-width text fallback
+   (`chart.rs`'s deterministic degradation, `docs/architecture/
+   rendering.md`) drops to title-and-border-only rather than clipping
+   or overflowing. The point of this level is confirming the
+   *arrangement* is right, not reading any panel's data. **Revised
+   after shipping:** this originally promised no panel is ever hidden
+   here, unconditionally — true only once shrinking to fit is actually
+   possible. A 124-panel Grafana import (`docs/specs/
+   grafana-dashboards.md` Section H) spans thousands of row-units;
+   even the row-unit-height floor of `1` can't make everything fit, so
+   panels past whatever does fit clipped to nothing with no way to
+   page to them, reported live as arrow-key focus "getting lost, next
+   page is not seen." Layout now falls back to the exact same
+   fixed-height, `PageUp`/`PageDown`-driven scrolling Grid uses
+   (Section C) once it can't shrink to fit, reusing all of Grid's
+   paging (row-boundary snapping, focus-follow, the zoom bar's
+   "panels X-Y of Z" suffix) — the "nothing is ever hidden" guarantee
+   holds only for a dashboard small enough to actually fit; past that
+   point Layout behaves exactly like Grid instead of silently losing
+   panels off-screen.
 2. **Grid** (today's default, `open.md`'s existing behavior) — real
    charts at readable size. When more panel-rows exist than the
    terminal has height for, the viewport pages vertically (Section C)
@@ -108,7 +127,7 @@ change meaning by active region:
 |---|---|
 | Command box (editing) | Scroll the log — unchanged from `open.md` Section E, still works while typing without touching the buffer |
 | Grid, not editing | Page the panel viewport vertically (Section A.2) |
-| Layout, not editing | No-op — nothing to page; every panel is already visible by definition |
+| Layout, not editing | Page the panel viewport vertically, same as Grid, once the dashboard can't shrink to fit (Section A's revision) — a no-op only while everything already fits and there's nothing to page |
 | Focus, not editing | No-op for v1 — reserved for scrolling a single panel's own long content; not built now, flagged so it isn't lost. The detail pane's data table (`open.md` Section G.1) has the same unbuilt-scrolling gap, tracked there instead since it's no longer part of Focus. |
 
 This is the general rule the whole session follows going forward, not
@@ -130,7 +149,7 @@ per-region:
 
 - The **zoom bar** (`open.md` Section H) is what this section's
   original per-region hint became: one line, region-level keys only
-  (`PageUp`/`PageDown` paging, `Tab`/`1`-`9` selection, `+`/`-` zoom) —
+  (`PageUp`/`PageDown` paging, `Tab`/arrows selection, `+`/`-` zoom) —
   the things true of the *whole* active region, not any one panel.
 - Each individual **pane's own border** (`open.md` Section G.2,
   `dash9_tui::pane::pane_block`) carries the genuinely pane-specific
